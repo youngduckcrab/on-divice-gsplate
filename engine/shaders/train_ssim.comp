@@ -9,7 +9,8 @@
 // The sum of SSIM over the image changes with pixel x_q by
 //   sum_p G(p - q) (A(p) + 2 x_q B(p) + y_q C(p)),
 // A = dSSIM/dmu_x (through the variances too), B = dSSIM/dE_xx, C = dSSIM/dE_xy.
-// Writes A, B, C per pixel and channel, and the tile's SSIM sum (tile_loss.z).
+// Writes A, B, C per pixel and channel, times the pixel's loss weight (the
+// loss sums w SSIM), and the tile's SSIM sums (tile_loss, see train_forward).
 layout(local_size_x = 16, local_size_y = 16) in;
 
 #include "train_common.glsl"
@@ -23,7 +24,7 @@ const uint W = kTile + 2u * uint(kSsimRadius);  // tile plus halo
 shared float s_x[W * W];
 shared float s_y[W * W];
 shared float s_h[5u * W * kTile];  // x, y, xx, yy, xy blurred along rows
-shared float s_sum[kTile * kTile];
+shared vec2 s_sum[kTile * kTile];  // SSIM, weighted SSIM
 
 void main() {
   uint lid = gl_LocalInvocationIndex;
@@ -34,7 +35,8 @@ void main() {
   uint pix_id = pix.y * frame.image.x + pix.x;
   float c1 = frame.loss.y, c2 = frame.loss.z;
   vec3 a = vec3(0.0), b = vec3(0.0), cc = vec3(0.0);
-  float ssim_sum = 0.0;
+  float ssim_sum = 0.0, weighted_sum = 0.0;
+  float w = inside ? ssim_input[pix_id * 2u].w : 0.0;
 
   for (uint c = 0u; c < 3u; ++c) {
     for (uint e = lid; e < W * W; e += kTile * kTile) {
@@ -85,20 +87,27 @@ void main() {
     a[c] = 2.0 * my * cs * inv - ssim * 2.0 * mx / m - 2.0 * mx * d_vx - my * d_cxy;
     b[c] = d_vx;
     cc[c] = d_cxy;
-    if (inside) ssim_sum += ssim;
+    if (inside) {
+      ssim_sum += ssim;
+      weighted_sum += w * ssim;
+    }
     barrier();  // before the next channel overwrites the shared arrays
   }
 
   if (inside) {
-    ssim_maps[pix_id * 3u] = vec4(a, 0.0);
-    ssim_maps[pix_id * 3u + 1u] = vec4(b, 0.0);
-    ssim_maps[pix_id * 3u + 2u] = vec4(cc, 0.0);
+    ssim_maps[pix_id * 3u] = vec4(w * a, 0.0);
+    ssim_maps[pix_id * 3u + 1u] = vec4(w * b, 0.0);
+    ssim_maps[pix_id * 3u + 2u] = vec4(w * cc, 0.0);
   }
-  s_sum[lid] = ssim_sum;
+  s_sum[lid] = vec2(ssim_sum, weighted_sum);
   barrier();
   for (uint stride = kTile * kTile / 2u; stride > 0u; stride >>= 1u) {
     if (lid < stride) s_sum[lid] += s_sum[lid + stride];
     barrier();
   }
-  if (lid == 0u) tile_loss[tile.y * frame.image.z + tile.x].z = s_sum[0];
+  if (lid == 0u) {
+    uint t = tile.y * frame.image.z + tile.x;
+    tile_loss[t * 2u].z = s_sum[0].x;
+    tile_loss[t * 2u + 1u].x = s_sum[0].y;
+  }
 }

@@ -374,6 +374,8 @@ Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, js
     init.subject_only = options.masked;
     gs::InitStats init_stats;
     gs::SplatScene scene = gs::initialize_gaussians(ds, init, &init_stats);
+    // From the subject's points only: with the background in, the top would be the ceiling.
+    if (options.masked && ds.has_masks) options.head = gs::estimate_head(ds, scene);
     const double init_ms = ms_since(t1);
 
     for (size_t i = 0; i < ds.frames.size(); ++i) {
@@ -403,6 +405,10 @@ Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, js
     w.field("init_source", init_stats.source);
     w.field("init_points", init_stats.raw_points);
     w.field("init_gaussians", scene.count);
+    w.field("head_found", options.head.found);
+    w.field("head_radius", options.head.radius);
+    w.field("subject_height", options.head.subject_height);
+    w.field("head_weight", options.head_weight);
     w.field("load_ms", load_ms);
     w.field("init_ms", init_ms);
     w.field("setup_ms", setup_ms);
@@ -510,6 +516,8 @@ Java_com_ondevice_gsplat_NativeTrainer_evaluate(JNIEnv* env, jobject /*this*/) {
     w.field("ok", true);
     w.field("psnr", e.psnr);
     w.field("ssim", e.ssim);
+    w.field("head_psnr", e.head_psnr);
+    w.field("head_views", e.head_views);
     w.field("l1", e.l1);
     w.field("views", e.views);
     w.field("ms", ms_since(t0));

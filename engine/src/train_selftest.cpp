@@ -175,7 +175,8 @@ void look_at_c2w_gl(const float eye[3], const float target[3], float c2w[16]) {
 
 }  // namespace
 
-double reference_ssim(const std::vector<double>& x, const std::vector<double>& y, uint32_t width, uint32_t height) {
+double reference_ssim(const std::vector<double>& x, const std::vector<double>& y, uint32_t width, uint32_t height,
+                      const std::vector<double>* weights) {
   constexpr int R = 5;
   double w[2 * R + 1], total = 0.0;
   for (int k = -R; k <= R; ++k) total += w[k + R] = std::exp(-double(k * k) / (2.0 * 1.5 * 1.5));
@@ -216,7 +217,8 @@ double reference_ssim(const std::vector<double>& x, const std::vector<double>& y
     for (size_t p = 0; p < n; ++p) {
       const double mx = out[p], my = out[n + p];
       const double vx = out[2 * n + p] - mx * mx, vy = out[3 * n + p] - my * my, cxy = out[4 * n + p] - mx * my;
-      sum += (2 * mx * my + c1) * (2 * cxy + c2) / ((mx * mx + my * my + c1) * (vx + vy + c2));
+      const double w = weights ? (*weights)[p] : 1.0;
+      sum += w * (2 * mx * my + c1) * (2 * cxy + c2) / ((mx * mx + my * my + c1) * (vx + vy + c2));
     }
   }
   return sum / (3.0 * n);
@@ -225,8 +227,10 @@ double reference_ssim(const std::vector<double>& x, const std::vector<double>& y
 // Renders and returns the loss against `target` (RGBA8), compositing like the GPU.
 double reference_loss(const Camera& cam, const std::vector<double>& params, const std::vector<double>& sh,
                       int stride, int degree, const std::vector<uint8_t>& target, const float bg[3], bool masked,
-                      double lambda_dssim, std::vector<double>* image) {
+                      double lambda_dssim, std::vector<double>* image, const double* head) {
   std::vector<double> render(size_t(cam.width) * cam.height * 3), truth(render.size());
+  std::vector<double> weights(size_t(cam.width) * cam.height, 1.0);
+  double weighted_l1 = 0.0, weight_sum = 0.0;
   const size_t n = params.size() / 16;
   std::vector<Ref> refs(n);
   for (size_t i = 0; i < n; ++i) refs[i] = project(cam, &params[i * 16], &sh[i * stride], stride, degree);
@@ -235,7 +239,6 @@ double reference_loss(const Camera& cam, const std::vector<double>& params, cons
     if (refs[i].visible) order.push_back(i);
   }
   std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return refs[a].key < refs[b].key; });
-  double loss = 0;
   for (uint32_t y = 0; y < cam.height; ++y) {
     for (uint32_t x = 0; x < cam.width; ++x) {
       double T = 1, C[3] = {0, 0, 0};
@@ -255,16 +258,28 @@ double reference_loss(const Camera& cam, const std::vector<double>& params, cons
       for (int c = 0; c < 3; ++c) {
         const double out = C[c] + T * bg[c];
         const double tc = masked ? bg[c] * (1 - a) + t[c] / 255.0 * a : t[c] / 255.0;
-        loss += std::fabs(out - tc);
         render[(size_t(y) * cam.width + x) * 3 + c] = out;
         truth[(size_t(y) * cam.width + x) * 3 + c] = tc;
       }
+      double w = 1.0;
+      if (head != nullptr && head[2] > 0.0) {
+        const double d = std::hypot(x + 0.5 - head[0], y + 0.5 - head[1]) / head[2];
+        const double s = std::clamp((d - 0.8) / 0.2, 0.0, 1.0);
+        w = 1.0 + (head[3] - 1.0) * (1.0 - s * s * (3.0 - 2.0 * s));
+      }
+      weights[size_t(y) * cam.width + x] = w;
+      for (int c = 0; c < 3; ++c) {
+        const size_t i = (size_t(y) * cam.width + x) * 3 + c;
+        weighted_l1 += w * std::fabs(render[i] - truth[i]);
+      }
+      weight_sum += 3.0 * w;
     }
   }
   if (image) *image = render;
-  const double l1 = loss / (3.0 * cam.width * cam.height);
-  if (lambda_dssim <= 0.0) return l1;
-  return (1.0 - lambda_dssim) * l1 + lambda_dssim * (1.0 - reference_ssim(render, truth, cam.width, cam.height));
+  const double values = 3.0 * cam.width * cam.height;
+  if (lambda_dssim <= 0.0) return weighted_l1 / values;
+  return (1.0 - lambda_dssim) * weighted_l1 / values +
+         lambda_dssim * (weight_sum / values - reference_ssim(render, truth, cam.width, cam.height, &weights));
 }
 
 Dataset make_test_dataset(uint32_t width, uint32_t height, size_t frames, bool masks, uint32_t seed) {
@@ -339,16 +354,28 @@ bool GradientReport::ok() const {
 }
 
 GradientReport check_gradients(VkContext& ctx, bool masked, TrainOptions::Reduction reduction, int degree,
-                               float lambda_dssim) {
+                               float lambda_dssim, float head_weight) {
   constexpr uint32_t kWidth = 64, kHeight = 48, kCount = 10;
   Dataset ds = make_test_dataset(kWidth, kHeight, 1, masked, 3);
   SplatScene scene = make_test_scene(kCount, degree, 11);
   TrainOptions options = frozen_train_options(degree, masked);
   options.reduction = reduction;
   options.lambda_dssim = lambda_dssim;
+  const Camera cam = dataset_camera(ds, ds.frames[0]);
+  // A head region around the scene's centre, as the trainer projects it.
+  double head[4] = {0, 0, 0, 1};
+  if (head_weight != 1.0f) {
+    options.head.found = true;
+    options.head.radius = 0.25f;
+    options.head_weight = head_weight;
+    const float* t = cam.translation;  // the centre (origin) in camera space
+    head[0] = double(cam.fx) * t[0] / t[2] + cam.cx;
+    head[1] = double(cam.fy) * t[1] / t[2] + cam.cy;
+    head[2] = double(cam.fx) * options.head.radius / t[2];
+    head[3] = head_weight;
+  }
   Trainer trainer(ctx, ds, scene, options);
   const float bg[3] = {0.2f, 0.5f, 0.7f};
-  const Camera cam = dataset_camera(ds, ds.frames[0]);
 
   GradientReport report;
   report.reduction = trainer.reduction();
@@ -372,7 +399,7 @@ GradientReport check_gradients(VkContext& ctx, bool masked, TrainOptions::Reduct
   std::vector<double> ref_image;
   const double lambda = options.lambda_dssim;
   report.loss_ref =
-      reference_loss(cam, params, sh, stride, degree, ds.frames[0].rgba, bg, masked, lambda, &ref_image);
+      reference_loss(cam, params, sh, stride, degree, ds.frames[0].rgba, bg, masked, lambda, &ref_image, head);
   const std::vector<uint8_t> gpu_image = trainer.render(cam, bg);
   for (size_t p = 0; p < size_t(kWidth) * kHeight; ++p) {
     for (int c = 0; c < 3; ++c) {
@@ -402,9 +429,11 @@ GradientReport check_gradients(VkContext& ctx, bool masked, TrainOptions::Reduct
         double& value = off >= 0 ? params[i * 16 + off] : sh[i * stride + (-1 - off)];
         const double saved = value;
         value = saved + eps;
-        const double up = reference_loss(cam, params, sh, stride, degree, ds.frames[0].rgba, bg, masked, lambda);
+        const double up =
+            reference_loss(cam, params, sh, stride, degree, ds.frames[0].rgba, bg, masked, lambda, nullptr, head);
         value = saved - eps;
-        const double down = reference_loss(cam, params, sh, stride, degree, ds.frames[0].rgba, bg, masked, lambda);
+        const double down =
+            reference_loss(cam, params, sh, stride, degree, ds.frames[0].rgba, bg, masked, lambda, nullptr, head);
         value = saved;
         const double fd = (up - down) / (2 * eps);
         if (off >= 12 && off < 15) dc_fd[i * 3 + (off - 12)] = fd;

@@ -76,6 +76,17 @@ Dataset load_dataset(const std::string& directory, uint32_t target_width) {
   const double depth_scale = root.number_or("depth_unit_scale_factor", 0.001);
 
   Dataset ds;
+  if (const JsonValue* lab = root.find("gsplat_lab")) {
+    const JsonValue* up = lab->find("world_up");
+    if (up != nullptr && up->type == JsonValue::Type::Array && up->array.size() == 3) {
+      double len = 0.0;
+      for (const JsonValue& v : up->array) len += v.number * v.number;
+      len = std::sqrt(len);
+      if (len > 0.0) {
+        for (int k = 0; k < 3; ++k) ds.world_up[k] = float(up->array[k].number / len);
+      }
+    }
+  }
   const size_t slash = directory.find_last_of('/');
   ds.name = slash == std::string::npos ? directory : directory.substr(slash + 1);
   ds.width = std::min<uint32_t>(target_width, static_cast<uint32_t>(src_w));
@@ -228,6 +239,44 @@ Camera dataset_camera(const Dataset& ds, const DatasetFrame& f) {
   cam.width = ds.width;
   cam.height = ds.height;
   return cam;
+}
+
+HeadRegion estimate_head(const Dataset& ds, const SplatScene& subject) {
+  HeadRegion head;
+  const size_t n = subject.count;
+  if (n < 200) return head;
+  const float* up = ds.world_up;
+  std::vector<float> heights(n);
+  for (size_t i = 0; i < n; ++i) {
+    const float* p = &subject.positions[i * 3];
+    heights[i] = p[0] * up[0] + p[1] * up[1] + p[2] * up[2];
+  }
+  std::vector<float> sorted = heights;
+  std::sort(sorted.begin(), sorted.end());
+  const float lo = sorted[n / 100], hi = sorted[n - 1 - n / 200];  // ignore stray points
+  const float height = hi - lo;
+  // Not a standing person (e.g. a head-and-shoulders capture): no head region.
+  if (!(height >= 1.0f)) return head;
+  // Heads are about an eighth of a standing person's height.
+  const float slab = hi - 0.13f * height;
+  std::vector<float> across[3];
+  for (size_t i = 0; i < n; ++i) {
+    if (heights[i] < slab || heights[i] > hi) continue;
+    const float* p = &subject.positions[i * 3];
+    for (int k = 0; k < 3; ++k) across[k].push_back(p[k] - heights[i] * up[k]);
+  }
+  if (across[0].size() < 20) return head;
+  // A little below the slab's middle (hair raises the top), with room for the chin.
+  const float middle = hi - 0.085f * height;
+  for (int k = 0; k < 3; ++k) {
+    std::vector<float>& v = across[k];
+    std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+    head.center[k] = v[v.size() / 2] + middle * up[k];
+  }
+  head.radius = 0.1f * height;
+  head.subject_height = height;
+  head.found = true;
+  return head;
 }
 
 SplatScene initialize_gaussians(const Dataset& ds, const InitOptions& options, InitStats* stats) {

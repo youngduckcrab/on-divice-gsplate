@@ -25,9 +25,10 @@ constexpr uint32_t kHeight = 48;
 
 void test_gradients(gs::VkContext& ctx, bool masked,
                     gs::TrainOptions::Reduction reduction = gs::TrainOptions::Reduction::Auto,
-                    float lambda_dssim = gs::TrainOptions{}.lambda_dssim) {
-  const gs::GradientReport r = gs::check_gradients(ctx, masked, reduction, 2, lambda_dssim);
-  std::printf("  loss (lambda %.1f): gpu %.6f, reference %.6f\n", lambda_dssim, r.loss_gpu, r.loss_ref);
+                    float lambda_dssim = gs::TrainOptions{}.lambda_dssim, float head_weight = 1.0f) {
+  const gs::GradientReport r = gs::check_gradients(ctx, masked, reduction, 2, lambda_dssim, head_weight);
+  std::printf("  loss (lambda %.1f, head x%.0f): gpu %.6f, reference %.6f\n", lambda_dssim, head_weight, r.loss_gpu,
+              r.loss_ref);
   EXPECT(r.image_max_diff < 2.5 / 255.0, "forward image differs from the reference by %.4f", r.image_max_diff);
   EXPECT(std::fabs(r.loss_gpu - r.loss_ref) < 1e-4, "loss %.6f, reference %.6f", r.loss_gpu, r.loss_ref);
   for (const gs::GradientGroup& g : r.groups) {
@@ -452,6 +453,9 @@ int main() {
     test_gradients(ctx, true, gs::TrainOptions::Reduction::Bucket, 0.0f);
     test_gradients(ctx, false, gs::TrainOptions::Reduction::Bucket, 1.0f);
     test_gradients(ctx, true, gs::TrainOptions::Reduction::SerialCut, 1.0f);
+    // With a head region weighing 3x (L1 and SSIM parts).
+    test_gradients(ctx, true, gs::TrainOptions::Reduction::Bucket, 0.2f, 3.0f);
+    test_gradients(ctx, false, gs::TrainOptions::Reduction::SerialCut, 1.0f, 3.0f);
     test_gradients(ctx, true, gs::TrainOptions::Reduction::Shared);
     test_gradients(ctx, true, gs::TrainOptions::Reduction::SubgroupScalar);
     test_gradients(ctx, false, gs::TrainOptions::Reduction::SubgroupLane4);

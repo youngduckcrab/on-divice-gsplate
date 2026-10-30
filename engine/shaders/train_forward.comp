@@ -15,7 +15,9 @@ layout(std430, binding = 5) readonly buffer Target { uint target[]; };  // RGBA8
 layout(std430, binding = 6) writeonly buffer PixelGrad { vec4 pixel_grad[]; };  // dL/dC rgb, final T
 layout(std430, binding = 7) writeonly buffer PixelCount { uint pixel_count[]; };  // pairs up to the last contributor
 layout(std430, binding = 8) writeonly buffer Image { uint image[]; };  // rendered RGBA8
-layout(std430, binding = 9) writeonly buffer TileLoss { vec4 tile_loss[]; };  // sum |e|, sum e^2
+// 2 per tile: [0] sum |e|, sum e^2, (SSIM sum, train_ssim), sum w |e|;
+// [1] (sum w SSIM, train_ssim), sum w (per channel), head sum e^2, head pixels. w: pixel_weight.
+layout(std430, binding = 9) writeonly buffer TileLoss { vec4 tile_loss[]; };
 // Per tile, the largest per-pixel count: pairs behind it contribute to no pixel.
 layout(std430, binding = 10) writeonly buffer TileCount { uint tile_count[]; };
 // For the bucket backward pass (kFlagBucketState; see train_backward_bucket.comp):
@@ -33,6 +35,7 @@ shared vec4 s_g1[BATCH];  // conic abc
 shared vec4 s_g2[BATCH];  // colour
 shared uint s_done;
 shared vec2 s_loss[BATCH];
+shared vec4 s_more[BATCH];  // sum w |e|, sum w, head sum e^2, head pixels
 shared uint s_count[BATCH];
 
 void main() {
@@ -96,6 +99,7 @@ void main() {
   }
 
   vec2 loss = vec2(0.0);
+  vec4 more = vec4(0.0);
   if (inside) {
     vec3 bg = frame.background.rgb;
     vec3 out_color = C + T * bg;
@@ -103,9 +107,10 @@ void main() {
     vec3 target_color = (frame.model.w & kFlagMaskedTarget) != 0u ? mix(bg, t.rgb, t.a) : t.rgb;
     vec3 e = out_color - target_color;
     // The L1 part; train_ssim_grad adds the D-SSIM part.
-    vec3 dL_dC = sign(e) * ((1.0 - frame.loss.x) * frame.background.w);
+    float w = pixel_weight(frame.head, center);
+    vec3 dL_dC = sign(e) * ((1.0 - frame.loss.x) * frame.background.w * w);
     if ((frame.model.w & kFlagSsim) != 0u) {
-      ssim_input[pix_id * 2u] = vec4(out_color, 0.0);
+      ssim_input[pix_id * 2u] = vec4(out_color, w);
       ssim_input[pix_id * 2u + 1u] = vec4(target_color, 0.0);
     }
     pixel_grad[pix_id] = vec4(dL_dC, T);
@@ -113,19 +118,23 @@ void main() {
     pixel_count[pix_id] = last;
     image[pix_id] = packUnorm4x8(vec4(clamp(out_color, 0.0, 1.0), 1.0 - T));
     loss = vec2(abs(e.r) + abs(e.g) + abs(e.b), dot(e, e));
+    more = vec4(w * loss.x, 3.0 * w, in_head(frame.head, center) ? vec2(loss.y, 1.0) : vec2(0.0));
   }
   s_loss[lid] = loss;
+  s_more[lid] = more;
   s_count[lid] = last;
   barrier();
   for (uint stride = BATCH / 2u; stride > 0u; stride >>= 1u) {
     if (lid < stride) {
       s_loss[lid] += s_loss[lid + stride];
+      s_more[lid] += s_more[lid + stride];
       s_count[lid] = max(s_count[lid], s_count[lid + stride]);
     }
     barrier();
   }
   if (lid == 0u) {
-    tile_loss[tile_id] = vec4(s_loss[0], 0.0, 0.0);
+    tile_loss[tile_id * 2u] = vec4(s_loss[0], 0.0, s_more[0].x);
+    tile_loss[tile_id * 2u + 1u] = vec4(0.0, s_more[0].yzw);
     tile_count[tile_id] = s_count[0];
     uint len = range.y - range.x;
     if (buckets && len > 0u) {

@@ -6,7 +6,7 @@
 //            [--sh 3] [--init-gaussians 150000] [--opacity-reset N (0 = off)] [--grad-threshold 2e-4]
 //            [--reduction bucket|bucket2|subgroup|subgroup_scalar|subgroup_lane4|subgroup_lane1|serial_cut2|serial_cut|serial|shared]
 //            [--alternatives serial_cut2,subgroup_lane4,...] (timed on real steps; the fastest is kept)
-//            [--no-masks] [--preview <dir>] [--eval-every 1000] [--dssim 0.2 (0 = L1 only)] [--dssim-end L (ramp to L)]
+//            [--no-masks] [--preview <dir>] [--eval-every 1000] [--dssim 0.2 (0 = L1 only)] [--dssim-end L (ramp to L)] [--head-weight 3]
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -83,6 +83,8 @@ int main(int argc, char** argv) {
         grad_threshold = std::atof(next());
       } else if (arg == "--dssim") {
         options.lambda_dssim = float(std::atof(next()));
+      } else if (arg == "--head-weight") {
+        options.head_weight = float(std::atof(next()));
       } else if (arg == "--dssim-end") {
         options.lambda_dssim_end = float(std::atof(next()));
       } else if (arg == "--no-masks") {
@@ -113,6 +115,12 @@ int main(int argc, char** argv) {
     init.subject_only = options.masked;
     init.max_gaussians = max_init;
     gs::SplatScene scene = gs::initialize_gaussians(ds, init, &init_stats);
+    if (options.masked && ds.has_masks) options.head = gs::estimate_head(ds, scene);
+    if (options.head.found) {
+      std::printf("head region: centre %.2f %.2f %.2f, radius %.2f m (subject %.2f m tall), weight %.1f\n",
+                  options.head.center[0], options.head.center[1], options.head.center[2], options.head.radius,
+                  options.head.subject_height, options.head_weight);
+    }
     std::printf("init from %s: %zu points -> %u gaussians (voxel %.4f)\n", init_stats.source.c_str(),
                 init_stats.raw_points, scene.count, init_stats.voxel_size);
 
@@ -152,7 +160,8 @@ int main(int argc, char** argv) {
       }
       if (eval_every > 0 && (s.step % eval_every == 0 || trainer.finished())) {
         const gs::EvalResult e = trainer.evaluate();
-        std::printf("  eval: held-out PSNR %.2f dB, SSIM %.4f over %u views\n", e.psnr, e.ssim, e.views);
+        std::printf("  eval: held-out PSNR %.2f dB, SSIM %.4f over %u views; head PSNR %.2f dB over %u\n", e.psnr,
+                    e.ssim, e.views, e.head_psnr, e.head_views);
         if (!preview.empty()) {
           for (size_t f = 0; f < ds.frames.size(); f += ds.frames.size() / 4) {
             const float black[3] = {0, 0, 0};

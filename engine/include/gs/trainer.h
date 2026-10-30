@@ -56,6 +56,11 @@ struct TrainOptions {
   // 0.9810 for 0.2 throughout (and 34.96 / 0.9756 for L1 alone).
   float lambda_dssim = 0.2f;
   float lambda_dssim_end = 1.0f;
+  // Pixels in the head region (estimate_head) weigh this much in the loss, so
+  // the face gets more of the gradient and of the densification. Views where
+  // the head covers much of the frame are left alone.
+  HeadRegion head;
+  float head_weight = 3.0f;
 
   // Adaptive density control.
   uint32_t densify_from = 300;
@@ -139,6 +144,8 @@ struct RetuneResult {
 struct EvalResult {
   double psnr = 0.0;  // mean over the held-out views
   double ssim = 0.0;
+  double head_psnr = 0.0;  // within the head circle, over the views that show it
+  uint32_t head_views = 0;
   double l1 = 0.0;
   uint32_t views = 0;
 };
@@ -275,7 +282,8 @@ class Trainer {
   size_t active_ = 0;
   std::vector<RetuneResult> retunes_;
   bool bucket_fits_ = true;  // bucket_state_ could be sized for the pair capacity
-  double last_losses_[3] = {0.0, 0.0, 0.0};  // sum |e|, sum e^2, sum SSIM of the last slot read
+  // Of the last slot read: sum |e|, e^2, SSIM, w |e|, w SSIM, w, head e^2, head pixels.
+  double last_losses_[8] = {};
   void set_view_stats();                       // l1, psnr, ssim, loss from last_losses_
   uint64_t max_pairs_seen_ = 0;
   uint32_t last_slot_ = 0;  // slot of the last step, whose frame data densify() reuses

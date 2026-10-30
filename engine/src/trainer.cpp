@@ -53,6 +53,7 @@ struct Trainer::FrameData {
   float densify1[4];
   uint32_t limits[4];
   float loss[4];
+  float head[4];
 };
 
 namespace {
@@ -259,7 +260,7 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
     frames_.push_back(ctx.create_buffer(sizeof(FrameData), MemoryKind::Upload));
     targets_.push_back(ctx.create_buffer(pixels * 4, MemoryKind::Upload));
     readback_smalls_.push_back(ctx.create_buffer(16, MemoryKind::Readback));
-    readback_losses_.push_back(ctx.create_buffer(tiles * 16, MemoryKind::Readback));
+    readback_losses_.push_back(ctx.create_buffer(tiles * 32, MemoryKind::Readback));
   }
   // Persistent descriptor sets: per batch slot about 16 pipelines (and one
   // per backward variant), up to 14 buffers each.
@@ -287,7 +288,7 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
   pixel_count_ = ctx.create_buffer(pixels * 4, MemoryKind::Device);
   image_ = ctx.create_buffer(pixels * 4, MemoryKind::Device);
   ranges_buf_ = ctx.create_buffer((tiles + 1) * 8, MemoryKind::Device);  // + the tile emit pads into
-  tile_loss_ = ctx.create_buffer(tiles * 16, MemoryKind::Device);
+  tile_loss_ = ctx.create_buffer(tiles * 32, MemoryKind::Device);
   tile_count_ = ctx.create_buffer(tiles * 4, MemoryKind::Device);
   pixel_dot_ = ctx.create_buffer(pixels * 4, MemoryKind::Device);
   ssim_input_ = ctx.create_buffer(pixels * 32, MemoryKind::Device);
@@ -400,6 +401,22 @@ void Trainer::write_frame(uint32_t slot, const Camera& camera, const float backg
   f.loss[0] = lambda_at(step);
   f.loss[1] = 0.01f * 0.01f;  // SSIM constants for colours in [0, 1]
   f.loss[2] = 0.03f * 0.03f;
+  f.head[3] = 1.0f;
+  if (options_.head.found) {
+    const float* c = options_.head.center;
+    float t[3];
+    for (int r = 0; r < 3; ++r) {
+      t[r] = camera.rotation[r * 3] * c[0] + camera.rotation[r * 3 + 1] * c[1] + camera.rotation[r * 3 + 2] * c[2] +
+             camera.translation[r];
+    }
+    if (t[2] > 0.05f) {
+      f.head[0] = camera.fx * t[0] / t[2] + camera.cx;
+      f.head[1] = camera.fy * t[1] / t[2] + camera.cy;
+      f.head[2] = camera.fx * options_.head.radius / t[2];
+      // A head filling much of the view needs no extra weight (close-ups).
+      f.head[3] = f.head[2] < 0.25f * float(height_) ? options_.head_weight : 1.0f;
+    }
+  }
   std::memcpy(frames_[slot].mapped(), &f, sizeof(f));
 }
 
@@ -591,16 +608,11 @@ bool Trainer::read_slot(uint32_t slot) {
   stats_.tile_mismatch = small[1];
   max_pairs_seen_ = std::max<uint64_t>(max_pairs_seen_, small[0]);
   const float* v = static_cast<const float*>(readback_losses_[slot].mapped());
-  double abs_sum = 0.0, sq_sum = 0.0;
+  // Per tile (train_forward): |e|, e^2, SSIM, w |e|, w SSIM, w, head e^2, head pixels.
+  for (double& s : last_losses_) s = 0.0;
   for (uint32_t t = 0; t < tiles_x_ * tiles_y_; ++t) {
-    abs_sum += v[t * 4];
-    sq_sum += v[t * 4 + 1];
+    for (int k = 0; k < 8; ++k) last_losses_[k] += v[t * 8 + k];
   }
-  double ssim_sum = 0.0;
-  for (uint32_t t = 0; t < tiles_x_ * tiles_y_; ++t) ssim_sum += v[t * 4 + 2];
-  last_losses_[0] = abs_sum;
-  last_losses_[1] = sq_sum;
-  last_losses_[2] = ssim_sum;
   return small[0] > pair_capacity_;
 }
 
@@ -610,7 +622,8 @@ void Trainer::set_view_stats() {
   stats_.psnr = -10.0 * std::log10(std::max(last_losses_[1] / n, 1e-12));
   const double lambda = lambda_at(stats_.step);
   stats_.ssim = uses_ssim() ? last_losses_[2] / n : 0.0;
-  stats_.loss = (1.0 - lambda) * stats_.l1 + lambda * (1.0 - stats_.ssim);
+  // The objective, with the head's weight: (1 - lambda) sum w |e| + lambda sum w (1 - SSIM), over 3 pixels.
+  stats_.loss = ((1.0 - lambda) * last_losses_[3] + lambda * (last_losses_[5] - last_losses_[4])) / n;
 }
 
 void Trainer::run_view(const Camera& camera, const uint8_t* target, const float background[3], bool masked_target,
@@ -901,7 +914,7 @@ std::vector<uint8_t> Trainer::render(const Camera& camera, const float backgroun
 EvalResult Trainer::evaluate() {
   EvalResult result;
   const float black[3] = {0.0f, 0.0f, 0.0f};
-  double psnr_sum = 0.0, l1_sum = 0.0, ssim_sum = 0.0;
+  double psnr_sum = 0.0, l1_sum = 0.0, ssim_sum = 0.0, head_sum = 0.0;
   const double n = 3.0 * width_ * height_;
   for (const DatasetFrame& frame : dataset_.frames) {
     if (!frame.holdout) continue;
@@ -910,11 +923,16 @@ EvalResult Trainer::evaluate() {
     psnr_sum += -10.0 * std::log10(std::max(sq_sum / n, 1e-12));
     l1_sum += abs_sum / n;
     ssim_sum += last_losses_[2] / n;
+    if (last_losses_[7] > 0.0) {
+      head_sum += -10.0 * std::log10(std::max(last_losses_[6] / (3.0 * last_losses_[7]), 1e-12));
+      ++result.head_views;
+    }
     ++result.views;
   }
   if (result.views > 0) {
     result.psnr = psnr_sum / result.views;
     result.ssim = ssim_sum / result.views;
+    result.head_psnr = result.head_views > 0 ? head_sum / result.head_views : 0.0;
     result.l1 = l1_sum / result.views;
   }
   return result;

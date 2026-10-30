@@ -33,6 +33,7 @@ struct Dataset {
   std::vector<uint8_t> point_colors;  // rgb per point
   float camera_center[3] = {0, 0, 0};
   float camera_extent = 1.0f;  // max camera distance from camera_center (3DGS "scene extent")
+  float world_up[3] = {0, 1, 0};  // gsplat_lab.world_up when given (gravity for phone captures)
   std::vector<std::string> skipped;  // frames left out because their files could not be read
 
   size_t train_count() const;
@@ -64,5 +65,17 @@ struct InitStats {
 // Initial gaussians (SH degree 0) from the dataset's depth maps, its sparse
 // points, or random points around the cameras' target, in that order of preference.
 SplatScene initialize_gaussians(const Dataset& dataset, const InitOptions& options, InitStats* stats = nullptr);
+
+// Where a standing person's head is, from points on them (e.g. subject-only
+// initial gaussians): the top 13% of their extent along world up, a sphere
+// around the middle of that slab. Training weights the head's pixels more.
+// Not found for subjects under 1 m tall (close-ups), assuming metric scale.
+struct HeadRegion {
+  bool found = false;
+  float center[3] = {0, 0, 0};
+  float radius = 0;
+  float subject_height = 0;  // extent of the points along world up
+};
+HeadRegion estimate_head(const Dataset& dataset, const SplatScene& subject);
 
 }  // namespace gs

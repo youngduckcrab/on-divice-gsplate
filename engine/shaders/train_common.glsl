@@ -29,7 +29,19 @@ struct FrameData {
   vec4 densify1;    // prune max screen radius, random seed (uint bits), split scale divisor, unused
   uvec4 limits;     // pair capacity (more pairs: the step is skipped), unused
   vec4 loss;        // D-SSIM weight lambda (loss = (1 - lambda) L1 + lambda (1 - SSIM)), C1, C2, unused
+  vec4 head;        // head region in this view: centre x, y and radius (px; 0: none), loss weight
 };
+
+// Loss weight of the pixel centred at `p`: `head.w` inside the head circle,
+// fading to 1 over its outer fifth.
+float pixel_weight(vec4 head, vec2 p) {
+  if (head.z <= 0.0) return 1.0;
+  float d = length(p - head.xy) / head.z;
+  return 1.0 + (head.w - 1.0) * (1.0 - smoothstep(0.8, 1.0, d));
+}
+
+// Whether the pixel centred at `p` is in the head circle (head PSNR).
+bool in_head(vec4 head, vec2 p) { return head.z > 0.0 && length(p - head.xy) <= head.z; }
 
 const uint kFlagMaskedTarget = 1u;  // composite the target over the background using its alpha
 const uint kFlagBucketState = 2u;   // the forward pass saves state for train_backward_bucket
