@@ -1,0 +1,26 @@
+#version 450
+// Integer atomic add throughput into `slot_mask + 1` hashed slots.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Slots { uint slots[]; };
+
+layout(push_constant) uniform Params {
+  uint threads;
+  uint slot_mask;
+  uint per_thread;
+} pc;
+
+uint hash(uint x) {
+  x ^= x >> 16u; x *= 0x7feb352du;
+  x ^= x >> 15u; x *= 0x846ca68bu;
+  x ^= x >> 16u;
+  return x;
+}
+
+void main() {
+  uint tid = gl_GlobalInvocationID.x;
+  if (tid >= pc.threads) return;
+  for (uint j = 0u; j < pc.per_thread; ++j) {
+    atomicAdd(slots[hash(tid * pc.per_thread + j) & pc.slot_mask], 1u);
+  }
+}

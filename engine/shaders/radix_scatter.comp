@@ -1,0 +1,66 @@
+#version 450
+// Radix sort pass 3/3: stable scatter. Each block walks its items in chunks of
+// WG keys; a workgroup-wide scan of one-hot digit flags gives every key its rank
+// among equal digits in the chunk. Counts for the 16 digits are packed as bytes
+// into a uvec4 (max 128 per chunk fits in 8 bits).
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer KeysIn { uint keys_in[]; };
+layout(std430, binding = 1) readonly buffer ValuesIn { uint values_in[]; };
+layout(std430, binding = 2) writeonly buffer KeysOut { uint keys_out[]; };
+layout(std430, binding = 3) writeonly buffer ValuesOut { uint values_out[]; };
+layout(std430, binding = 4) readonly buffer Hist { uint hist[]; };
+
+layout(push_constant) uniform Params {
+  uint n;
+  uint shift;
+  uint num_blocks;
+} pc;
+
+const uint WG = 128u;
+const uint ITEMS = 8u;
+
+shared uvec4 s_scan[WG];
+shared uint s_offset[16];
+
+void main() {
+  uint lid = gl_LocalInvocationID.x;
+  uint block = gl_WorkGroupID.x;
+  if (lid < 16u) s_offset[lid] = hist[lid * pc.num_blocks + block];
+  barrier();
+
+  uint base = block * WG * ITEMS;
+  for (uint i = 0u; i < ITEMS; ++i) {
+    uint idx = base + i * WG + lid;
+    bool valid = idx < pc.n;
+    uint key = valid ? keys_in[idx] : 0u;
+    uint digit = (key >> pc.shift) & 15u;
+    uint comp = digit >> 2u;
+    uint byte_shift = (digit & 3u) * 8u;
+
+    uvec4 flag = uvec4(0u);
+    if (valid) flag[comp] = 1u << byte_shift;
+    s_scan[lid] = flag;
+    barrier();
+
+    for (uint offset = 1u; offset < WG; offset <<= 1u) {
+      uvec4 v = lid >= offset ? s_scan[lid - offset] : uvec4(0u);
+      barrier();
+      s_scan[lid] += v;
+      barrier();
+    }
+
+    uvec4 inclusive = s_scan[lid];
+    uvec4 chunk_total = s_scan[WG - 1u];
+    if (valid) {
+      uint rank = ((inclusive[comp] >> byte_shift) & 255u) - 1u;
+      uint dst = s_offset[digit] + rank;
+      keys_out[dst] = key;
+      values_out[dst] = values_in[idx];
+    }
+    barrier();
+
+    if (lid < 16u) s_offset[lid] += (chunk_total[lid >> 2u] >> ((lid & 3u) * 8u)) & 255u;
+    barrier();
+  }
+}

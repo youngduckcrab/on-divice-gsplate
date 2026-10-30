@@ -1,0 +1,34 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// FP16 throughput: 8 independent f16vec4 chains, unrolled 2x
+// (64 FMA = 128 FLOP per loop iteration per thread, same as fma_fp32).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) writeonly buffer Out { float result[]; };
+
+layout(push_constant) uniform Params {
+  uint iterations;
+  float seed;
+} pc;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  f16vec4 a0 = f16vec4(float16_t(pc.seed + float(i & 1023u) * 1e-4));
+  f16vec4 a1 = a0 + float16_t(0.125);
+  f16vec4 a2 = a0 + float16_t(0.25);
+  f16vec4 a3 = a0 + float16_t(0.375);
+  f16vec4 a4 = a0 + float16_t(0.5);
+  f16vec4 a5 = a0 + float16_t(0.625);
+  f16vec4 a6 = a0 + float16_t(0.75);
+  f16vec4 a7 = a0 + float16_t(0.875);
+  const f16vec4 m = f16vec4(float16_t(0.999));
+  const f16vec4 k = f16vec4(float16_t(0.001));
+  for (uint it = 0u; it < pc.iterations; ++it) {
+    a0 = fma(a0, m, k); a1 = fma(a1, m, k); a2 = fma(a2, m, k); a3 = fma(a3, m, k);
+    a4 = fma(a4, m, k); a5 = fma(a5, m, k); a6 = fma(a6, m, k); a7 = fma(a7, m, k);
+    a0 = fma(a0, m, k); a1 = fma(a1, m, k); a2 = fma(a2, m, k); a3 = fma(a3, m, k);
+    a4 = fma(a4, m, k); a5 = fma(a5, m, k); a6 = fma(a6, m, k); a7 = fma(a7, m, k);
+  }
+  f16vec4 s = a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7;
+  result[i] = float(s.x + s.y + s.z + s.w);
+}

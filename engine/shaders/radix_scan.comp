@@ -1,0 +1,42 @@
+#version 450
+// Radix sort pass 2/3: in-place exclusive prefix sum of the histogram with a
+// single workgroup. Each thread scans a contiguous chunk serially, then the
+// chunk totals are scanned in shared memory.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Hist { uint hist[]; };
+
+layout(push_constant) uniform Params {
+  uint count;
+} pc;
+
+const uint WG = 256u;
+
+shared uint s_sum[WG];
+
+void main() {
+  uint lid = gl_LocalInvocationID.x;
+  uint per_thread = (pc.count + WG - 1u) / WG;
+  uint begin = min(lid * per_thread, pc.count);
+  uint end = min(begin + per_thread, pc.count);
+
+  uint total = 0u;
+  for (uint i = begin; i < end; ++i) total += hist[i];
+  s_sum[lid] = total;
+  barrier();
+
+  // Hillis-Steele inclusive scan of the chunk totals.
+  for (uint offset = 1u; offset < WG; offset <<= 1u) {
+    uint v = lid >= offset ? s_sum[lid - offset] : 0u;
+    barrier();
+    s_sum[lid] += v;
+    barrier();
+  }
+
+  uint running = s_sum[lid] - total;
+  for (uint i = begin; i < end; ++i) {
+    uint h = hist[i];
+    hist[i] = running;
+    running += h;
+  }
+}
