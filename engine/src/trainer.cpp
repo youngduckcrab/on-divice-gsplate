@@ -546,7 +546,7 @@ void Trainer::record_optimize(VkCommandBuffer cmd, uint32_t slot, int part) {
   }
   if ((part == 0 || part == 3) && sh_stride_ > 0) {
     kernel(cmd, step_sh_, {&frames_[slot], &params_, &sh_, &m_sh_, &v_sh_, &sh_input_, &totals_},
-           div_up(uint64_t(slots_) * sh_stride_, 256));
+           div_up(uint64_t(slots_) * (sh_stride_ / 3), 256));
     VkContext::barrier(cmd);
   }
 }
