@@ -2,16 +2,17 @@
 
 | 항목 | 내용 |
 |---|---|
-| 문서 버전 | v0.4 |
+| 문서 버전 | v0.5 |
 | 작성일 | 2026-10-30 |
 | 대상 플랫폼 | Android (arm64) |
 | 테스트 기기 | **Galaxy Z Fold6** — Snapdragon 8 Gen 3 for Galaxy (GPU: Adreno 750), RAM 12 GB |
 | 촬영 대상 | **사람** (인물 3D 스캔) |
 | 진행 방식 | Claude가 구현 → APK 배포 → 사용자가 설치·실험 → **이 대화로 피드백** → 반복 |
 | 저장소 | private (GitHub Release로 APK 배포) |
-| 상태 | M1 완료 (뷰어 동작 확인). 카메라·촬영 인원이 없어 촬영(M2)은 보류하고, **가상 촬영 데이터셋으로 학습(M3)을 먼저** 진행 |
+| 상태 | **M3 첫 빌드(v0.3.0) 배포** — 가상 촬영 데이터셋으로 폰에서 학습. 기기 실측 대기 중. 촬영(M2)은 보류 |
 
 ### 변경 이력
+- v0.5: M3 1차 구현 반영 — atomic-free 그래디언트 방식 (c) 채택, densify를 M3로 앞당김(3DGS 방식, GPU에서 free list로 처리), D-SSIM은 M4로, 학습 이미지는 매 단계 업로드(128 MB 바인딩 제한 회피). §5.3 갱신.
 - v0.4: 카메라와 촬영 인원이 당분간 없음 → M2(촬영) 보류, M3(학습)을 [가상 촬영 데이터셋](datasets.md)으로 먼저 진행. M3에 데이터셋 불러오기 추가, 표준 장면에 가상 촬영 3종 추가.
 - v0.3: M0 기기 진단 결과 반영 ([결과](experiments/m0-fold6.md)) — float atomic 미지원에 따른 그래디언트 누적 방식, 128 MB 바인딩 제한, 1080p 촬영, 정렬 속도 목표, 메모리 예산 갱신.
 - v0.2: 테스트 기기(Fold6), 촬영 대상(사람), 피드백 채널(대화), private 저장소 결정 반영. 인물 스캔 설계(§5.8) 추가, 표준 장면·리스크·마일스톤 갱신.
@@ -224,30 +225,29 @@ on-divice-gsplate/
 
 ### 5.3 학습 엔진 (Vulkan compute)
 
-**iteration 1회의 흐름**
+**iteration 1회의 흐름** (v0.3.0 구현, `engine/src/trainer.cpp`, `engine/shaders/train_*.comp`)
 
-1. **전처리** — scale·quaternion으로 3D 공분산 → EWA 투영으로 2D conic, 반경, 타일 범위 계산 → SH에서 색 계산
-2. **정렬** — 깊이로 먼저 정렬한 뒤 타일 ID로 안정 정렬한다. 32-bit 키만 써서 64-bit 정수(`shaderInt64`) 지원에 의존하지 않는다.
+1. **전처리** (`train_project`) — scale·quaternion으로 3D 공분산 → EWA 투영으로 2D conic → SH에서 색. 타일 범위는 opacity를 반영한 반경(alpha ≥ 1/255인 영역)만큼 잡아 쌍 수를 줄인다. 타일 수를 prefix sum으로 합산(`scan_local` → `radix_scan` → `scan_add`).
+2. **정렬** (`train_emit` → radix sort → `train_ranges`) — 키 = (타일 ID << 16) | 16-bit log 깊이. 32-bit 키만 쓰므로 `shaderInt64` 불필요. 정렬 값은 정렬 전 쌍 인덱스.
    - 기기마다 subgroup 크기가 16~128로 다르므로 이에 의존하지 않는 radix sort를 쓴다. GPU 간 forward-progress 보장이 필요한 onesweep 방식은 쓰지 않는다.
-3. **Forward 래스터** — 16×16 타일, 픽셀별 front-to-back alpha blending. 최종 투과율과 마지막 기여 인덱스를 저장한다.
-4. **Loss** — (1−λ)·L1 + λ·D-SSIM (λ = 0.2). SSIM은 separable convolution compute 셰이더로 fused 처리한다.
-5. **Backward 래스터** — back-to-front로 다시 순회하며 가우시안별 그래디언트를 계산한다. 그래디언트 누적 방식 3가지를 구현하고 기기별 벤치마크로 고른다.
-   - (a) subgroup 합산 후 float atomic add (`VK_EXT_shader_atomic_float` 지원 시)
-   - (b) subgroup 합산 후 CAS loop로 float atomic 에뮬레이션
-   - (c) **atomic-free**: (타일, 가우시안) 쌍별 부분 그래디언트를 정렬 전 인덱스 위치에 기록 → 가우시안마다 연속 구간을 합산
-   - (d) **고정소수점 정수 atomic**: subgroup 합산 후 그래디언트를 스케일링해 int32 `atomicAdd`
-   - **M0 결과 (Fold6)**: float atomic 미지원, CAS는 경합이 높을 때 u32 atomic보다 16배 느림 → (a)는 불가, (b)·(c)·(d)를 M3에서 비교
-6. **Backward 전처리** — 2D 그래디언트를 3D 파라미터(위치, scale, rotation, opacity, SH) 그래디언트로 변환
-7. **Adam** — 단일 fused kernel. 이번 iteration에 화면에 보이지 않은 가우시안은 건너뛴다(sparse). 위치 학습률은 장면 크기 기준으로 지수 감쇠
-8. **Densify / Prune** (N iteration마다) — 개수 예산을 고정한다. 3DGS-MCMC식 재배치(relocation)를 1순위로 하고, Taming식 점수 기반 방식과 비교 실험한다.
+   - 쌍 개수는 매 단계 CPU로 읽어 온다(제출 2회/단계). 간접 dispatch로 없애는 것은 M5.
+3. **Forward 래스터** (`train_forward`) — 16×16 타일, 픽셀별 front-to-back alpha blending. 최종 투과율과 마지막 기여 인덱스, 픽셀별 dL/dC, 타일별 loss 합을 저장한다.
+4. **Loss** — L1. 마스크가 있으면 정답을 무작위 배경색 위에 합성하고 렌더도 같은 배경색 위에 그려, 대상 밖은 투명해지도록 학습한다. (M4: (1−λ)·L1 + λ·D-SSIM)
+5. **Backward 래스터** (`train_backward`) — back-to-front로 다시 순회. **(c) atomic-free 방식 채택**: 가우시안 B개씩 묶어 픽셀별 그래디언트를 subgroupAdd → 공유 메모리에서 subgroup끼리 합산 → (타일, 가우시안) 쌍별 그래디언트를 정렬 전 인덱스 위치에 기록. 가장 작은 subgroup 크기에 맞춰 공유 메모리 크기를 specialization constant로 정한다 (Adreno 64 → B=32, lavapipe 8 → B=8).
+   - (a)는 Fold6에서 불가(float atomic 없음), (b)·(d)는 (c)가 느릴 때 비교 후보로 남긴다.
+6. **Backward 전처리 + Adam** (`train_step`, 가우시안당 1스레드) — 정렬 전 순서에서 연속인 자기 쌍들을 합산 → 투영 · SH(시점 방향 포함) · 공분산 · quaternion 정규화를 거쳐 3D 파라미터 그래디언트 → fused Adam. 위치 학습률은 카메라 범위 기준 지수 감쇠. densify 통계(NDC 위치 그래디언트 크기, 보인 횟수, 최대 반경)도 여기서 누적.
+7. **Densify / Prune** (`train_densify_mark`, `train_densify_spawn`) — 3DGS 기본 방식: 평균 위치 그래디언트가 임계값 이상이면 작은 것은 복제, 큰 것은 분할(1.6배 축소, 가우시안 분포에서 표본), opacity < 0.005나 너무 큰 것은 제거. 제거된 슬롯은 free list로 재사용하고 슬롯 상한(가우시안 예산)을 넘지 않는다. 정수 atomic만 쓴다. opacity 리셋도 GPU에서.
+   - 3DGS-MCMC 재배치, Taming식 점수 기반 방식은 M4에서 비교.
 
-**점진 스케줄**: 학습 해상도 1/4 → 1/2 → 1, SH 0차 → 1차(→ 2차), 가우시안 예산 점증.
+**검증**: CI(lavapipe)에서 CPU 배정밀도 기준 구현과 forward 이미지, 모든 파라미터 그래디언트(위치, scale, rotation, opacity, SH 0~3차, 마스크 유무)를 중앙 차분으로 비교한다 (상대 오차 ~1e-9). 알려진 장면을 다시 맞추는 종단 테스트도 함께 돈다.
+
+**점진 스케줄**: SH 0차 → 3차 (기본 3000회 기준 500회마다 1차씩, 학습 횟수에 비례해 조정). 학습 해상도 단계적 증가는 M4 후보.
 
 **메모리 예산** (가우시안 1개당)
 - 파라미터는 SH 1차 기준 23 float(약 92 B). 그래디언트와 Adam 모멘트 2개까지 포함하면 약 0.4 KB. SH 3차면 약 1 KB.
 - 가우시안 30만 개 → 120~300 MB. 여기에 타일 쌍·정렬 버퍼 수십~100 MB, 학습 이미지(200장 × 640×480 RGBA ≈ 245 MB).
 - **전체 1 GB 안팎**을 목표로 한다 (M0에서 측정 시 가용 RAM 1.8 GB → 상한 1.5 GB).
-- **바인딩 제한**: Adreno 750은 storage buffer 바인딩 1개가 최대 128 MB. 큰 배열은 나누고, 학습 이미지는 이미지 배열(텍스처)에 둔다.
+- **바인딩 제한**: Adreno 750은 storage buffer 바인딩 1개가 최대 128 MB. 학습 이미지는 CPU 메모리에 두고 매 단계 현재 이미지만 올린다(360×640이면 0.9 MB). 쌍별 그래디언트(48 B/쌍)가 이 제한에 걸리므로 쌍은 최대 약 280만 개.
 
 **정렬 속도**: M0에서 32-bit 키 100만 개 정렬이 20.9 ms(50 Mkeys/s, 결과 정확). 학습에는 4~8배 빨라야 하므로 깊이 선정렬 + 타일 ID 키(3~4 패스), subgroup 기반 순위 계산으로 개선한다.
 
@@ -380,6 +380,8 @@ on-divice-gsplate/
 **목표**: 폰에서 처음부터 끝까지 학습되는 첫 결과.
 
 **구현**: **데이터셋 불러오기**(zip: 이미지 + `transforms.json` + 마스크 + 깊이) 및 카메라 궤적·깊이 포인트 확인 화면, Vulkan 전처리 · 정렬 · forward · backward · Adam, L1 loss, 인물 마스크 기반 학습(배경 무작위색 치환), depth 초기화, 고정 가우시안 수(densify 없음), SH 0차, 학습 화면(미리보기, 손실/PSNR 그래프, 단계별 시간), 결과 저장 → 뷰어. CI에서 CPU 레퍼런스 대비 그래디언트 수치 검증.
+
+**v0.3.0에서 실제로 한 것**: 위 항목 중 카메라 궤적·깊이 포인트 확인 화면은 빠졌고(학습 미리보기로 대신), 대신 densify(3DGS 방식)와 SH 3차까지를 앞당겨 넣었다. 프리셋 3개(빠름 360px·2000회 / 표준 360px·4000회 / 고품질 540px·7000회). lavapipe(CPU 소프트웨어 Vulkan)에서 head 데이터셋 180×320, 250회 학습만으로 얼굴이 알아볼 수 있게 재구성됨을 확인 — 폰 속도와 품질은 사용자 테스트로 측정한다.
 
 **사용자 테스트**
 1. 가상 촬영 데이터셋(head → lizard → body 순)으로 학습 실행 → 완료까지 걸린 시간

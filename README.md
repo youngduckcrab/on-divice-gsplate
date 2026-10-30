@@ -5,7 +5,7 @@
 - 개발 계획서: [docs/PLAN.md](docs/PLAN.md)
 - 릴리즈 노트: [docs/releases/](docs/releases/)
 - 예제 데이터셋 (가상 촬영): [docs/datasets.md](docs/datasets.md)
-- 현재 단계: **M1 — 스플랫 뷰어** (`v0.2.0`). M0 결과: [docs/experiments/m0-fold6.md](docs/experiments/m0-fold6.md)
+- 현재 단계: **M3 — 온디바이스 학습 v1** (`v0.3.0`). M0 결과: [docs/experiments/m0-fold6.md](docs/experiments/m0-fold6.md)
 
 ## 구조
 
@@ -31,4 +31,5 @@ cmake --build build/engine
 ctest --test-dir build/engine --output-on-failure
 ./build/engine/gs_probe          # 기기 정보 + 벤치마크 JSON 출력
 ./build/engine/gs_render scene.spz out.ppm 800 600   # 뷰어와 같은 렌더러로 이미지 저장
+./build/engine/gs_train dataset_dir out.ply --width 360 --iters 3000   # 앱과 같은 엔진으로 학습
 ```

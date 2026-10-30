@@ -9,6 +9,7 @@ import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -16,6 +17,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalView
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.ondevice.gsplat.train.TrainViewModel
 import java.io.File
 
 private val tabs = listOf("학습", "뷰어", "진단")
@@ -25,6 +29,13 @@ fun AppScreen() {
     var selected by rememberSaveable { mutableIntStateOf(0) }
     // A trained model waiting to be opened by the viewer tab.
     var pendingModel by remember { mutableStateOf<File?>(null) }
+    // Training takes minutes and stops if the screen sleeps; keep it on on every tab.
+    val trainVm: TrainViewModel = viewModel()
+    val view = LocalView.current
+    DisposableEffect(trainVm.running) {
+        view.keepScreenOn = trainVm.running
+        onDispose { view.keepScreenOn = false }
+    }
     Scaffold(
         topBar = {
             TabRow(selectedTabIndex = selected, modifier = Modifier.statusBarsPadding()) {

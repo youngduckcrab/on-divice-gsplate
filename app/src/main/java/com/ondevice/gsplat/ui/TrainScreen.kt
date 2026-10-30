@@ -30,7 +30,6 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -38,7 +37,6 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ondevice.gsplat.train.DatasetInfo
@@ -63,13 +61,6 @@ fun TrainScreen(onOpenModel: (File) -> Unit, vm: TrainViewModel = viewModel()) {
     val exportPly = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/octet-stream"),
     ) { uri -> if (uri != null) vm.exportTo(uri) }
-
-    // Training can take minutes; keep the screen (and with it the app) awake.
-    val view = LocalView.current
-    DisposableEffect(vm.running) {
-        view.keepScreenOn = vm.running
-        onDispose { view.keepScreenOn = false }
-    }
 
     Column(
         Modifier
@@ -240,7 +231,7 @@ private fun ProgressCard(vm: TrainViewModel) {
             val total = s.optInt("iterations").coerceAtLeast(1)
             LinearProgressIndicator(progress = { step.toFloat() / total }, modifier = Modifier.fillMaxWidth())
             val remaining = if (step > 0) vm.elapsedSeconds / step * (total - step) else 0.0
-            Text("$step / $total회 · 경과 ${duration(vm.elapsedSeconds)} · 남은 시간 약 ${duration(remaining)}")
+            Text("$step / ${total}회 · 경과 ${duration(vm.elapsedSeconds)} · 남은 시간 약 ${duration(remaining)}")
             Text(
                 "가우시안 ${thousands(s.optLong("gaussians"))} · 쌍 ${thousands(s.optLong("pairs"))} · " +
                     "SH ${s.optInt("sh_degree")} · ${"%.1f".format(Locale.US, s.optDouble("step_ms"))} ms/회",
