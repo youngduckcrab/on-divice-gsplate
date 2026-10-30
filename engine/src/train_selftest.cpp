@@ -268,6 +268,7 @@ SplatScene make_test_scene(uint32_t n, int degree, uint32_t seed) {
 TrainOptions frozen_train_options(int degree, bool masked) {
   TrainOptions o;
   o.iterations = 1;
+  o.max_gaussians = 0;  // room for the scene only: no densification, and no large buffers to clear
   o.sh_degree = degree;
   o.sh_degree_interval = 0;
   o.masked = masked;
@@ -480,8 +481,77 @@ double benchmark_backward(VkContext& ctx, TrainOptions::Reduction reduction) {
   return measured > 0 ? total / measured : 1e9;
 }
 
+bool bucket_matches_reference(VkContext& ctx, TrainOptions::Reduction bucket, TrainOptions::Reduction reference) {
+  // Faint overlapping splats: pixel lists span many buckets of 32, so most
+  // buckets start from the state the forward pass saved. The CPU check's
+  // scene is too small to reach that path.
+  Dataset ds = make_test_dataset(64, 48, 1, true, 23);
+  SplatScene scene = make_test_scene(700, 1, 29);
+  for (float& v : scene.opacity_logits) v -= 2.5f;
+  for (float& v : scene.log_scales) v += 0.3f;
+  TrainOptions o = frozen_train_options(1, true);
+  o.reduction = bucket;
+  o.alternatives = {reference};
+  Trainer trainer(ctx, ds, scene, o);
+  const float bg[3] = {0.3f, 0.2f, 0.1f};
+  const std::string bucket_name = trainer.reduction();
+  trainer.step_on(0, bg);  // the learning rates are zero: the second step sees the same model
+  const std::vector<float> a = trainer.debug_snapshot().pair_grads;
+  for (const std::string name : {"serial_cut", "serial_cut2", "serial", "shared"}) {
+    if (trainer.select_backward(name)) break;
+  }
+  if (trainer.reduction() == bucket_name) return false;
+  trainer.step_on(0, bg);
+  const std::vector<float> b = trainer.debug_snapshot().pair_grads;
+  if (a.size() != b.size() || a.empty()) return false;
+  double max_diff = 0.0, max_abs = 0.0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (!std::isfinite(a[i])) return false;
+    max_diff = std::max(max_diff, double(std::fabs(a[i] - b[i])));
+    max_abs = std::max(max_abs, double(std::fabs(b[i])));
+  }
+  return max_abs > 0.0 && max_diff <= 1e-4 * max_abs;
+}
+
 ReductionChoice choose_reduction(VkContext& ctx) {
   using Reduction = TrainOptions::Reduction;
+  ReductionChoice choice;
+  // Fast path: bucket was 2.7-4.4x faster than every other variant on Fold6's
+  // training steps. Check it against the CPU reference and, on long pixel
+  // lists, against serial_cut (checked too, and kept as its fallback for when
+  // the bucket state does not fit). Training retimes them anyway.
+  bool bucket_bad = false;
+  auto checked = [&](Reduction r, const char* name) {
+    if (!choice.log.empty()) choice.log += ", ";
+    choice.log += name;
+    try {
+      const bool ok = check_gradients(ctx, true, r, 1).ok();
+      choice.log += ok ? " 정상" : " 틀림";
+      return ok;
+    } catch (const std::exception&) {
+      choice.log += " 사용 불가";
+      return false;
+    }
+  };
+  if (checked(Reduction::SerialCut, "serial_cut") && checked(Reduction::Bucket, "bucket")) {
+    bool long_ok = false;
+    try {
+      long_ok = bucket_matches_reference(ctx, Reduction::Bucket, Reduction::SerialCut);
+    } catch (const std::exception&) {
+    }
+    choice.log += long_ok ? ", 긴 목록 일치" : ", 긴 목록 불일치";
+    if (long_ok) {
+      choice.found = true;
+      choice.reduction = Reduction::Bucket;
+      choice.name = "bucket";
+      choice.others = {Reduction::SerialCut};
+      choice.log += " → bucket";
+      return choice;
+    }
+    bucket_bad = true;
+  }
+  choice.log += "; 전체 검사: ";
+  const size_t full_start = choice.log.size();
   struct Candidate {
     Reduction reduction;
     const char* name;
@@ -497,13 +567,13 @@ ReductionChoice choose_reduction(VkContext& ctx) {
                                   {Reduction::SerialCut2, "serial_cut2", false},
                                   {Reduction::Serial, "serial", true},
                                   {Reduction::Shared, "shared", true}};
-  ReductionChoice choice;
   double best_ms = 0.0;
   std::vector<std::pair<double, Reduction>> correct;
   char buffer[32];
   for (const Candidate& c : candidates) {
     if (c.fallback && choice.found) break;
-    if (!choice.log.empty()) choice.log += ", ";
+    if (bucket_bad && (c.reduction == Reduction::Bucket || c.reduction == Reduction::Bucket2)) continue;
+    if (choice.log.size() > full_start) choice.log += ", ";
     choice.log += c.name;
     try {
       // SH degree 1 keeps the CPU side short; every parameter group is still checked.

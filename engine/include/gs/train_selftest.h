@@ -111,6 +111,9 @@ struct ReductionChoice {
   std::vector<TrainOptions::Reduction> others;
 };
 ReductionChoice choose_reduction(VkContext& ctx);
+// Whether the `bucket` variant's per-pair gradients match `reference`'s on a
+// scene whose pixel lists span many buckets.
+bool bucket_matches_reference(VkContext& ctx, TrainOptions::Reduction bucket, TrainOptions::Reduction reference);
 
 // GPU probes, gradient checks for each backward variant and the fit, as JSON with "ok".
 std::string trainer_self_test_json(VkContext& ctx);

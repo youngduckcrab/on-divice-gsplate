@@ -1,7 +1,9 @@
 #version 450
 // Radix sort pass 1/3: per-block histogram of one 4-bit digit.
 // Layout hist[digit * num_blocks + block], so an exclusive scan over the whole
-// array gives every (digit, block) pair its global scatter offset.
+// array gives every (digit, block) pair its global scatter offset. The block
+// count follows from the item count, which may come from the GPU (Count), so
+// the passes can be dispatched indirectly with exactly that many blocks.
 layout(local_size_x = 128) in;
 
 layout(std430, binding = 0) readonly buffer Keys { uint keys[]; };
@@ -12,7 +14,7 @@ layout(std430, binding = 2) readonly buffer Count { uint count[]; };
 layout(push_constant) uniform Params {
   uint n;
   uint shift;
-  uint num_blocks;
+  uint num_blocks;  // unused: derived from the count
 } pc;
 
 const uint WG = 128u;
@@ -23,10 +25,12 @@ shared uint s_count[16];
 void main() {
   uint lid = gl_LocalInvocationID.x;
   uint block = gl_WorkGroupID.x;
+  uint n = min(pc.n, count[0]);
+  uint num_blocks = (n + WG * ITEMS - 1u) / (WG * ITEMS);
+  if (block >= num_blocks) return;  // the whole workgroup
   if (lid < 16u) s_count[lid] = 0u;
   barrier();
 
-  uint n = min(pc.n, count[0]);
   uint base = block * WG * ITEMS;
   for (uint i = 0u; i < ITEMS; ++i) {
     uint idx = base + i * WG + lid;
@@ -34,5 +38,5 @@ void main() {
   }
   barrier();
 
-  if (lid < 16u) hist[lid * pc.num_blocks + block] = s_count[lid];
+  if (lid < 16u) hist[lid * num_blocks + block] = s_count[lid];
 }

@@ -442,6 +442,9 @@ Java_com_ondevice_gsplat_NativeTrainer_step(JNIEnv* env, jobject /*this*/, jint 
       w.field("rasterize", p.rasterize);
       w.field("backward", p.backward);
       w.field("optimize", p.optimize);
+      w.field("optimize_sum", p.optimize_sum);
+      w.field("optimize_geometry", p.optimize_geometry);
+      w.field("optimize_sh", p.optimize_sh);
       w.end_object();
     }
     w.end_object();

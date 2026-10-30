@@ -135,8 +135,10 @@ int main(int argc, char** argv) {
       const gs::TrainStats& s = trainer.stats();
       if (s.step % 100 == 51 && trainer.last_profile().valid) {
         const gs::PassTimes& p = trainer.last_profile();
-        std::printf("  gpu ms: project %.1f  sort %.1f  forward %.1f  backward %.1f  optimize %.1f\n", p.project,
-                    p.sort, p.rasterize, p.backward, p.optimize);
+        std::printf("  gpu ms: project %.1f  sort %.1f  forward %.1f  backward %.1f  optimize %.1f (sum %.1f, "
+                    "geometry %.1f, sh %.1f)\n",
+                    p.project, p.sort, p.rasterize, p.backward, p.optimize, p.optimize_sum, p.optimize_geometry,
+                    p.optimize_sh);
       }
       if (s.step % 100 == 0 || trainer.finished()) {
         std::printf("step %5u  l1 %.4f  psnr %5.2f  gaussians %7u (+%u -%u)  pairs %8llu  sh %d  %.1f ms/step\n",

@@ -16,7 +16,7 @@ layout(std430, binding = 5) readonly buffer Count { uint count[]; };
 layout(push_constant) uniform Params {
   uint n;
   uint shift;
-  uint num_blocks;
+  uint num_blocks;  // unused: derived from the count, as in radix_count
 } pc;
 
 const uint WG = 128u;
@@ -28,10 +28,12 @@ shared uint s_offset[16];
 void main() {
   uint lid = gl_LocalInvocationID.x;
   uint block = gl_WorkGroupID.x;
-  if (lid < 16u) s_offset[lid] = hist[lid * pc.num_blocks + block];
+  uint n = min(pc.n, count[0]);
+  uint num_blocks = (n + WG * ITEMS - 1u) / (WG * ITEMS);
+  if (block >= num_blocks) return;  // the whole workgroup
+  if (lid < 16u) s_offset[lid] = hist[lid * num_blocks + block];
   barrier();
 
-  uint n = min(pc.n, count[0]);
   uint base = block * WG * ITEMS;
   for (uint i = 0u; i < ITEMS; ++i) {
     uint idx = base + i * WG + lid;

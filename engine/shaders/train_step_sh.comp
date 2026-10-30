@@ -1,0 +1,37 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Training pass 6c, one thread per SH coefficient float: the Adam step of the
+// SH coefficients beyond DC, from the colour gradient and view direction that
+// train_step left per gaussian. Neighbouring threads touch neighbouring
+// floats, so sh and its moments are read and written in whole cache lines
+// (one thread per gaussian walked them with a stride of sh_stride floats).
+layout(local_size_x = 256) in;
+
+#include "train_common.glsl"
+
+layout(std430, binding = 0) readonly buffer FrameBuf { FrameData frame; };
+layout(std430, binding = 1) readonly buffer Params { vec4 params[]; };
+layout(std430, binding = 2) buffer Sh { float sh[]; };
+layout(std430, binding = 3) buffer MomentSh { float m_sh[]; };
+layout(std430, binding = 4) buffer VarianceSh { float v_sh[]; };
+layout(std430, binding = 5) readonly buffer ShInput { vec4 sh_input[]; };  // 2 per slot: dL/dcolour, view direction
+layout(std430, binding = 6) readonly buffer Totals { uint totals[]; };     // [0] pairs this step
+
+void main() {
+  uint o = gl_GlobalInvocationID.x;
+  uint stride = frame.model.z;
+  uint i = o / stride, j = o - i * stride;
+  uint degree = frame.model.y;
+  if (i >= frame.model.x || totals[0] > frame.limits.x) return;
+  if (j >= uint(sh_rest_coeffs(degree)) * 3u) return;  // degrees not active yet
+  if (params[i * 4u + 1u].w < 0.5) return;            // free slot
+  vec3 colour = sh_input[i * 2u].xyz;
+  float basis[16];
+  sh_basis(sh_input[i * 2u + 1u].xyz, degree, basis);
+  float g = basis[j / 3u + 1u] * colour[j % 3u];
+  float m = mix(g, m_sh[o], frame.adam.x);
+  float v = mix(g * g, v_sh[o], frame.adam.y);
+  m_sh[o] = m;
+  v_sh[o] = v;
+  sh[o] -= frame.lr1.y * (m * frame.bias.x) / (sqrt(v * frame.bias.y) + frame.adam.z);
+}

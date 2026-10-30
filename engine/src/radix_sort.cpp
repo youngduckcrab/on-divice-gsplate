@@ -14,7 +14,7 @@ struct PassParams {
 };
 
 struct ScanParams {
-  uint32_t count;
+  uint32_t n;  // items (at most); the scan derives the histogram size
 };
 
 constexpr uint32_t kRadixBits = 4;
@@ -25,7 +25,7 @@ constexpr uint32_t kBuckets = 1u << kRadixBits;
 RadixSort::RadixSort(VkContext& ctx)
     : ctx_(ctx),
       count_(ctx.create_compute_pipeline(shaders::radix_count, 3, sizeof(PassParams))),
-      scan_(ctx.create_compute_pipeline(shaders::radix_scan, 1, sizeof(ScanParams))),
+      scan_(ctx.create_compute_pipeline(shaders::radix_scan, 2, sizeof(ScanParams))),
       scatter_(ctx.create_compute_pipeline(shaders::radix_scatter, 6, sizeof(PassParams))),
       unlimited_(ctx.create_buffer(4, MemoryKind::Device)) {
   ctx.run([&](VkCommandBuffer cmd) { vkCmdFillBuffer(cmd, unlimited_.handle(), 0, 4, 0xffffffffu); });
@@ -46,7 +46,7 @@ RadixSort::Binding RadixSort::bind(VkDescriptorPool pool, const Buffer& keys, co
   Binding b;
   b.count[0] = ctx_.allocate_set(pool, count_.set_layout(), {&keys, &histogram_, c});
   b.count[1] = ctx_.allocate_set(pool, count_.set_layout(), {&tmp_keys_, &histogram_, c});
-  b.scan = ctx_.allocate_set(pool, scan_.set_layout(), {&histogram_});
+  b.scan = ctx_.allocate_set(pool, scan_.set_layout(), {&histogram_, c});
   b.scatter[0] = ctx_.allocate_set(pool, scatter_.set_layout(),
                                    {&keys, &values, &tmp_keys_, &tmp_values_, &histogram_, c});
   b.scatter[1] = ctx_.allocate_set(pool, scatter_.set_layout(),
@@ -66,7 +66,7 @@ void RadixSort::record(VkCommandBuffer cmd, const Binding& binding, const Buffer
     PassParams params{n, pass * kRadixBits, num_blocks};
     ctx_.dispatch(cmd, count_, binding.count[dir], params, num_blocks);
     VkContext::barrier(cmd);
-    ScanParams scan{num_blocks * kBuckets};
+    ScanParams scan{n};
     ctx_.dispatch(cmd, scan_, binding.scan, scan, 1);
     VkContext::barrier(cmd);
     ctx_.dispatch(cmd, scatter_, binding.scatter[dir], params, num_blocks);
@@ -82,6 +82,31 @@ void RadixSort::record(VkCommandBuffer cmd, const Binding& binding, const Buffer
   }
 }
 
+void RadixSort::record_indirect(VkCommandBuffer cmd, const Binding& binding, const Buffer& keys,
+                                const Buffer& values, uint32_t max_n, const Buffer& args, VkDeviceSize offset,
+                                uint32_t key_bits) {
+  if (max_n <= 1) return;
+  if (max_n > capacity_) throw std::logic_error("RadixSort: reserve() before recording a larger sort");
+  const uint32_t passes = div_up(key_bits == 0 ? 32 : key_bits, kRadixBits);
+  for (uint32_t pass = 0; pass < passes; ++pass) {
+    const uint32_t dir = pass & 1;
+    PassParams params{max_n, pass * kRadixBits, 0};
+    ctx_.dispatch_indirect(cmd, count_, binding.count[dir], &params, sizeof(params), args, offset);
+    VkContext::barrier(cmd);
+    ScanParams scan{max_n};
+    ctx_.dispatch(cmd, scan_, binding.scan, scan, 1);
+    VkContext::barrier(cmd);
+    ctx_.dispatch_indirect(cmd, scatter_, binding.scatter[dir], &params, sizeof(params), args, offset);
+    VkContext::barrier(cmd);
+  }
+  if (passes & 1) {
+    VkBufferCopy region{0, 0, uint64_t(max_n) * 4};
+    vkCmdCopyBuffer(cmd, tmp_keys_.handle(), keys.handle(), 1, &region);
+    vkCmdCopyBuffer(cmd, tmp_values_.handle(), values.handle(), 1, &region);
+    VkContext::barrier(cmd);
+  }
+}
+
 void RadixSort::record(VkCommandBuffer cmd, const Buffer& keys, const Buffer& values, uint32_t n,
                        uint32_t key_bits) {
   if (n <= 1) return;
@@ -89,7 +114,7 @@ void RadixSort::record(VkCommandBuffer cmd, const Buffer& keys, const Buffer& va
   Binding b;
   b.count[0] = ctx_.allocate_transient_set(count_, {&keys, &histogram_, &unlimited_});
   b.count[1] = ctx_.allocate_transient_set(count_, {&tmp_keys_, &histogram_, &unlimited_});
-  b.scan = ctx_.allocate_transient_set(scan_, {&histogram_});
+  b.scan = ctx_.allocate_transient_set(scan_, {&histogram_, &unlimited_});
   b.scatter[0] = ctx_.allocate_transient_set(
       scatter_, {&keys, &values, &tmp_keys_, &tmp_values_, &histogram_, &unlimited_});
   b.scatter[1] = ctx_.allocate_transient_set(

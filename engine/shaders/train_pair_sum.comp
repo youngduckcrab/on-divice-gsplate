@@ -1,0 +1,32 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Training pass 6a, per gaussian: the sum of its pairs' gradients (its pairs
+// are contiguous in the pre-sort order). Kept apart from train_step so this
+// loop, whose length varies a lot between gaussians, runs with few registers.
+layout(local_size_x = 128) in;
+
+#include "train_common.glsl"
+
+layout(std430, binding = 0) readonly buffer FrameBuf { FrameData frame; };
+layout(std430, binding = 1) readonly buffer Tiles { uint tiles_touched[]; };
+layout(std430, binding = 2) readonly buffer Offsets { uint offsets[]; };
+layout(std430, binding = 3) readonly buffer PairGrads { vec4 pair_grads[]; };
+layout(std430, binding = 4) readonly buffer Totals { uint totals[]; };  // [0] pairs this step
+layout(std430, binding = 5) writeonly buffer GradSum { vec4 grad_sum[]; };  // 3 per slot
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  // Too many pairs: train_step skips the update (see there).
+  if (i >= frame.model.x || totals[0] > frame.limits.x) return;
+  vec4 a0 = vec4(0.0), a1 = vec4(0.0), a2 = vec4(0.0);
+  uint first = offsets[i], pairs = tiles_touched[i];
+  for (uint k = 0u; k < pairs; ++k) {
+    uint o = (first + k) * 3u;
+    a0 += pair_grads[o];
+    a1 += pair_grads[o + 1u];
+    a2 += pair_grads[o + 2u];
+  }
+  grad_sum[i * 3u] = a0;
+  grad_sum[i * 3u + 1u] = a1;
+  grad_sum[i * 3u + 2u] = a2;
+}

@@ -25,7 +25,7 @@ class RadixSort {
   // when it reallocates.
   void reserve(uint32_t n);
 
-  // Persistent descriptor sets from `pool` (5 sets, 19 storage buffers), for
+  // Persistent descriptor sets from `pool` (5 sets, 20 storage buffers), for
   // sorting the same buffers every frame. Call reserve() first. With `count`,
   // only the first min(n, count[0]) items are sorted, n as passed to record():
   // the count can then be written by an earlier pass on the GPU.
@@ -36,6 +36,12 @@ class RadixSort {
   // multiple of 4).
   void record(VkCommandBuffer cmd, const Binding& binding, const Buffer& keys,
               const Buffer& values, uint32_t n, uint32_t key_bits = 32);
+
+  // The same with the count and scatter passes dispatched indirectly from
+  // `args` at `offset` (x = blocks of kBlockSize items, as the count buffer
+  // bound with bind() implies); `max_n` bounds the item count.
+  void record_indirect(VkCommandBuffer cmd, const Binding& binding, const Buffer& keys, const Buffer& values,
+                       uint32_t max_n, const Buffer& args, VkDeviceSize offset, uint32_t key_bits = 32);
 
   // One-off variant using transient descriptor sets; only valid inside VkContext::run().
   void record(VkCommandBuffer cmd, const Buffer& keys, const Buffer& values, uint32_t n,

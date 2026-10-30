@@ -1,0 +1,22 @@
+#version 450
+// Indirect dispatch sizes for the passes over pairs, from the pair count the
+// scan left on the GPU: [0..2] radix sort blocks of 1024, [4..6] train_ranges
+// groups of 256. Beyond the capacity the step is skipped, so sort that many.
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer Totals { uint totals[]; };  // [0] pairs
+layout(std430, binding = 1) writeonly buffer Args { uint args[]; };
+
+layout(push_constant) uniform Params {
+  uint capacity;
+} pc;
+
+void main() {
+  uint n = min(totals[0], pc.capacity);
+  args[0] = (n + 1023u) / 1024u;
+  args[1] = 1u;
+  args[2] = 1u;
+  args[4] = (n + 255u) / 256u;
+  args[5] = 1u;
+  args[6] = 1u;
+}

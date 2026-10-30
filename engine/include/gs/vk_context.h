@@ -173,6 +173,10 @@ class VkContext {
                 const void* push, uint32_t push_size, uint32_t groups_x, uint32_t groups_y = 1,
                 uint32_t groups_z = 1) const;
 
+  // Dispatches with the group counts read from `args` at `offset` (three uints).
+  void dispatch_indirect(VkCommandBuffer cmd, const ComputePipeline& pipeline, VkDescriptorSet set,
+                         const void* push, uint32_t push_size, const Buffer& args, VkDeviceSize offset) const;
+
   // Binds `buffers` at bindings 0..n-1 through a transient set and dispatches.
   // Only valid inside a run() callback.
   void dispatch(VkCommandBuffer cmd, const ComputePipeline& pipeline,
@@ -193,7 +197,8 @@ class VkContext {
     dispatch(cmd, pipeline, set, &push, sizeof(Push), groups_x, groups_y, groups_z);
   }
 
-  // Full compute/transfer memory barrier between consecutive commands.
+  // Full compute/transfer memory barrier between consecutive commands (also
+  // making shader writes visible to indirect dispatch arguments).
   static void barrier(VkCommandBuffer cmd);
   // Makes transfer writes (e.g. copies into Readback buffers) visible to host reads.
   static void barrier_to_host(VkCommandBuffer cmd);

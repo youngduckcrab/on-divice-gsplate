@@ -5,20 +5,24 @@
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer Hist { uint hist[]; };
+// Items being sorted: min(n, count[0]) (see radix_count); 16 entries per block of them.
+layout(std430, binding = 1) readonly buffer Count { uint count[]; };
 
 layout(push_constant) uniform Params {
-  uint count;
+  uint n;
 } pc;
 
 const uint WG = 256u;
+const uint BLOCK = 128u * 8u;  // radix_count's items per block
 
 shared uint s_sum[WG];
 
 void main() {
   uint lid = gl_LocalInvocationID.x;
-  uint per_thread = (pc.count + WG - 1u) / WG;
-  uint begin = min(lid * per_thread, pc.count);
-  uint end = min(begin + per_thread, pc.count);
+  uint entries = (min(pc.n, count[0]) + BLOCK - 1u) / BLOCK * 16u;
+  uint per_thread = (entries + WG - 1u) / WG;
+  uint begin = min(lid * per_thread, entries);
+  uint end = min(begin + per_thread, entries);
 
   uint total = 0u;
   for (uint i = begin; i < end; ++i) total += hist[i];

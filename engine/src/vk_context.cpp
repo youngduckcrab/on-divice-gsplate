@@ -646,6 +646,20 @@ void VkContext::dispatch(VkCommandBuffer cmd, const ComputePipeline& pipeline, V
   vkCmdDispatch(cmd, groups_x, groups_y, groups_z);
 }
 
+void VkContext::dispatch_indirect(VkCommandBuffer cmd, const ComputePipeline& pipeline, VkDescriptorSet set,
+                                  const void* push, uint32_t push_size, const Buffer& args,
+                                  VkDeviceSize offset) const {
+  if (push_size != pipeline.push_constant_size_) {
+    throw std::logic_error("dispatch_indirect: push constant size mismatch");
+  }
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline_);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout_, 0, 1, &set, 0, nullptr);
+  if (push_size > 0) {
+    vkCmdPushConstants(cmd, pipeline.layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push);
+  }
+  vkCmdDispatchIndirect(cmd, args.handle(), offset);
+}
+
 void VkContext::dispatch(VkCommandBuffer cmd, const ComputePipeline& pipeline,
                          std::initializer_list<const Buffer*> buffers, const void* push,
                          uint32_t push_size, uint32_t groups_x, uint32_t groups_y,
@@ -665,10 +679,11 @@ void VkContext::barrier_to_host(VkCommandBuffer cmd) {
 void VkContext::barrier(VkCommandBuffer cmd) {
   VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
   mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-  mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                     VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-  VkPipelineStageFlags stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
-  vkCmdPipelineBarrier(cmd, stages, stages, 0, 1, &mb, 0, nullptr, 0, nullptr);
+  mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                     VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+  const VkPipelineStageFlags src = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+  const VkPipelineStageFlags dst = src | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
+  vkCmdPipelineBarrier(cmd, src, dst, 0, 1, &mb, 0, nullptr, 0, nullptr);
 }
 
 }  // namespace gs

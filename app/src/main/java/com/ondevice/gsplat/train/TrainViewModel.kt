@@ -424,7 +424,8 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                 appendLine(
                     "GPU ms/회: 투영 ${f1(p.optDouble("project"))} · 정렬 ${f1(p.optDouble("sort"))} · " +
                         "렌더 ${f1(p.optDouble("rasterize"))} · 역전파 ${f1(p.optDouble("backward"))} · " +
-                        "최적화 ${f1(p.optDouble("optimize"))}",
+                        "최적화 ${f1(p.optDouble("optimize"))} (쌍 합 ${f1(p.optDouble("optimize_sum"))} · " +
+                        "기하 ${f1(p.optDouble("optimize_geometry"))} · SH ${f1(p.optDouble("optimize_sh"))})",
                 )
             }
             evalJson?.let { e ->

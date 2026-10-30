@@ -85,7 +85,10 @@ struct PassTimes {
   double sort = 0.0;       // pair emission, radix sort, tile ranges
   double rasterize = 0.0;  // forward + loss
   double backward = 0.0;   // per-pair gradients
-  double optimize = 0.0;   // per-gaussian backprop + Adam
+  double optimize = 0.0;   // the three below
+  double optimize_sum = 0.0;       // per-gaussian sum of its pairs' gradients
+  double optimize_geometry = 0.0;  // per-gaussian backprop + Adam on 16 parameters
+  double optimize_sh = 0.0;        // Adam on the SH coefficients, per float
   bool valid = false;
 };
 
@@ -191,6 +194,8 @@ class Trainer {
   const std::string& reduction_note() const { return reduction_note_; }
   // Timings of the backward variants on training steps (TrainOptions::alternatives).
   const std::vector<RetuneResult>& retunes() const { return retunes_; }
+  // Testing: makes the named variant (one of those created) the active one.
+  bool select_backward(const std::string& name);
 
   static constexpr uint32_t kTileSize = 16;
 
@@ -227,7 +232,8 @@ class Trainer {
   void record_sort(VkCommandBuffer cmd, uint32_t slot);
   void record_rasterize(VkCommandBuffer cmd, uint32_t slot);  // + copies of losses and counts to the slot
   void record_backward(VkCommandBuffer cmd, uint32_t slot, const Backward& b);
-  void record_optimize(VkCommandBuffer cmd, uint32_t slot);
+  // The three optimizer kernels; `part` 0 records all, 1..3 one of them (profiling).
+  void record_optimize(VkCommandBuffer cmd, uint32_t slot, int part = 0);
   void record_scan(VkCommandBuffer cmd, const Buffer& values, const Buffer& prefix, uint32_t count,
                    uint32_t total_index);
   // Reads slot `slot`'s pair count, tile mismatches and losses into stats;
@@ -271,7 +277,8 @@ class Trainer {
   std::vector<size_t> order_;
   size_t order_pos_ = 0;
 
-  ComputePipeline project_, scan_local_, scan_blocks_, scan_add_, emit_, ranges_, forward_, step_;
+  ComputePipeline project_, scan_local_, scan_blocks_, scan_add_, emit_, dispatch_args_, ranges_, forward_, pair_sum_,
+      step_, step_sh_;
   ComputePipeline densify_mark_, densify_spawn_, reset_opacity_;
   std::unique_ptr<RadixSort> sort_;
 
@@ -282,6 +289,8 @@ class Trainer {
   std::vector<Buffer> targets_;  // per batch slot
   Buffer pixel_grad_, pixel_count_, image_, ranges_buf_, tile_loss_, tile_count_;
   Buffer bucket_state_, bucket_list_, pixel_dot_;
+  Buffer grad_sum_, sh_input_;
+  Buffer dispatch_args_buf_;  // indirect group counts of the passes over pairs (train_dispatch_args)  // per slot: summed pair gradients; colour gradient and view direction
   std::vector<Buffer> readback_smalls_, readback_losses_;  // per batch slot
   Buffer readback_image_;
 };

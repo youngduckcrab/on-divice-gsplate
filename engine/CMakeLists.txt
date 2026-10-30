@@ -80,6 +80,10 @@ set(GS_SHADERS
   probe_sg_add_loop.comp
   probe_sg_combo_scalar.comp
   train_step.comp
+  train_pair_sum.comp
+  train_dispatch_args.comp
+  scan_blocks.comp
+  train_step_sh.comp
   train_densify_mark.comp
   train_densify_spawn.comp
   train_reset_opacity.comp
