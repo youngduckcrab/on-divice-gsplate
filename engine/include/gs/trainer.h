@@ -56,11 +56,14 @@ struct TrainOptions {
   // 0.9810 for 0.2 throughout (and 34.96 / 0.9756 for L1 alone).
   float lambda_dssim = 0.2f;
   float lambda_dssim_end = 1.0f;
-  // Pixels in the head region (estimate_head) weigh this much in the loss, so
-  // the face gets more of the gradient and of the densification. Views where
-  // the head covers much of the frame are left alone.
+  // Pixels in the head region (estimate_head) weigh this much in the loss.
+  // Views where the head covers much of the frame are left alone. Off by
+  // default: on body (360x640, 600 steps) 3x left the head PSNR where it was
+  // (31.09 -> 31.05 dB) with 4% more gaussians; Adam rescales each
+  // parameter's steps, so a uniform weight mostly changes densification.
+  // The region still gives the held-out head PSNR.
   HeadRegion head;
-  float head_weight = 3.0f;
+  float head_weight = 1.0f;
 
   // Adaptive density control.
   uint32_t densify_from = 300;
