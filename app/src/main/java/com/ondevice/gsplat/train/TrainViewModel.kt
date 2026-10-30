@@ -389,7 +389,8 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 appendLine(
                     "설정: ${preset.label} · ${prep.optInt("iterations")}회 · 최대 ${preset.maxGaussians / 1000}k · " +
-                        "SH 3 · 배경 제거 ${ox(prep.optBoolean("masked"))}",
+                        "SH 3 · 배경 제거 ${ox(prep.optBoolean("masked"))} · " +
+                        "손실 L1+D-SSIM (λ ${f1(prep.optDouble("lambda_start"))} → ${f1(prep.optDouble("lambda_end"))})",
                 )
                 appendLine(
                     "초기화: ${prep.optString("init_source")} ${prep.optLong("init_points")}점 → " +

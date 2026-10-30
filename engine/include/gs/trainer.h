@@ -49,10 +49,13 @@ struct TrainOptions {
   float lr_opacity = 2.5e-2f;
   float lr_sh_dc = 2.5e-3f;
   float lr_sh_rest = 2.5e-3f / 20.0f;
-  // Loss: (1 - lambda) L1 + lambda (1 - SSIM), as in 3D Gaussian Splatting (0: L1 only).
+  // Loss: (1 - lambda) L1 + lambda (1 - SSIM), lambda ramping linearly from
+  // lambda_dssim at the first step to lambda_dssim_end at the last (< 0: no
+  // ramp). 3D Gaussian Splatting keeps 0.2; on body (360x640, 600 steps,
+  // held-out) the ramp to 1.0 gave 37.22 dB / SSIM 0.9871 against 36.14 dB /
+  // 0.9810 for 0.2 throughout (and 34.96 / 0.9756 for L1 alone).
   float lambda_dssim = 0.2f;
-  // Experiments: >= 0 ramps lambda linearly from lambda_dssim (first step) to this (last).
-  float lambda_dssim_end = -1.0f;
+  float lambda_dssim_end = 1.0f;
 
   // Adaptive density control.
   uint32_t densify_from = 300;

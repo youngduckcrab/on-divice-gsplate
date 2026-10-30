@@ -406,6 +406,8 @@ Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, js
     w.field("load_ms", load_ms);
     w.field("init_ms", init_ms);
     w.field("setup_ms", setup_ms);
+    w.field("lambda_start", session->trainer->options().lambda_dssim);
+    w.field("lambda_end", session->trainer->options().lambda_dssim_end);
     w.field("reduction_note", session->trainer->reduction_note());
     w.field("reduction_check", g_reduction->log);
     w.field("reduction_check_ms", g_reduction_ms);
