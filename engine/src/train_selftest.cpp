@@ -5,9 +5,15 @@
 #include <cstring>
 #include <cmath>
 #include <random>
+#include <span>
 
 #include "gs/json.h"
 #include "shaders/probe_ops.h"
+#include "shaders/probe_sg_add.h"
+#include "shaders/probe_sg_ballot.h"
+#include "shaders/probe_sg_basic.h"
+#include "shaders/probe_sg_elect.h"
+#include "shaders/probe_sg_id.h"
 #include "shaders/probe_subgroup.h"
 
 namespace gs {
@@ -421,7 +427,48 @@ ProbeReport probe_gpu_ops(VkContext& ctx) {
   } catch (const VulkanError& e) {
     r.subgroup_error = vk_result_name(e.result);
   }
+  const std::pair<const char*, std::span<const uint32_t>> parts[] = {{"basic", shaders::probe_sg_basic},
+                                                                     {"elect", shaders::probe_sg_elect},
+                                                                     {"id", shaders::probe_sg_id},
+                                                                     {"add", shaders::probe_sg_add},
+                                                                     {"ballot", shaders::probe_sg_ballot}};
+  for (const auto& [name, spirv] : parts) {
+    try {
+      ComputePipeline pipeline = ctx.create_compute_pipeline(spirv, 1, 0);
+      r.subgroup_parts.emplace_back(name, "ok");
+    } catch (const VulkanError& e) {
+      r.subgroup_parts.emplace_back(name, vk_result_name(e.result));
+    }
+  }
   return r;
+}
+
+ReductionChoice choose_reduction(VkContext& ctx) {
+  using Reduction = TrainOptions::Reduction;
+  const std::pair<Reduction, const char*> candidates[] = {{Reduction::Subgroup, "subgroup"},
+                                                          {Reduction::SubgroupScalar, "subgroup_scalar"},
+                                                          {Reduction::Serial, "serial"},
+                                                          {Reduction::Shared, "shared"}};
+  ReductionChoice choice;
+  for (const auto& [reduction, name] : candidates) {
+    if (!choice.log.empty()) choice.log += ", ";
+    choice.log += name;
+    try {
+      // SH degree 1 keeps the CPU side short; every parameter group is still checked.
+      const GradientReport r = check_gradients(ctx, true, reduction, 1);
+      if (r.ok()) {
+        choice.found = true;
+        choice.reduction = reduction;
+        choice.name = name;
+        choice.log += " 정상";
+        return choice;
+      }
+      choice.log += " 틀림";
+    } catch (const std::exception&) {
+      choice.log += " 사용 불가";
+    }
+  }
+  return choice;
 }
 
 FitReport fit_known_scene(VkContext& ctx, uint32_t steps, TrainOptions::Reduction reduction) {
@@ -489,24 +536,31 @@ std::string trainer_self_test_json(VkContext& ctx) {
     w.field("subgroup_ok", p.subgroup_ok);
     w.field("subgroups", p.subgroups);
     w.field("subgroup_size", p.subgroup_size);
+    w.key("subgroup_parts").begin_object();
+    for (const auto& [name, result] : p.subgroup_parts) w.field(name, result);
+    w.end_object();
     w.end_object();
   } catch (const std::exception& e) {
     w.key("probes").begin_object().field("error", e.what()).end_object();
   }
+  bool any_ok = false;
   w.key("gradients").begin_array();
   struct Case {
     TrainOptions::Reduction reduction;
     bool masked;
   };
-  const Case cases[] = {{TrainOptions::Reduction::Subgroup, true},
-                        {TrainOptions::Reduction::SubgroupScalar, true},
-                        {TrainOptions::Reduction::Shared, false},
-                        {TrainOptions::Reduction::Shared, true}};
+  using Reduction = TrainOptions::Reduction;
+  const Case cases[] = {{Reduction::Subgroup, true},
+                        {Reduction::SubgroupScalar, true},
+                        {Reduction::Serial, false},
+                        {Reduction::Serial, true},
+                        {Reduction::Shared, true}};
   for (const Case& c : cases) {
     w.begin_object();
-    w.field("requested", c.reduction == TrainOptions::Reduction::Subgroup         ? "subgroup"
-                         : c.reduction == TrainOptions::Reduction::SubgroupScalar ? "subgroup_scalar"
-                                                                                  : "shared");
+    w.field("requested", c.reduction == Reduction::Subgroup         ? "subgroup"
+                         : c.reduction == Reduction::SubgroupScalar ? "subgroup_scalar"
+                         : c.reduction == Reduction::Serial         ? "serial"
+                                                                    : "shared");
     w.field("masked", c.masked);
     try {
       const GradientReport r = check_gradients(ctx, c.masked, c.reduction);
@@ -537,18 +591,22 @@ std::string trainer_self_test_json(VkContext& ctx) {
       w.field("backward_colour_bad", st.backward_colour_bad);
       w.field("step_colour_bad", st.step_colour_bad);
       w.end_object();
-      ok = ok && r.ok();
+      if (r.ok()) any_ok = true;
     } catch (const std::exception& e) {
-      // The subgroup variant may be unavailable; that alone is not a failure.
+      // A variant may be unavailable on this device; that alone is not a failure.
       w.field("ok", false);
       w.field("error", e.what());
-      if (c.reduction == TrainOptions::Reduction::Shared) ok = false;
     }
     w.end_object();
   }
   w.end_array();
+  ok = ok && any_ok;
+  // The fit uses the variant the app would train with.
+  const ReductionChoice choice = choose_reduction(ctx);
+  w.field("chosen", choice.found ? choice.name : std::string());
+  w.field("choice_log", choice.log);
   try {
-    const FitReport f = fit_known_scene(ctx);
+    const FitReport f = fit_known_scene(ctx, 600, choice.found ? choice.reduction : TrainOptions::Reduction::Auto);
     w.key("fit").begin_object();
     w.field("reduction", f.reduction);
     w.field("ok", f.ok());

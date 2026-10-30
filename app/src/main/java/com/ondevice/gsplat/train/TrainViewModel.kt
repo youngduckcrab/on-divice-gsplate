@@ -291,6 +291,10 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                                 else -> "틀림"
                             } + " (${p.optInt("subgroups")}개 × ${p.optInt("subgroup_size")})",
                     )
+                    p.optJSONObject("subgroup_parts")?.let { parts ->
+                        val list = parts.keys().asSequence().joinToString(", ") { "$it ${parts.optString(it)}" }
+                        add("  subgroup 기능별 컴파일: $list")
+                    }
                 }
             }
             val grads = t.optJSONArray("gradients")
@@ -319,6 +323,9 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                             "(${st.optInt("colour_checked")}개 중)",
                     )
                 }
+            }
+            if (t.has("choice_log")) {
+                add("  역전파 선택: ${t.optString("chosen").ifEmpty { "없음" }} (${t.optString("choice_log")})")
             }
             t.optJSONObject("fit")?.let { f ->
                 if (f.has("error")) {
@@ -388,8 +395,10 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                 if (prep.optInt("skipped") > 0) {
                     appendLine("건너뛴 프레임: ${prep.optInt("skipped")}장 (${prep.optString("skipped_first")})")
                 }
-                val note = prep.optString("reduction_note").takeIf { it.isNotEmpty() }?.let { " ($it)" } ?: ""
-                appendLine("역전파 합산: ${prep.optString("reduction")}$note")
+                appendLine(
+                    "역전파 합산: ${prep.optString("reduction")} · GPU 검증: ${prep.optString("reduction_check")} " +
+                        "(${sec(prep.optDouble("reduction_check_ms"))})",
+                )
             }
             if (s != null) {
                 appendLine(

@@ -53,6 +53,9 @@ void test_probes(gs::VkContext& ctx) {
   EXPECT(p.shared_ok, "shared probe: max %u add %u tree %u", p.atomic_max, p.atomic_add, p.tree_max);
   EXPECT(p.subgroup_compiled && p.subgroup_ok, "subgroup probe: %s, %u subgroups of %u", p.subgroup_error.c_str(),
          p.subgroups, p.subgroup_size);
+  for (const auto& [name, result] : p.subgroup_parts) EXPECT(result == "ok", "subgroup %s: %s", name.c_str(), result.c_str());
+  const gs::ReductionChoice choice = gs::choose_reduction(ctx);
+  EXPECT(choice.found && choice.name == "subgroup", "chosen %s (%s)", choice.name.c_str(), choice.log.c_str());
 }
 
 void test_scan_and_densify(gs::VkContext& ctx) {
@@ -207,6 +210,8 @@ int main() {
     test_gradients(ctx, true);
     test_gradients(ctx, true, gs::TrainOptions::Reduction::Shared);
     test_gradients(ctx, true, gs::TrainOptions::Reduction::SubgroupScalar);
+    test_gradients(ctx, false, gs::TrainOptions::Reduction::Serial);
+    test_gradients(ctx, true, gs::TrainOptions::Reduction::Serial);
     test_probes(ctx);
     test_scan_and_densify(ctx);
     test_training_converges(ctx);

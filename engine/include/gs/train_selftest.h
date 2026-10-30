@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "gs/camera.h"
@@ -88,8 +89,21 @@ struct ProbeReport {
   bool subgroup_ok = false;
   uint32_t subgroups = 0;     // per 256-invocation workgroup
   uint32_t subgroup_size = 0;
+  // Which single subgroup features compile: basic builtins, elect, subgroup id,
+  // float add, ballot ("ok" or the error).
+  std::vector<std::pair<std::string, std::string>> subgroup_parts;
 };
 ProbeReport probe_gpu_ops(VkContext& ctx);
+
+// The first backward variant (fastest first) whose gradients match the CPU
+// reference on this GPU. `log` says what happened to each one tried.
+struct ReductionChoice {
+  bool found = false;
+  TrainOptions::Reduction reduction = TrainOptions::Reduction::Serial;
+  std::string name;
+  std::string log;
+};
+ReductionChoice choose_reduction(VkContext& ctx);
 
 // GPU probes, gradient checks for each backward variant and the fit, as JSON with "ok".
 std::string trainer_self_test_json(VkContext& ctx);

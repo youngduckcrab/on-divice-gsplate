@@ -81,10 +81,7 @@ void main() {
     pair_grads[p + 2u] = vec4(0.0);
   }
 
-  float T = T_final;
-  vec3 accum = vec3(0.0);
-  float last_alpha = 0.0;
-  vec3 last_color = vec3(0.0);
+  PixelState st = PixelState(T_final, vec3(0.0), 0.0, vec3(0.0));
   uint batch = min(pc.batch, MAX_BATCH);
 #ifndef GS_SHARED_REDUCTION
   uint num_subgroups = min(gl_NumSubgroups, pc.max_subgroups);
@@ -108,31 +105,8 @@ void main() {
       uint rel = count - done_n - j;  // 1-based position in the tile's range
       vec4 g0 = vec4(0.0), g1 = vec4(0.0), g2 = vec4(0.0);
       if (inside && rel <= last) {
-        vec2 d = s_g0[j].xy - center;
-        vec3 con = s_g1[j].xyz;
-        float opacity = s_g0[j].z;
-        float power = -0.5 * (con.x * d.x * d.x + con.z * d.y * d.y) - con.y * d.x * d.y;
-        float G = exp(power);
-        float raw_alpha = opacity * G;
-        float alpha = min(kMaxAlpha, raw_alpha);
-        if (power <= 0.0 && alpha >= kMinAlpha) {
-          vec3 color = s_g2[j].rgb;
-          T = T / (1.0 - alpha);
-          accum = last_alpha * last_color + (1.0 - last_alpha) * accum;
-          last_color = color;
-          float dL_dalpha = dot(color - accum, dL_dC) * T;
-          last_alpha = alpha;
-          dL_dalpha += (-T_final / (1.0 - alpha)) * bg_dot;
-          vec3 dL_dcolor = (alpha * T) * dL_dC;
-          bool clamped = raw_alpha >= kMaxAlpha;
-          float dL_dopacity = clamped ? 0.0 : G * dL_dalpha;
-          float dL_dpower = clamped ? 0.0 : raw_alpha * dL_dalpha;
-          vec2 dL_dmean = dL_dpower * vec2(-(con.x * d.x + con.y * d.y), -(con.z * d.y + con.y * d.x));
-          vec3 dL_dconic = dL_dpower * vec3(-0.5 * d.x * d.x, -d.x * d.y, -0.5 * d.y * d.y);
-          g0 = vec4(dL_dmean, dL_dconic.xy);
-          g1 = vec4(dL_dconic.z, dL_dopacity, dL_dcolor.rg);
-          g2 = vec4(dL_dcolor.b, abs(dL_dmean), 0.0);
-        }
+        splat_pixel_grad(s_g0[j].xy - center, s_g1[j].xyz, s_g0[j].z, s_g2[j].rgb, dL_dC, T_final, bg_dot, st,
+                         g0, g1, g2);
       }
 #ifdef GS_SHARED_REDUCTION
       s_red[lid * 3u] = g0;

@@ -1,0 +1,4 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#define PROBE 5
+#include "probe_subgroup_parts.glsl"

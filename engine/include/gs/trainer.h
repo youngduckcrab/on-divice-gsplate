@@ -17,10 +17,11 @@ namespace gs {
 struct TrainOptions {
   // How the backward pass sums gradients over a tile's pixels.
   enum class Reduction {
-    Auto,            // the first of the variants below the driver accepts
+    Auto,            // the first subgroup variant the driver accepts, else Serial
     Subgroup,        // vec4 subgroup adds (fails if unavailable)
     SubgroupScalar,  // scalar subgroup adds (fails if unavailable)
-    Shared,          // shared-memory tree, no subgroup operations (slower)
+    Serial,          // no subgroups: one splat at a time, two-stage shared-memory sum
+    Shared,          // no subgroups: batched splats, shared-memory tree per splat
   };
 
   uint32_t iterations = 3000;

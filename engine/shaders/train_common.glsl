@@ -129,3 +129,43 @@ vec3 normal3(inout uint state) {
   float r1 = sqrt(-2.0 * log(u1)), r2 = sqrt(-2.0 * log(u3));
   return vec3(r1 * cos(6.283185307 * u2), r1 * sin(6.283185307 * u2), r2 * cos(6.283185307 * u4));
 }
+
+// Back-to-front state of one pixel in the backward pass.
+struct PixelState {
+  float T;           // transmittance in front of the current splat
+  vec3 accum;        // colour of everything behind it, normalised by T
+  float last_alpha;
+  vec3 last_color;
+};
+
+// Gradient of one pixel's loss with respect to one projected splat (centre
+// offset d = centre - pixel, conic, opacity, colour), advancing the pixel's
+// back-to-front state. Output layout as in pair_grads: [0] dL/d(centre xy,
+// conic a, conic b), [1] dL/d(conic c, opacity, colour r, colour g),
+// [2] dL/d(colour b), |dL/dcentre xy|, unused. Zero if the splat is skipped.
+void splat_pixel_grad(vec2 d, vec3 con, float opacity, vec3 color, vec3 dL_dC, float T_final, float bg_dot,
+                      inout PixelState st, out vec4 g0, out vec4 g1, out vec4 g2) {
+  g0 = vec4(0.0);
+  g1 = vec4(0.0);
+  g2 = vec4(0.0);
+  float power = -0.5 * (con.x * d.x * d.x + con.z * d.y * d.y) - con.y * d.x * d.y;
+  float G = exp(power);
+  float raw_alpha = opacity * G;
+  float alpha = min(kMaxAlpha, raw_alpha);
+  if (power > 0.0 || alpha < kMinAlpha) return;
+  st.T = st.T / (1.0 - alpha);
+  st.accum = st.last_alpha * st.last_color + (1.0 - st.last_alpha) * st.accum;
+  st.last_color = color;
+  float dL_dalpha = dot(color - st.accum, dL_dC) * st.T;
+  st.last_alpha = alpha;
+  dL_dalpha += (-T_final / (1.0 - alpha)) * bg_dot;
+  vec3 dL_dcolor = (alpha * st.T) * dL_dC;
+  bool clamped = raw_alpha >= kMaxAlpha;
+  float dL_dopacity = clamped ? 0.0 : G * dL_dalpha;
+  float dL_dpower = clamped ? 0.0 : raw_alpha * dL_dalpha;
+  vec2 dL_dmean = dL_dpower * vec2(-(con.x * d.x + con.y * d.y), -(con.z * d.y + con.y * d.x));
+  vec3 dL_dconic = dL_dpower * vec3(-0.5 * d.x * d.x, -d.x * d.y, -0.5 * d.y * d.y);
+  g0 = vec4(dL_dmean, dL_dconic.xy);
+  g1 = vec4(dL_dconic.z, dL_dopacity, dL_dcolor.rg);
+  g2 = vec4(dL_dcolor.b, abs(dL_dmean), 0.0);
+}

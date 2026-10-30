@@ -13,6 +13,7 @@
 #include "shaders/scan_local.h"
 #include "shaders/train_backward.h"
 #include "shaders/train_backward_scalar.h"
+#include "shaders/train_backward_serial.h"
 #include "shaders/train_backward_shared.h"
 #include "shaders/train_densify_mark.h"
 #include "shaders/train_densify_spawn.h"
@@ -173,12 +174,17 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
     }
   }
   if (reduction_.empty()) {
-    if (options_.reduction != Reduction::Auto && options_.reduction != Reduction::Shared) {
+    if (options_.reduction == Reduction::Subgroup || options_.reduction == Reduction::SubgroupScalar) {
       throw std::runtime_error("subgroup 역전파를 쓸 수 없음 (" + reduction_note_ + ")");
     }
     backward_push_[0] = 32;
-    backward_ = make("train_backward_shared", shaders::train_backward_shared, 8, sizeof(backward_push_));
-    reduction_ = "shared";
+    if (options_.reduction == Reduction::Shared) {
+      backward_ = make("train_backward_shared", shaders::train_backward_shared, 8, sizeof(backward_push_));
+      reduction_ = "shared";
+    } else {
+      backward_ = make("train_backward_serial", shaders::train_backward_serial, 8, sizeof(backward_push_));
+      reduction_ = "serial";
+    }
   }
   if (!failures.empty()) {
     std::string message = "학습 셰이더를 만들 수 없음:";

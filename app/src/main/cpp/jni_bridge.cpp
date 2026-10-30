@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <fstream>
+#include <optional>
 
 #include "gs/benchmarks.h"
 #include "gs/dataset.h"
@@ -278,6 +279,10 @@ struct TrainSession {
 
 std::mutex g_train_mutex;
 std::unique_ptr<TrainSession> g_train;
+// Backward variant whose gradients matched the CPU reference on this GPU,
+// chosen on the first prepare(). Guarded by g_train_mutex.
+std::optional<gs::ReductionChoice> g_reduction;
+double g_reduction_ms = 0.0;
 
 template <typename F>
 std::string with_trainer(F&& f) {
@@ -325,7 +330,17 @@ Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, js
     gs::Dataset ds = gs::load_dataset(dir, static_cast<uint32_t>(width));
     const double load_ms = ms_since(t0);
 
+    if (!g_reduction) {
+      const auto tc = Clock::now();
+      g_reduction = gs::choose_reduction(*session->ctx);
+      g_reduction_ms = ms_since(tc);
+    }
+    if (!g_reduction->found) {
+      throw std::runtime_error("이 GPU에서 그래디언트가 맞는 역전파 방식을 찾지 못함 (" + g_reduction->log + ")");
+    }
+
     gs::TrainOptions options = gs::scaled_options(static_cast<uint32_t>(iterations));
+    options.reduction = g_reduction->reduction;
     options.max_gaussians = static_cast<uint32_t>(max_gaussians);
     options.sh_degree = sh_degree;
     options.masked = masked == JNI_TRUE;
@@ -369,6 +384,8 @@ Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, js
     w.field("setup_ms", setup_ms);
     w.field("reduction", session->trainer->reduction());
     w.field("reduction_note", session->trainer->reduction_note());
+    w.field("reduction_check", g_reduction->log);
+    w.field("reduction_check_ms", g_reduction_ms);
     write_stats(w, *session->trainer);
     w.end_object();
     g_train = std::move(session);
