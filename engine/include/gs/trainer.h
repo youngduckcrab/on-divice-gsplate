@@ -44,6 +44,20 @@ struct TrainOptions {
   uint32_t seed = 1;
 };
 
+// The defaults' step schedule (densification, opacity reset, SH degree) is
+// tuned for 3000 steps; this scales it to `iterations`.
+TrainOptions scaled_options(uint32_t iterations);
+
+// GPU milliseconds of each pass in one profiled step.
+struct PassTimes {
+  double project = 0.0;    // projection + pair count
+  double sort = 0.0;       // pair emission, radix sort, tile ranges
+  double rasterize = 0.0;  // forward + loss
+  double backward = 0.0;   // per-pair gradients
+  double optimize = 0.0;   // per-gaussian backprop + Adam
+  bool valid = false;
+};
+
 struct TrainStats {
   uint32_t step = 0;
   uint32_t gaussians = 0;  // alive
@@ -73,8 +87,11 @@ class Trainer {
   Trainer(const Trainer&) = delete;
   Trainer& operator=(const Trainer&) = delete;
 
-  // One optimisation step on the next training view, then densification on schedule.
-  void step();
+  // One optimisation step on the next training view, then densification on
+  // schedule. With `profile`, the passes are submitted separately and timed
+  // (see last_profile()), which costs a little extra.
+  void step(bool profile = false);
+  const PassTimes& last_profile() const { return profile_; }
   bool finished() const { return stats_.step >= options_.iterations; }
   const TrainStats& stats() const { return stats_; }
   const TrainOptions& options() const { return options_; }
@@ -91,7 +108,7 @@ class Trainer {
   // Testing: one step on `frame` over `background`. With all learning rates
   // zero the parameters stay put, and after the first step Adam's first moment
   // is (1 - beta1) * gradient, which first_step_gradients() returns.
-  void step_on(size_t frame, const float background[3]);
+  void step_on(size_t frame, const float background[3], bool profile = false);
   struct Gradients {
     std::vector<float> params;  // 16 per slot, the parameter layout of train_common.glsl
     std::vector<float> sh;      // sh_stride() per slot
@@ -106,7 +123,7 @@ class Trainer {
   void write_frame(const Camera& camera, const float background[3], bool masked_target, uint32_t sh_degree);
   // Renders `camera` into image_/tile losses; with `train`, also the backward pass and Adam step.
   void run_view(const Camera& camera, const uint8_t* target, const float background[3], bool masked_target,
-                bool train);
+                bool train, bool profile = false);
   void ensure_pair_capacity(uint64_t pairs);
   void record_scan(VkCommandBuffer cmd, const Buffer& values, const Buffer& prefix, uint32_t count,
                    uint32_t total_index);
@@ -118,6 +135,7 @@ class Trainer {
   Dataset dataset_;
   TrainOptions options_;
   TrainStats stats_;
+  PassTimes profile_;
   uint32_t width_ = 0, height_ = 0, tiles_x_ = 0, tiles_y_ = 0;
   uint32_t capacity_ = 0;
   uint32_t sh_stride_ = 0;  // floats per slot

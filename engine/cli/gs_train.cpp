@@ -28,6 +28,7 @@ int main(int argc, char** argv) {
   uint32_t width = 360, eval_every = 1000;
   std::string preview;
   gs::TrainOptions options;
+  uint32_t iterations = options.iterations;
   for (int i = 3; i < argc; ++i) {
     const std::string arg = argv[i];
     auto next = [&]() -> const char* {
@@ -38,7 +39,7 @@ int main(int argc, char** argv) {
       if (arg == "--width") {
         width = std::atoi(next());
       } else if (arg == "--iters") {
-        options.iterations = std::atoi(next());
+        iterations = std::atoi(next());
       } else if (arg == "--max-gaussians") {
         options.max_gaussians = std::atoi(next());
       } else if (arg == "--sh") {
@@ -58,13 +59,6 @@ int main(int argc, char** argv) {
       return 2;
     }
   }
-  // Keep the schedule proportional for short runs.
-  const double scale = options.iterations / 3000.0;
-  options.densify_from = uint32_t(options.densify_from * scale);
-  options.densify_until = uint32_t(options.densify_until * scale);
-  options.opacity_reset_interval = uint32_t(options.opacity_reset_interval * scale);
-  options.sh_degree_interval = std::max(1u, uint32_t(options.sh_degree_interval * scale));
-
   try {
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
@@ -80,12 +74,24 @@ int main(int argc, char** argv) {
     std::printf("init from %s: %zu points -> %u gaussians (voxel %.4f)\n", init_stats.source.c_str(),
                 init_stats.raw_points, scene.count, init_stats.voxel_size);
 
+    // Keep the schedule proportional for shorter or longer runs.
+    const gs::TrainOptions defaults = gs::scaled_options(iterations);
+    options.iterations = defaults.iterations;
+    options.densify_from = defaults.densify_from;
+    options.densify_until = defaults.densify_until;
+    options.opacity_reset_interval = defaults.opacity_reset_interval;
+    options.sh_degree_interval = defaults.sh_degree_interval;
     gs::VkContext ctx;
     gs::Trainer trainer(ctx, ds, scene, options);
     const auto t2 = clock::now();
     while (!trainer.finished()) {
-      trainer.step();
+      trainer.step(trainer.stats().step % 500 == 250);
       const gs::TrainStats& s = trainer.stats();
+      if (s.step % 500 == 251 && trainer.last_profile().valid) {
+        const gs::PassTimes& p = trainer.last_profile();
+        std::printf("  gpu ms: project %.1f  sort %.1f  forward %.1f  backward %.1f  optimize %.1f\n", p.project,
+                    p.sort, p.rasterize, p.backward, p.optimize);
+      }
       if (s.step % 100 == 0 || trainer.finished()) {
         std::printf("step %5u  l1 %.4f  psnr %5.2f  gaussians %7u  pairs %8llu  sh %d  %.1f ms/step\n", s.step,
                     s.l1, s.psnr, s.gaussians, (unsigned long long)s.pairs, s.sh_degree, s.step_ms);

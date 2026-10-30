@@ -68,6 +68,17 @@ void dispatch_kernel(VkContext& ctx, VkCommandBuffer cmd, const ComputePipeline&
 
 }  // namespace
 
+TrainOptions scaled_options(uint32_t iterations) {
+  TrainOptions o;
+  const double scale = double(iterations) / double(o.iterations);
+  o.iterations = iterations;
+  o.densify_from = uint32_t(o.densify_from * scale);
+  o.densify_until = uint32_t(o.densify_until * scale);
+  o.opacity_reset_interval = uint32_t(o.opacity_reset_interval * scale);
+  o.sh_degree_interval = std::max(1u, uint32_t(o.sh_degree_interval * scale));
+  return o;
+}
+
 Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initial, const TrainOptions& options)
     : ctx_(ctx), dataset_(dataset), options_(options), rng_(options.seed) {
   const DeviceInfo& info = ctx.info();
@@ -273,7 +284,7 @@ void Trainer::ensure_pair_capacity(uint64_t pairs) {
 }
 
 void Trainer::run_view(const Camera& camera, const uint8_t* target, const float background[3], bool masked_target,
-                       bool train) {
+                       bool train, bool profile) {
   const uint32_t degree =
       std::min<uint32_t>(options_.sh_degree, options_.sh_degree_interval > 0 ? stats_.step / options_.sh_degree_interval
                                                                              : options_.sh_degree);
@@ -282,7 +293,7 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
   if (target != nullptr) std::memcpy(target_.mapped(), target, size_t(width_) * height_ * 4);
 
   // Phase 1: project and count pairs.
-  ctx_.run([&](VkCommandBuffer cmd) {
+  const RunTiming project_time = ctx_.run([&](VkCommandBuffer cmd) {
     if (slots_ > 0) {
       dispatch_kernel(ctx_, cmd, project_, {&frame_, &params_, &sh_, &projected_, &tiles_}, div_up(slots_, 128));
       VkContext::barrier(cmd);
@@ -301,7 +312,7 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
 
   // Phase 2: sort, rasterise, and (training) back-propagate and step.
   const uint32_t key_bits = 16 + bits_for(tiles_x_ * tiles_y_);
-  ctx_.run([&](VkCommandBuffer cmd) {
+  auto sort = [&](VkCommandBuffer cmd) {
     vkCmdFillBuffer(cmd, ranges_buf_.handle(), 0, VK_WHOLE_SIZE, 0);
     if (pairs > 0) {
       dispatch_kernel(ctx_, cmd, emit_, {&frame_, &projected_, &tiles_, &offsets_, &keys_, &values_, &pair_gaussian_},
@@ -311,28 +322,52 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
       ctx_.dispatch(cmd, ranges_, {&keys_, &ranges_buf_}, pairs, div_up(pairs, 256));
     }
     VkContext::barrier(cmd);
+  };
+  auto rasterize = [&](VkCommandBuffer cmd) {
     dispatch_kernel(ctx_, cmd, forward_,
                     {&frame_, &projected_, &ranges_buf_, &values_, &pair_gaussian_, &target_, &pixel_grad_,
                      &pixel_count_, &image_, &tile_loss_},
                     tiles_x_, tiles_y_);
     VkContext::barrier(cmd);
-    if (train) {
-      dispatch_kernel(
-          ctx_, cmd, backward_,
-          {&frame_, &projected_, &ranges_buf_, &values_, &pair_gaussian_, &pixel_grad_, &pixel_count_, &pair_grads_},
-          tiles_x_, tiles_y_);
-      VkContext::barrier(cmd);
-      if (slots_ > 0) {
-        dispatch_kernel(ctx_, cmd, step_,
-                        {&frame_, &params_, &sh_, &m_params_, &v_params_, &m_sh_, &v_sh_, &tiles_, &offsets_,
-                         &pair_grads_, &projected_, &stats_buf_},
-                        div_up(slots_, 128));
-        VkContext::barrier(cmd);
-      }
-    }
     VkBufferCopy loss{0, 0, tile_loss_.size()};
     vkCmdCopyBuffer(cmd, tile_loss_.handle(), readback_loss_.handle(), 1, &loss);
-  });
+  };
+  auto backward = [&](VkCommandBuffer cmd) {
+    dispatch_kernel(
+        ctx_, cmd, backward_,
+        {&frame_, &projected_, &ranges_buf_, &values_, &pair_gaussian_, &pixel_grad_, &pixel_count_, &pair_grads_},
+        tiles_x_, tiles_y_);
+    VkContext::barrier(cmd);
+  };
+  auto optimize = [&](VkCommandBuffer cmd) {
+    if (slots_ == 0) return;
+    dispatch_kernel(ctx_, cmd, step_,
+                    {&frame_, &params_, &sh_, &m_params_, &v_params_, &m_sh_, &v_sh_, &tiles_, &offsets_,
+                     &pair_grads_, &projected_, &stats_buf_},
+                    div_up(slots_, 128));
+    VkContext::barrier(cmd);
+  };
+
+  if (!profile) {
+    ctx_.run([&](VkCommandBuffer cmd) {
+      sort(cmd);
+      rasterize(cmd);
+      if (train) {
+        backward(cmd);
+        optimize(cmd);
+      }
+    });
+    return;
+  }
+  profile_ = PassTimes{};
+  profile_.project = project_time.best_ms();
+  profile_.sort = ctx_.run(sort).best_ms();
+  profile_.rasterize = ctx_.run(rasterize).best_ms();
+  if (train) {
+    profile_.backward = ctx_.run(backward).best_ms();
+    profile_.optimize = ctx_.run(optimize).best_ms();
+  }
+  profile_.valid = true;
 }
 
 std::pair<double, double> Trainer::read_losses() {
@@ -345,7 +380,7 @@ std::pair<double, double> Trainer::read_losses() {
   return {abs_sum, sq_sum};
 }
 
-void Trainer::step() {
+void Trainer::step(bool profile) {
   if (order_pos_ >= order_.size()) {
     order_ = train_frames_;
     std::shuffle(order_.begin(), order_.end(), rng_);
@@ -358,13 +393,13 @@ void Trainer::step() {
   } else {
     std::copy(options_.background, options_.background + 3, bg);
   }
-  step_on(order_[order_pos_++], bg);
+  step_on(order_[order_pos_++], bg, profile);
 }
 
-void Trainer::step_on(size_t frame_index, const float background[3]) {
+void Trainer::step_on(size_t frame_index, const float background[3], bool profile) {
   const auto start = std::chrono::steady_clock::now();
   const DatasetFrame& frame = dataset_.frames.at(frame_index);
-  run_view(dataset_camera(dataset_, frame), frame.rgba.data(), background, options_.masked, true);
+  run_view(dataset_camera(dataset_, frame), frame.rgba.data(), background, options_.masked, true, profile);
   const auto [abs_sum, sq_sum] = read_losses();
   const double n = 3.0 * width_ * height_;
   stats_.l1 = abs_sum / n;

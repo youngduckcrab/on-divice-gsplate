@@ -3,16 +3,20 @@ package com.ondevice.gsplat.viewer
 import android.app.Application
 import android.content.ContentResolver
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.ondevice.gsplat.NativeBridge
 import com.ondevice.gsplat.NativeViewer
+import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -50,6 +54,18 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
             val pfd = resolver.openFileDescriptor(uri, "r")
                 ?: return@load JSONObject().put("ok", false).put("error", "파일을 열 수 없음").toString()
             pfd.use { NativeViewer.loadFile(it.detachFd()) }
+        }
+    }
+
+    /** Opens a model file from app storage, after any load in progress (e.g. the start-up sample). */
+    fun loadModel(file: File) {
+        viewModelScope.launch {
+            snapshotFlow { loading }.first { !it }
+            load(file.name) {
+                ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use {
+                    NativeViewer.loadFile(it.detachFd())
+                }
+            }
         }
     }
 

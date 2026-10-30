@@ -1,6 +1,7 @@
-// JNI entry points for com.ondevice.gsplat.NativeBridge (diagnostics) and
-// com.ondevice.gsplat.NativeViewer. Calls that can fail return JSON with
-// {"ok":false,"error":...} instead of throwing into Java.
+// JNI entry points for com.ondevice.gsplat.NativeBridge (diagnostics),
+// com.ondevice.gsplat.NativeViewer and com.ondevice.gsplat.NativeTrainer. Calls
+// that can fail return JSON with {"ok":false,"error":...} instead of throwing
+// into Java.
 #include <android/native_window_jni.h>
 #include <jni.h>
 #include <sys/stat.h>
@@ -12,11 +13,15 @@
 #include <string>
 #include <vector>
 
+#include <fstream>
+
 #include "gs/benchmarks.h"
+#include "gs/dataset.h"
 #include "gs/device_probe.h"
 #include "gs/json.h"
 #include "gs/splat_renderer.h"
 #include "gs/splat_scene.h"
+#include "gs/trainer.h"
 #include "gs/vk_context.h"
 #include "viewer.h"
 
@@ -82,6 +87,13 @@ jstring to_jstring(JNIEnv* env, std::string s) {
   env->DeleteLocalRef(bytes);
   env->DeleteLocalRef(string_class);
   return result;
+}
+
+std::string from_jstring(JNIEnv* env, jstring s) {
+  const char* chars = env->GetStringUTFChars(s, nullptr);
+  std::string out = chars != nullptr ? chars : "";
+  if (chars != nullptr) env->ReleaseStringUTFChars(s, chars);
+  return out;
 }
 
 std::vector<uint8_t> read_fd(int fd) {
@@ -245,4 +257,236 @@ Java_com_ondevice_gsplat_NativeViewer_stats(JNIEnv* env, jobject /*this*/) {
   } catch (const std::exception& e) {
     return to_jstring(env, error_json(e.what()));
   }
+}
+
+// --- NativeTrainer -----------------------------------------------------------------
+// Called from one background thread at a time; the mutex only guards release()
+// racing a late call.
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
+struct TrainSession {
+  std::shared_ptr<gs::VkContext> ctx;
+  std::unique_ptr<gs::Trainer> trainer;
+  std::vector<size_t> preview_frames;  // held-out frames, else all
+};
+
+std::mutex g_train_mutex;
+std::unique_ptr<TrainSession> g_train;
+
+template <typename F>
+std::string with_trainer(F&& f) {
+  std::lock_guard<std::mutex> lock(g_train_mutex);
+  try {
+    if (!g_train) return error_json("학습이 준비되지 않음");
+    return f(*g_train);
+  } catch (const std::exception& e) {
+    return error_json(e.what());
+  }
+}
+
+void write_stats(gs::JsonWriter& w, const gs::Trainer& t) {
+  const gs::TrainStats& s = t.stats();
+  w.field("step", s.step);
+  w.field("iterations", t.options().iterations);
+  w.field("gaussians", s.gaussians);
+  w.field("slots", s.slots);
+  w.field("pairs", s.pairs);
+  w.field("l1", s.l1);
+  w.field("psnr", s.psnr);
+  w.field("step_ms", s.step_ms);
+  w.field("sh_degree", s.sh_degree);
+  w.field("densify_events", s.densify_events);
+  w.field("finished", t.finished());
+}
+
+}  // namespace
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, jstring jdir, jint width,
+                                               jint iterations, jint max_gaussians, jint sh_degree, jboolean masked) {
+  const std::string dir = from_jstring(env, jdir);
+  std::lock_guard<std::mutex> lock(g_train_mutex);
+  try {
+    g_train.reset();
+    auto session = std::make_unique<TrainSession>();
+    {
+      std::lock_guard<std::mutex> ctx_lock(g_mutex);
+      session->ctx = context_locked();
+    }
+    const auto t0 = Clock::now();
+    gs::Dataset ds = gs::load_dataset(dir, static_cast<uint32_t>(width));
+    const double load_ms = ms_since(t0);
+
+    gs::TrainOptions options = gs::scaled_options(static_cast<uint32_t>(iterations));
+    options.max_gaussians = static_cast<uint32_t>(max_gaussians);
+    options.sh_degree = sh_degree;
+    options.masked = masked == JNI_TRUE;
+    const auto t1 = Clock::now();
+    gs::InitOptions init;
+    init.max_gaussians = std::min<uint32_t>(options.max_gaussians / 2, 150000);
+    init.subject_only = options.masked;
+    gs::InitStats init_stats;
+    gs::SplatScene scene = gs::initialize_gaussians(ds, init, &init_stats);
+    const double init_ms = ms_since(t1);
+
+    for (size_t i = 0; i < ds.frames.size(); ++i) {
+      if (ds.frames[i].holdout) session->preview_frames.push_back(i);
+    }
+    if (session->preview_frames.empty()) session->preview_frames.push_back(0);
+
+    const auto t2 = Clock::now();
+    session->trainer = std::make_unique<gs::Trainer>(*session->ctx, ds, scene, options);
+    const double setup_ms = ms_since(t2);
+    const gs::Dataset& d = session->trainer->dataset();
+
+    gs::JsonWriter w;
+    w.begin_object();
+    w.field("ok", true);
+    w.field("name", d.name);
+    w.field("frames", d.frames.size());
+    w.field("holdout", d.holdout_count());
+    w.field("width", d.width);
+    w.field("height", d.height);
+    w.field("masks", d.has_masks);
+    w.field("depth", d.has_depth);
+    w.field("points", d.points.size() / 3);
+    w.field("masked", session->trainer->options().masked);
+    w.field("init_source", init_stats.source);
+    w.field("init_points", init_stats.raw_points);
+    w.field("init_gaussians", scene.count);
+    w.field("load_ms", load_ms);
+    w.field("init_ms", init_ms);
+    w.field("setup_ms", setup_ms);
+    write_stats(w, *session->trainer);
+    w.end_object();
+    g_train = std::move(session);
+    return to_jstring(env, w.str());
+  } catch (const std::exception& e) {
+    g_train.reset();
+    return to_jstring(env, error_json(e.what()));
+  }
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ondevice_gsplat_NativeTrainer_step(JNIEnv* env, jobject /*this*/, jint count, jboolean profile) {
+  return to_jstring(env, with_trainer([&](TrainSession& s) {
+    const auto t0 = Clock::now();
+    int done = 0;
+    for (; done < count && !s.trainer->finished(); ++done) {
+      // Profile the first step of the batch only.
+      s.trainer->step(profile == JNI_TRUE && done == 0);
+    }
+    gs::JsonWriter w;
+    w.begin_object();
+    w.field("ok", true);
+    w.field("steps", done);
+    w.field("wall_ms", ms_since(t0));
+    write_stats(w, *s.trainer);
+    const gs::PassTimes& p = s.trainer->last_profile();
+    if (profile == JNI_TRUE && p.valid) {
+      w.key("profile").begin_object();
+      w.field("project", p.project);
+      w.field("sort", p.sort);
+      w.field("rasterize", p.rasterize);
+      w.field("backward", p.backward);
+      w.field("optimize", p.optimize);
+      w.end_object();
+    }
+    w.end_object();
+    return w.str();
+  }));
+}
+
+// Renders held-out view `index` (modulo their count) and returns ARGB pixels:
+// the render followed by the target, both over the same dark background.
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_ondevice_gsplat_NativeTrainer_preview(JNIEnv* env, jobject /*this*/, jint index) {
+  std::vector<uint8_t> render, target;
+  uint32_t width = 0, height = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_train_mutex);
+    if (!g_train) return nullptr;
+    try {
+      gs::Trainer& t = *g_train->trainer;
+      const gs::Dataset& ds = t.dataset();
+      const size_t frame = g_train->preview_frames[size_t(index) % g_train->preview_frames.size()];
+      const float bg[3] = {0.08f, 0.09f, 0.11f};
+      render = t.render(gs::dataset_camera(ds, ds.frames[frame]), bg);
+      target = ds.frames[frame].rgba;
+      const bool masked = t.options().masked;
+      for (size_t p = 0; p < target.size() / 4; ++p) {
+        const float a = masked ? target[p * 4 + 3] / 255.0f : 1.0f;
+        for (int c = 0; c < 3; ++c) {
+          target[p * 4 + c] = static_cast<uint8_t>(target[p * 4 + c] * a + bg[c] * 255.0f * (1.0f - a) + 0.5f);
+        }
+      }
+      width = ds.width;
+      height = ds.height;
+    } catch (const std::exception&) {
+      return nullptr;
+    }
+  }
+  const size_t pixels = size_t(width) * height;
+  std::vector<jint> argb(pixels * 2);
+  auto pack = [](const uint8_t* p) {
+    return static_cast<jint>(0xff000000u | (uint32_t(p[0]) << 16) | (uint32_t(p[1]) << 8) | uint32_t(p[2]));
+  };
+  for (size_t p = 0; p < pixels; ++p) {
+    argb[p] = pack(&render[p * 4]);
+    argb[pixels + p] = pack(&target[p * 4]);
+  }
+  jintArray out = env->NewIntArray(static_cast<jsize>(argb.size()));
+  if (out != nullptr) env->SetIntArrayRegion(out, 0, static_cast<jsize>(argb.size()), argb.data());
+  return out;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ondevice_gsplat_NativeTrainer_evaluate(JNIEnv* env, jobject /*this*/) {
+  return to_jstring(env, with_trainer([](TrainSession& s) {
+    const auto t0 = Clock::now();
+    const gs::EvalResult e = s.trainer->evaluate();
+    gs::JsonWriter w;
+    w.begin_object();
+    w.field("ok", true);
+    w.field("psnr", e.psnr);
+    w.field("l1", e.l1);
+    w.field("views", e.views);
+    w.field("ms", ms_since(t0));
+    w.end_object();
+    return w.str();
+  }));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ondevice_gsplat_NativeTrainer_exportPly(JNIEnv* env, jobject /*this*/, jstring jpath) {
+  const std::string path = from_jstring(env, jpath);
+  return to_jstring(env, with_trainer([&](TrainSession& s) {
+    const auto t0 = Clock::now();
+    gs::SplatScene scene = s.trainer->export_scene();
+    gs::convert_convention(scene, gs::AxisConvention::RDF);
+    const std::vector<uint8_t> ply = gs::save_ply(scene);
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file.write(reinterpret_cast<const char*>(ply.data()), static_cast<std::streamsize>(ply.size()));
+    file.close();
+    if (!file) throw std::runtime_error("PLY 파일을 쓸 수 없음");
+    gs::JsonWriter w;
+    w.begin_object();
+    w.field("ok", true);
+    w.field("count", scene.count);
+    w.field("bytes", ply.size());
+    w.field("ms", ms_since(t0));
+    w.end_object();
+    return w.str();
+  }));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_ondevice_gsplat_NativeTrainer_release(JNIEnv*, jobject) {
+  std::lock_guard<std::mutex> lock(g_train_mutex);
+  g_train.reset();
 }

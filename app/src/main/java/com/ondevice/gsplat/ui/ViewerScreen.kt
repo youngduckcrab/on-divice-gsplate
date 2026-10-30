@@ -42,15 +42,26 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ondevice.gsplat.NativeViewer
 import com.ondevice.gsplat.viewer.ViewerViewModel
+import java.io.File
 import java.util.Locale
 import kotlinx.coroutines.delay
 import org.json.JSONObject
 
 @Composable
-fun ViewerScreen(vm: ViewerViewModel = viewModel()) {
+fun ViewerScreen(
+    pendingModel: File? = null,
+    onModelOpened: () -> Unit = {},
+    vm: ViewerViewModel = viewModel(),
+) {
     vm.loadError?.let {
         Text("네이티브 라이브러리 로드 실패: $it", modifier = Modifier.padding(16.dp))
         return
+    }
+    LaunchedEffect(pendingModel) {
+        if (pendingModel != null) {
+            vm.loadModel(pendingModel)
+            onModelOpened()
+        }
     }
     val openFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) vm.loadUri(uri)
