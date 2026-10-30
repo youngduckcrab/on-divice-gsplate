@@ -4,6 +4,7 @@
 // Usage:
 //   gs_train <dataset_dir> <out.ply> [--width 360] [--iters 3000] [--max-gaussians 300000]
 //            [--sh 3] [--init-gaussians 150000] [--opacity-reset N (0 = off)] [--grad-threshold 2e-4]
+//            [--reduction subgroup|subgroup_scalar|serial_cut|serial|shared]
 //            [--no-masks] [--preview <dir>] [--eval-every 1000]
 #include <chrono>
 #include <cstdio>
@@ -51,6 +52,16 @@ int main(int argc, char** argv) {
         max_init = std::atoi(next());
       } else if (arg == "--opacity-reset") {
         reset_override = std::atoi(next());
+      } else if (arg == "--reduction") {
+        const std::string r = next();
+        using R = gs::TrainOptions::Reduction;
+        options.reduction = r == "subgroup"          ? R::Subgroup
+                            : r == "subgroup_scalar" ? R::SubgroupScalar
+                            : r == "serial_cut2"     ? R::SerialCut2
+                            : r == "serial_cut"      ? R::SerialCut
+                            : r == "serial"          ? R::Serial
+                            : r == "shared"          ? R::Shared
+                                                     : R::Auto;
       } else if (arg == "--grad-threshold") {
         grad_threshold = std::atof(next());
       } else if (arg == "--no-masks") {
@@ -97,9 +108,9 @@ int main(int argc, char** argv) {
     gs::Trainer trainer(ctx, ds, scene, options);
     const auto t2 = clock::now();
     while (!trainer.finished()) {
-      trainer.step(trainer.stats().step % 500 == 250);
+      trainer.step(trainer.stats().step % 100 == 50);
       const gs::TrainStats& s = trainer.stats();
-      if (s.step % 500 == 251 && trainer.last_profile().valid) {
+      if (s.step % 100 == 51 && trainer.last_profile().valid) {
         const gs::PassTimes& p = trainer.last_profile();
         std::printf("  gpu ms: project %.1f  sort %.1f  forward %.1f  backward %.1f  optimize %.1f\n", p.project,
                     p.sort, p.rasterize, p.backward, p.optimize);

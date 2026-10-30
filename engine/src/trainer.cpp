@@ -12,6 +12,8 @@
 #include "shaders/scan_add.h"
 #include "shaders/scan_local.h"
 #include "shaders/train_backward.h"
+#include "shaders/train_backward_cut.h"
+#include "shaders/train_backward_cut2.h"
 #include "shaders/train_backward_scalar.h"
 #include "shaders/train_backward_serial.h"
 #include "shaders/train_backward_shared.h"
@@ -50,6 +52,7 @@ constexpr float kEpsilon = 1e-15f;
 constexpr uint32_t kFlagMaskedTarget = 1;
 constexpr uint32_t kScanBlock = 1024;
 constexpr uint32_t kPairGradBytes = 48;
+constexpr uint32_t kBackwardBindings = 9;  // the variants use up to 9 (serial_cut reads tile counts)
 
 struct ScanPush {
   uint32_t count;
@@ -128,7 +131,7 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
   scan_add_ = make("scan_add", shaders::scan_add, 4, sizeof(ScanPush));
   emit_ = make("train_emit", shaders::train_emit, 7, 0);
   ranges_ = make("train_ranges", shaders::train_ranges, 2, sizeof(uint32_t));
-  forward_ = make("train_forward", shaders::train_forward, 10, 0);
+  forward_ = make("train_forward", shaders::train_forward, 11, 0);
   step_ = make("train_step", shaders::train_step, 12, 0);
   densify_mark_ = make("train_densify_mark", shaders::train_densify_mark, 11, 0);
   densify_spawn_ = make("train_densify_spawn", shaders::train_densify_spawn, 11, sizeof(uint32_t));
@@ -165,7 +168,7 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
       break;
     }
     try {
-      backward_ = ctx.create_compute_pipeline(v.spirv, 8, sizeof(backward_push_));
+      backward_ = ctx.create_compute_pipeline(v.spirv, kBackwardBindings, sizeof(backward_push_));
       reduction_ = v.name;
     } catch (const VulkanError& e) {
       log_error("trainer: %s backward rejected (%s)", v.name, e.what());
@@ -179,11 +182,19 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
     }
     backward_push_[0] = 32;
     if (options_.reduction == Reduction::Shared) {
-      backward_ = make("train_backward_shared", shaders::train_backward_shared, 8, sizeof(backward_push_));
+      backward_ = make("train_backward_shared", shaders::train_backward_shared, kBackwardBindings,
+                       sizeof(backward_push_));
       reduction_ = "shared";
-    } else {
-      backward_ = make("train_backward_serial", shaders::train_backward_serial, 8, sizeof(backward_push_));
+    } else if (options_.reduction == Reduction::Serial) {
+      backward_ = make("train_backward_serial", shaders::train_backward_serial, kBackwardBindings,
+                       sizeof(backward_push_));
       reduction_ = "serial";
+    } else if (options_.reduction == Reduction::SerialCut) {
+      backward_ = make("train_backward_cut", shaders::train_backward_cut, kBackwardBindings, sizeof(backward_push_));
+      reduction_ = "serial_cut";
+    } else {
+      backward_ = make("train_backward_cut2", shaders::train_backward_cut2, kBackwardBindings, sizeof(backward_push_));
+      reduction_ = "serial_cut2";
     }
   }
   if (!failures.empty()) {
@@ -222,6 +233,7 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
   image_ = ctx.create_buffer(pixels * 4, MemoryKind::Device);
   ranges_buf_ = ctx.create_buffer(tiles * 8, MemoryKind::Device);
   tile_loss_ = ctx.create_buffer(tiles * 16, MemoryKind::Device);
+  tile_count_ = ctx.create_buffer(tiles * 4, MemoryKind::Device);
   readback_small_ = ctx.create_buffer(16, MemoryKind::Readback);
   readback_image_ = ctx.create_buffer(pixels * 4, MemoryKind::Readback);
   readback_loss_ = ctx.create_buffer(tiles * 16, MemoryKind::Readback);
@@ -384,7 +396,7 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
   auto rasterize = [&](VkCommandBuffer cmd) {
     dispatch_kernel(ctx_, cmd, forward_,
                     {&frame_, &projected_, &ranges_buf_, &values_, &pair_gaussian_, &target_, &pixel_grad_,
-                     &pixel_count_, &image_, &tile_loss_},
+                     &pixel_count_, &image_, &tile_loss_, &tile_count_},
                     tiles_x_, tiles_y_);
     VkContext::barrier(cmd);
     VkBufferCopy loss{0, 0, tile_loss_.size()};
@@ -394,7 +406,7 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
   auto backward = [&](VkCommandBuffer cmd) {
     ctx_.dispatch(cmd, backward_,
                   {&frame_, &projected_, &ranges_buf_, &values_, &pair_gaussian_, &pixel_grad_, &pixel_count_,
-                   &pair_grads_},
+                   &pair_grads_, &tile_count_},
                   backward_push_, tiles_x_, tiles_y_);
     VkContext::barrier(cmd);
   };
@@ -408,7 +420,7 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
   };
 
   if (!profile) {
-    ctx_.run([&](VkCommandBuffer cmd) {
+    const RunTiming main_time = ctx_.run([&](VkCommandBuffer cmd) {
       sort(cmd);
       rasterize(cmd);
       if (train) {
@@ -416,6 +428,13 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
         optimize(cmd);
       }
     });
+    if (train) {
+      auto ema = [](double& avg, double v) { avg = avg == 0.0 ? v : 0.95 * avg + 0.05 * v; };
+      ema(stats_.timing.project_wall_ms, project_time.cpu_ms);
+      ema(stats_.timing.project_gpu_ms, std::max(project_time.gpu_ms, 0.0));
+      ema(stats_.timing.main_wall_ms, main_time.cpu_ms);
+      ema(stats_.timing.main_gpu_ms, std::max(main_time.gpu_ms, 0.0));
+    }
     return;
   }
   profile_ = PassTimes{};

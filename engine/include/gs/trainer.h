@@ -17,9 +17,11 @@ namespace gs {
 struct TrainOptions {
   // How the backward pass sums gradients over a tile's pixels.
   enum class Reduction {
-    Auto,            // the first subgroup variant the driver accepts, else Serial
+    Auto,            // the first subgroup variant the driver accepts, else SerialCut2
     Subgroup,        // vec4 subgroup adds (fails if unavailable)
     SubgroupScalar,  // scalar subgroup adds (fails if unavailable)
+    SerialCut2,      // no subgroups: like SerialCut, two splats per round of barriers
+    SerialCut,       // no subgroups: like Serial, stopping at the tile's last contributor
     Serial,          // no subgroups: one splat at a time, two-stage shared-memory sum
     Shared,          // no subgroups: batched splats, shared-memory tree per splat
   };
@@ -84,6 +86,14 @@ struct TrainStats {
   uint32_t densify_events = 0;
   uint32_t spawned = 0;  // gaussians added by densification, in total
   uint32_t pruned = 0;   // and removed
+  // Moving averages per training step: wall clock around each submit + wait,
+  // and GPU time from timestamps, for the projection submit and the main one.
+  struct Timing {
+    double project_wall_ms = 0.0;
+    double project_gpu_ms = 0.0;
+    double main_wall_ms = 0.0;
+    double main_gpu_ms = 0.0;
+  } timing;
 };
 
 struct EvalResult {
@@ -188,7 +198,7 @@ class Trainer {
   Buffer params_, sh_, m_params_, v_params_, m_sh_, v_sh_, stats_buf_;
   Buffer projected_, tiles_, offsets_, spawn_, free_list_, counters_, block_sums_, totals_;
   Buffer keys_, values_, pair_gaussian_, pair_grads_;
-  Buffer target_, pixel_grad_, pixel_count_, image_, ranges_buf_, tile_loss_;
+  Buffer target_, pixel_grad_, pixel_count_, image_, ranges_buf_, tile_loss_, tile_count_;
   Buffer readback_small_, readback_image_, readback_loss_;
 };
 

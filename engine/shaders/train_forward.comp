@@ -16,6 +16,8 @@ layout(std430, binding = 6) writeonly buffer PixelGrad { vec4 pixel_grad[]; };  
 layout(std430, binding = 7) writeonly buffer PixelCount { uint pixel_count[]; };  // pairs up to the last contributor
 layout(std430, binding = 8) writeonly buffer Image { uint image[]; };  // rendered RGBA8
 layout(std430, binding = 9) writeonly buffer TileLoss { vec4 tile_loss[]; };  // sum |e|, sum e^2
+// Per tile, the largest per-pixel count: pairs behind it contribute to no pixel.
+layout(std430, binding = 10) writeonly buffer TileCount { uint tile_count[]; };
 
 const uint BATCH = 256u;
 shared vec4 s_g0[BATCH];  // centre xy, opacity, unused
@@ -23,6 +25,7 @@ shared vec4 s_g1[BATCH];  // conic abc
 shared vec4 s_g2[BATCH];  // colour
 shared uint s_done;
 shared vec2 s_loss[BATCH];
+shared uint s_count[BATCH];
 
 void main() {
   uint lid = gl_LocalInvocationIndex;
@@ -89,10 +92,18 @@ void main() {
     loss = vec2(abs(e.r) + abs(e.g) + abs(e.b), dot(e, e));
   }
   s_loss[lid] = loss;
+  s_count[lid] = last;
   barrier();
   for (uint stride = BATCH / 2u; stride > 0u; stride >>= 1u) {
-    if (lid < stride) s_loss[lid] += s_loss[lid + stride];
+    if (lid < stride) {
+      s_loss[lid] += s_loss[lid + stride];
+      s_count[lid] = max(s_count[lid], s_count[lid + stride]);
+    }
     barrier();
   }
-  if (lid == 0u) tile_loss[tile.y * frame.image.z + tile.x] = vec4(s_loss[0], 0.0, 0.0);
+  if (lid == 0u) {
+    uint t = tile.y * frame.image.z + tile.x;
+    tile_loss[t] = vec4(s_loss[0], 0.0, 0.0);
+    tile_count[t] = s_count[0];
+  }
 }

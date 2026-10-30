@@ -1,0 +1,7 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Backward pass, two splats per barrier round up to the tile's last contributor
+// (see train_backward_serial.glsl).
+#define GS_TILE_CUTOFF
+#define GS_BATCH 2
+#include "train_backward_serial.glsl"

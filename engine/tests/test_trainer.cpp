@@ -48,6 +48,38 @@ void test_gradients(gs::VkContext& ctx, bool masked,
   EXPECT(r.ok(), "gradient report not ok");
 }
 
+void test_cutoff_matches_serial(gs::VkContext& ctx) {
+  // Dense, nearly opaque gaussians: pixels saturate, so the cut variant skips
+  // pairs behind them. Gradients must equal the full serial variant's.
+  gs::Dataset ds = gs::make_test_dataset(kWidth, kHeight, 1, false, 7);
+  gs::SplatScene scene = gs::make_test_scene(80, 1, 5);
+  for (float& v : scene.opacity_logits) v += 4.0f;
+  for (float& v : scene.log_scales) v += 0.7f;
+  const float bg[3] = {0.1f, 0.2f, 0.3f};
+  std::vector<float> grads[3];
+  float min_t = 1.0f;
+  const gs::TrainOptions::Reduction variants[3] = {gs::TrainOptions::Reduction::Serial,
+                                                   gs::TrainOptions::Reduction::SerialCut,
+                                                   gs::TrainOptions::Reduction::SerialCut2};
+  for (int v = 0; v < 3; ++v) {
+    gs::TrainOptions o = gs::frozen_train_options(1, false);
+    o.reduction = variants[v];
+    gs::Trainer trainer(ctx, ds, scene, o);
+    trainer.step_on(0, bg);
+    grads[v] = trainer.first_step_gradients().params;
+    const gs::Trainer::DebugSnapshot snap = trainer.debug_snapshot();
+    for (size_t p = 0; p < snap.pixel_count.size(); ++p) min_t = std::min(min_t, snap.pixel_grad[p * 4 + 3]);
+  }
+  double max_diff = 0.0, max_abs = 0.0;
+  for (size_t i = 0; i < grads[0].size(); ++i) {
+    for (int v = 1; v < 3; ++v) max_diff = std::max(max_diff, double(std::fabs(grads[0][i] - grads[v][i])));
+    max_abs = std::max(max_abs, double(std::fabs(grads[0][i])));
+  }
+  std::printf("  cutoff: min transmittance %.2g, max |grad| %.3g, max diff %.3g\n", min_t, max_abs, max_diff);
+  EXPECT(min_t < 1e-3f, "test scene does not saturate (min T %.3g)", min_t);
+  EXPECT(max_diff <= 1e-5 * max_abs, "serial_cut(2) gradients differ from serial by %.3g", max_diff);
+}
+
 void test_probes(gs::VkContext& ctx) {
   const gs::ProbeReport p = gs::probe_gpu_ops(ctx);
   EXPECT(p.shared_ok, "shared probe: max %u add %u tree %u", p.atomic_max, p.atomic_add, p.tree_max);
@@ -210,8 +242,13 @@ int main() {
     test_gradients(ctx, true);
     test_gradients(ctx, true, gs::TrainOptions::Reduction::Shared);
     test_gradients(ctx, true, gs::TrainOptions::Reduction::SubgroupScalar);
+    test_gradients(ctx, false, gs::TrainOptions::Reduction::SerialCut2);
+    test_gradients(ctx, true, gs::TrainOptions::Reduction::SerialCut2);
+    test_gradients(ctx, false, gs::TrainOptions::Reduction::SerialCut);
+    test_gradients(ctx, true, gs::TrainOptions::Reduction::SerialCut);
     test_gradients(ctx, false, gs::TrainOptions::Reduction::Serial);
     test_gradients(ctx, true, gs::TrainOptions::Reduction::Serial);
+    test_cutoff_matches_serial(ctx);
     test_probes(ctx);
     test_scan_and_densify(ctx);
     test_training_converges(ctx);

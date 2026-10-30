@@ -66,6 +66,15 @@ set(GS_SHADERS
   probe_sg_add.comp
   probe_sg_ballot.comp
   train_backward_serial.comp
+  train_backward_cut.comp
+  train_backward_cut2.comp
+  probe_sg_vec4.comp
+  probe_sg_add_id.comp
+  probe_sg_add_elect.comp
+  probe_sg_add_num.comp
+  probe_sg_add_shared.comp
+  probe_sg_add_loop.comp
+  probe_sg_combo_scalar.comp
   train_step.comp
   train_densify_mark.comp
   train_densify_spawn.comp

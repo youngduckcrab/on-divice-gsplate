@@ -10,10 +10,17 @@
 #include "gs/json.h"
 #include "shaders/probe_ops.h"
 #include "shaders/probe_sg_add.h"
+#include "shaders/probe_sg_add_elect.h"
+#include "shaders/probe_sg_add_id.h"
+#include "shaders/probe_sg_add_loop.h"
+#include "shaders/probe_sg_add_num.h"
+#include "shaders/probe_sg_add_shared.h"
+#include "shaders/probe_sg_combo_scalar.h"
 #include "shaders/probe_sg_ballot.h"
 #include "shaders/probe_sg_basic.h"
 #include "shaders/probe_sg_elect.h"
 #include "shaders/probe_sg_id.h"
+#include "shaders/probe_sg_vec4.h"
 #include "shaders/probe_subgroup.h"
 
 namespace gs {
@@ -431,7 +438,14 @@ ProbeReport probe_gpu_ops(VkContext& ctx) {
                                                                      {"elect", shaders::probe_sg_elect},
                                                                      {"id", shaders::probe_sg_id},
                                                                      {"add", shaders::probe_sg_add},
-                                                                     {"ballot", shaders::probe_sg_ballot}};
+                                                                     {"ballot", shaders::probe_sg_ballot},
+                                                                     {"vec4", shaders::probe_sg_vec4},
+                                                                     {"add+id", shaders::probe_sg_add_id},
+                                                                     {"add+elect", shaders::probe_sg_add_elect},
+                                                                     {"add+num", shaders::probe_sg_add_num},
+                                                                     {"add+shared", shaders::probe_sg_add_shared},
+                                                                     {"add+loop", shaders::probe_sg_add_loop},
+                                                                     {"combo", shaders::probe_sg_combo_scalar}};
   for (const auto& [name, spirv] : parts) {
     try {
       ComputePipeline pipeline = ctx.create_compute_pipeline(spirv, 1, 0);
@@ -447,6 +461,8 @@ ReductionChoice choose_reduction(VkContext& ctx) {
   using Reduction = TrainOptions::Reduction;
   const std::pair<Reduction, const char*> candidates[] = {{Reduction::Subgroup, "subgroup"},
                                                           {Reduction::SubgroupScalar, "subgroup_scalar"},
+                                                          {Reduction::SerialCut2, "serial_cut2"},
+                                                          {Reduction::SerialCut, "serial_cut"},
                                                           {Reduction::Serial, "serial"},
                                                           {Reduction::Shared, "shared"}};
   ReductionChoice choice;
@@ -552,13 +568,17 @@ std::string trainer_self_test_json(VkContext& ctx) {
   using Reduction = TrainOptions::Reduction;
   const Case cases[] = {{Reduction::Subgroup, true},
                         {Reduction::SubgroupScalar, true},
-                        {Reduction::Serial, false},
+                        {Reduction::SerialCut2, false},
+                        {Reduction::SerialCut2, true},
+                        {Reduction::SerialCut, true},
                         {Reduction::Serial, true},
                         {Reduction::Shared, true}};
   for (const Case& c : cases) {
     w.begin_object();
     w.field("requested", c.reduction == Reduction::Subgroup         ? "subgroup"
                          : c.reduction == Reduction::SubgroupScalar ? "subgroup_scalar"
+                         : c.reduction == Reduction::SerialCut2     ? "serial_cut2"
+                         : c.reduction == Reduction::SerialCut      ? "serial_cut"
                          : c.reduction == Reduction::Serial         ? "serial"
                                                                     : "shared");
     w.field("masked", c.masked);

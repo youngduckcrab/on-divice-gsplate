@@ -409,6 +409,12 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                         if (r?.stopped == true) " · 중간에 중지" else "",
                 )
             }
+            s?.optJSONObject("timing")?.let { t ->
+                appendLine(
+                    "제출별 ms/회 (벽시계/GPU): 투영 ${f1(t.optDouble("project_wall"))}/${f1(t.optDouble("project_gpu"))} · " +
+                        "본 단계 ${f1(t.optDouble("main_wall"))}/${f1(t.optDouble("main_gpu"))}",
+                )
+            }
             if (segmentMs.isNotEmpty()) {
                 appendLine("ms/회 (${SEGMENT}회 단위): " + segmentMs.joinToString(" ") { "%.0f".format(Locale.US, it) })
             }

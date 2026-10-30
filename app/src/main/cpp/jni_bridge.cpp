@@ -310,6 +310,12 @@ void write_stats(gs::JsonWriter& w, const gs::Trainer& t) {
   w.field("spawned", s.spawned);
   w.field("pruned", s.pruned);
   w.field("finished", t.finished());
+  w.key("timing").begin_object();
+  w.field("project_wall", s.timing.project_wall_ms);
+  w.field("project_gpu", s.timing.project_gpu_ms);
+  w.field("main_wall", s.timing.main_wall_ms);
+  w.field("main_gpu", s.timing.main_gpu_ms);
+  w.end_object();
 }
 
 }  // namespace

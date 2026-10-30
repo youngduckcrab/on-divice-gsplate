@@ -1,0 +1,5 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Backward pass, one splat at a time up to the tile's last contributor (see train_backward_serial.glsl).
+#define GS_TILE_CUTOFF
+#include "train_backward_serial.glsl"
