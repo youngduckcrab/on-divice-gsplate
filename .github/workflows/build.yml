@@ -29,8 +29,12 @@ jobs:
       - name: Test
         run: ctest --test-dir build/engine --output-on-failure
 
+  # Builds the APK and, the first time a version from version.properties builds
+  # green, publishes it as a GitHub release. The APK goes straight to the release
+  # rather than through workflow artifacts (the account's artifact quota is full).
   android:
     name: Android APK
+    needs: engine-tests
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -42,35 +46,20 @@ jobs:
       - name: Build release APK
         run: ./gradlew --no-daemon --continue assembleRelease
       - name: Rename APK
+        id: apk
         run: |
           version=$(grep '^versionName=' version.properties | cut -d= -f2)
           mkdir -p dist
           cp app/build/outputs/apk/release/app-release.apk "dist/gsplat-v${version}.apk"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: apk
-          path: dist/*.apk
-          if-no-files-found: error
-
-  # Publishes a GitHub release the first time a version from version.properties
-  # builds green. Later pushes with the same version only produce CI artifacts.
-  release:
-    name: Publish release
-    needs: [engine-tests, android]
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: apk
-          path: dist
-      - name: Create release for a new version
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          ls -l dist
+      - name: Publish release for a new version
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.apk.outputs.version }}
         run: |
-          version=$(grep '^versionName=' version.properties | cut -d= -f2)
-          tag="v${version}"
+          tag="v${VERSION}"
           if gh release view "$tag" > /dev/null 2>&1; then
             echo "Release $tag already exists; bump version.properties to publish a new build."
             exit 0
