@@ -74,6 +74,8 @@ add_library(gsengine STATIC
   src/vk_context.cpp
 )
 add_dependencies(gsengine gs_shaders)
+# Public headers use C++20 (concepts, std::span), so consumers need it too.
+target_compile_features(gsengine PUBLIC cxx_std_20)
 target_include_directories(gsengine
   PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
   PRIVATE "${GS_SHADER_OUT}")

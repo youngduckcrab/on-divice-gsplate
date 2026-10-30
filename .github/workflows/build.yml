@@ -40,7 +40,7 @@ jobs:
           java-version: '17'
       - uses: gradle/actions/setup-gradle@v4
       - name: Build release APK
-        run: ./gradlew --no-daemon --stacktrace assembleRelease
+        run: ./gradlew --no-daemon --continue assembleRelease
       - name: Rename APK
         run: |
           version=$(grep '^versionName=' version.properties | cut -d= -f2)
