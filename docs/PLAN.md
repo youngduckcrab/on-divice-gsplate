@@ -410,6 +410,8 @@ on-divice-gsplate/
 
 **완료 기준**: hold-out PSNR ≥ 22 dB, 학습 ≤ 5분
 
+**진행**: v0.4.0 — D-SSIM(0.8 L1 + 0.2 (1 − SSIM), GPU에서 SSIM과 그래디언트, CPU 유한차분으로 검증), 프리셋 해상도 상향(빠름·표준 540×960, 고품질 720×1280), 검증 SSIM 지표, 500회마다 발열 헤드룸. 다음: 얼굴 영역 loss 가중치와 얼굴 PSNR.
+
 ### M5 — 속도 최적화 `v0.6` · 2~4 사이클
 
 **구현**: GPU 타임스탬프 프로파일링, sparse Adam, fp16 경로, 기기별 atomic 전략 자동 선택, 타일 크기 · workgroup 튜닝, 커널 fusion, ADPF 열 관리

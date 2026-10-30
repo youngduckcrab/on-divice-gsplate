@@ -175,10 +175,58 @@ void look_at_c2w_gl(const float eye[3], const float target[3], float c2w[16]) {
 
 }  // namespace
 
-// Renders and returns the L1 loss against `target` (RGBA8), compositing like the GPU.
+double reference_ssim(const std::vector<double>& x, const std::vector<double>& y, uint32_t width, uint32_t height) {
+  constexpr int R = 5;
+  double w[2 * R + 1], total = 0.0;
+  for (int k = -R; k <= R; ++k) total += w[k + R] = std::exp(-double(k * k) / (2.0 * 1.5 * 1.5));
+  for (double& v : w) v /= total;
+  const double c1 = 0.01 * 0.01, c2 = 0.03 * 0.03;
+  const size_t n = size_t(width) * height;
+  // Window means of x, y, xx, yy, xy: rows, then columns; zero outside the image.
+  std::vector<double> in(n * 5), rows(n * 5, 0.0), out(n * 5, 0.0);
+  double sum = 0.0;
+  for (int c = 0; c < 3; ++c) {
+    for (size_t p = 0; p < n; ++p) {
+      const double a = x[p * 3 + c], b = y[p * 3 + c];
+      const double v[5] = {a, b, a * a, b * b, a * b};
+      for (int q = 0; q < 5; ++q) in[q * n + p] = v[q];
+    }
+    for (int q = 0; q < 5; ++q) {
+      for (uint32_t r = 0; r < height; ++r) {
+        for (uint32_t col = 0; col < width; ++col) {
+          double s = 0.0;
+          for (int k = -R; k <= R; ++k) {
+            const int cc = int(col) + k;
+            if (cc >= 0 && cc < int(width)) s += w[k + R] * in[q * n + size_t(r) * width + cc];
+          }
+          rows[q * n + size_t(r) * width + col] = s;
+        }
+      }
+      for (uint32_t r = 0; r < height; ++r) {
+        for (uint32_t col = 0; col < width; ++col) {
+          double s = 0.0;
+          for (int k = -R; k <= R; ++k) {
+            const int rr = int(r) + k;
+            if (rr >= 0 && rr < int(height)) s += w[k + R] * rows[q * n + size_t(rr) * width + col];
+          }
+          out[q * n + size_t(r) * width + col] = s;
+        }
+      }
+    }
+    for (size_t p = 0; p < n; ++p) {
+      const double mx = out[p], my = out[n + p];
+      const double vx = out[2 * n + p] - mx * mx, vy = out[3 * n + p] - my * my, cxy = out[4 * n + p] - mx * my;
+      sum += (2 * mx * my + c1) * (2 * cxy + c2) / ((mx * mx + my * my + c1) * (vx + vy + c2));
+    }
+  }
+  return sum / (3.0 * n);
+}
+
+// Renders and returns the loss against `target` (RGBA8), compositing like the GPU.
 double reference_loss(const Camera& cam, const std::vector<double>& params, const std::vector<double>& sh,
                       int stride, int degree, const std::vector<uint8_t>& target, const float bg[3], bool masked,
-                      std::vector<double>* image) {
+                      double lambda_dssim, std::vector<double>* image) {
+  std::vector<double> render(size_t(cam.width) * cam.height * 3), truth(render.size());
   const size_t n = params.size() / 16;
   std::vector<Ref> refs(n);
   for (size_t i = 0; i < n; ++i) refs[i] = project(cam, &params[i * 16], &sh[i * stride], stride, degree);
@@ -187,7 +235,6 @@ double reference_loss(const Camera& cam, const std::vector<double>& params, cons
     if (refs[i].visible) order.push_back(i);
   }
   std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return refs[a].key < refs[b].key; });
-  if (image) image->assign(size_t(cam.width) * cam.height * 3, 0.0);
   double loss = 0;
   for (uint32_t y = 0; y < cam.height; ++y) {
     for (uint32_t x = 0; x < cam.width; ++x) {
@@ -209,11 +256,15 @@ double reference_loss(const Camera& cam, const std::vector<double>& params, cons
         const double out = C[c] + T * bg[c];
         const double tc = masked ? bg[c] * (1 - a) + t[c] / 255.0 * a : t[c] / 255.0;
         loss += std::fabs(out - tc);
-        if (image) (*image)[(size_t(y) * cam.width + x) * 3 + c] = out;
+        render[(size_t(y) * cam.width + x) * 3 + c] = out;
+        truth[(size_t(y) * cam.width + x) * 3 + c] = tc;
       }
     }
   }
-  return loss / (3.0 * cam.width * cam.height);
+  if (image) *image = render;
+  const double l1 = loss / (3.0 * cam.width * cam.height);
+  if (lambda_dssim <= 0.0) return l1;
+  return (1.0 - lambda_dssim) * l1 + lambda_dssim * (1.0 - reference_ssim(render, truth, cam.width, cam.height));
 }
 
 Dataset make_test_dataset(uint32_t width, uint32_t height, size_t frames, bool masks, uint32_t seed) {
@@ -287,12 +338,14 @@ bool GradientReport::ok() const {
   return !groups.empty();
 }
 
-GradientReport check_gradients(VkContext& ctx, bool masked, TrainOptions::Reduction reduction, int degree) {
+GradientReport check_gradients(VkContext& ctx, bool masked, TrainOptions::Reduction reduction, int degree,
+                               float lambda_dssim) {
   constexpr uint32_t kWidth = 64, kHeight = 48, kCount = 10;
   Dataset ds = make_test_dataset(kWidth, kHeight, 1, masked, 3);
   SplatScene scene = make_test_scene(kCount, degree, 11);
   TrainOptions options = frozen_train_options(degree, masked);
   options.reduction = reduction;
+  options.lambda_dssim = lambda_dssim;
   Trainer trainer(ctx, ds, scene, options);
   const float bg[3] = {0.2f, 0.5f, 0.7f};
   const Camera cam = dataset_camera(ds, ds.frames[0]);
@@ -317,7 +370,9 @@ GradientReport check_gradients(VkContext& ctx, bool masked, TrainOptions::Reduct
   }
 
   std::vector<double> ref_image;
-  report.loss_ref = reference_loss(cam, params, sh, stride, degree, ds.frames[0].rgba, bg, masked, &ref_image);
+  const double lambda = options.lambda_dssim;
+  report.loss_ref =
+      reference_loss(cam, params, sh, stride, degree, ds.frames[0].rgba, bg, masked, lambda, &ref_image);
   const std::vector<uint8_t> gpu_image = trainer.render(cam, bg);
   for (size_t p = 0; p < size_t(kWidth) * kHeight; ++p) {
     for (int c = 0; c < 3; ++c) {
@@ -327,7 +382,7 @@ GradientReport check_gradients(VkContext& ctx, bool masked, TrainOptions::Reduct
   }
 
   trainer.step_on(0, bg);
-  report.loss_gpu = trainer.stats().l1;
+  report.loss_gpu = trainer.stats().loss;
   const Trainer::Gradients g = trainer.first_step_gradients();
 
   struct Group {
@@ -347,9 +402,9 @@ GradientReport check_gradients(VkContext& ctx, bool masked, TrainOptions::Reduct
         double& value = off >= 0 ? params[i * 16 + off] : sh[i * stride + (-1 - off)];
         const double saved = value;
         value = saved + eps;
-        const double up = reference_loss(cam, params, sh, stride, degree, ds.frames[0].rgba, bg, masked);
+        const double up = reference_loss(cam, params, sh, stride, degree, ds.frames[0].rgba, bg, masked, lambda);
         value = saved - eps;
-        const double down = reference_loss(cam, params, sh, stride, degree, ds.frames[0].rgba, bg, masked);
+        const double down = reference_loss(cam, params, sh, stride, degree, ds.frames[0].rgba, bg, masked, lambda);
         value = saved;
         const double fd = (up - down) / (2 * eps);
         if (off >= 12 && off < 15) dc_fd[i * 3 + (off - 12)] = fd;

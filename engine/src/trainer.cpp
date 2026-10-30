@@ -30,6 +30,8 @@
 #include "shaders/train_ranges.h"
 #include "shaders/train_reset_opacity.h"
 #include "shaders/train_pair_sum.h"
+#include "shaders/train_ssim.h"
+#include "shaders/train_ssim_grad.h"
 #include "shaders/train_step.h"
 #include "shaders/train_step_sh.h"
 
@@ -50,6 +52,7 @@ struct Trainer::FrameData {
   float densify0[4];
   float densify1[4];
   uint32_t limits[4];
+  float loss[4];
 };
 
 namespace {
@@ -59,6 +62,7 @@ constexpr float kBeta2 = 0.999f;
 constexpr float kEpsilon = 1e-15f;
 constexpr uint32_t kFlagMaskedTarget = 1;
 constexpr uint32_t kFlagBucketState = 2;
+constexpr uint32_t kFlagSsim = 4;
 constexpr uint32_t kBucketLanes = 32;   // splats per bucket (train_backward_bucket.comp)
 constexpr uint32_t kBucketGroups = 8;   // buckets per workgroup
 constexpr uint32_t kScanBlock = 1024;
@@ -143,7 +147,9 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
   emit_ = make("train_emit", shaders::train_emit, 9, 0);
   dispatch_args_ = make("train_dispatch_args", shaders::train_dispatch_args, 2, sizeof(uint32_t));
   ranges_ = make("train_ranges", shaders::train_ranges, 3, sizeof(uint32_t));
-  forward_ = make("train_forward", shaders::train_forward, 14, 0);
+  forward_ = make("train_forward", shaders::train_forward, 15, 0);
+  ssim_ = make("train_ssim", shaders::train_ssim, 4, 0);
+  ssim_grad_ = make("train_ssim_grad", shaders::train_ssim_grad, 5, 0);
   pair_sum_ = make("train_pair_sum", shaders::train_pair_sum, 6, 0);
   step_ = make("train_step", shaders::train_step, 11, 0);
   step_sh_ = make("train_step_sh", shaders::train_step_sh, 7, 0);
@@ -284,6 +290,8 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
   tile_loss_ = ctx.create_buffer(tiles * 16, MemoryKind::Device);
   tile_count_ = ctx.create_buffer(tiles * 4, MemoryKind::Device);
   pixel_dot_ = ctx.create_buffer(pixels * 4, MemoryKind::Device);
+  ssim_input_ = ctx.create_buffer(pixels * 32, MemoryKind::Device);
+  ssim_maps_ = ctx.create_buffer(pixels * 48, MemoryKind::Device);
   readback_image_ = ctx.create_buffer(pixels * 4, MemoryKind::Readback);
 
   // Initial parameters; unused slots stay zero (free).
@@ -330,7 +338,7 @@ uint32_t Trainer::sh_degree_at(uint32_t step) const {
 }
 
 void Trainer::write_frame(uint32_t slot, const Camera& camera, const float background[3], bool masked_target,
-                          uint32_t step, bool bucket_state) {
+                          uint32_t step, bool bucket_state, bool ssim) {
   FrameData f{};
   for (int r = 0; r < 3; ++r) {
     for (int c = 0; c < 3; ++c) f.rot[r][c] = camera.rotation[r * 3 + c];
@@ -348,7 +356,8 @@ void Trainer::write_frame(uint32_t slot, const Camera& camera, const float backg
   f.model[0] = slots_;
   f.model[1] = sh_degree_at(step);
   f.model[2] = sh_stride_;
-  f.model[3] = (masked_target ? kFlagMaskedTarget : 0) | (bucket_state ? kFlagBucketState : 0);
+  f.model[3] = (masked_target ? kFlagMaskedTarget : 0) | (bucket_state ? kFlagBucketState : 0) |
+               (ssim ? kFlagSsim : 0);
   for (int c = 0; c < 3; ++c) f.background[c] = background[c];
   f.background[3] = 1.0f / (3.0f * float(width_) * float(height_));
 
@@ -380,6 +389,9 @@ void Trainer::write_frame(uint32_t slot, const Camera& camera, const float backg
   std::memcpy(&f.densify1[1], &seed, 4);
   f.densify1[2] = 1.6f;
   f.limits[0] = uint32_t(pair_capacity_);
+  f.loss[0] = options_.lambda_dssim;
+  f.loss[1] = 0.01f * 0.01f;  // SSIM constants for colours in [0, 1]
+  f.loss[2] = 0.03f * 0.03f;
   std::memcpy(frames_[slot].mapped(), &f, sizeof(f));
 }
 
@@ -509,9 +521,22 @@ void Trainer::record_rasterize(VkCommandBuffer cmd, uint32_t slot) {
   VkContext::barrier(cmd);
   kernel(cmd, forward_,
          {&frames_[slot], &projected_, &ranges_buf_, &values_, &pair_gaussian_, &targets_[slot], &pixel_grad_,
-          &pixel_count_, &image_, &tile_loss_, &tile_count_, &bucket_state_, &bucket_list_, &pixel_dot_},
+          &pixel_count_, &image_, &tile_loss_, &tile_count_, &bucket_state_, &bucket_list_, &pixel_dot_,
+          &ssim_input_},
          tiles_x_, tiles_y_);
   VkContext::barrier(cmd);
+}
+
+void Trainer::record_loss(VkCommandBuffer cmd, uint32_t slot, bool ssim, bool grad) {
+  if (ssim) {
+    kernel(cmd, ssim_, {&frames_[slot], &ssim_input_, &ssim_maps_, &tile_loss_}, tiles_x_, tiles_y_);
+    VkContext::barrier(cmd);
+    if (grad) {
+      kernel(cmd, ssim_grad_, {&frames_[slot], &ssim_input_, &ssim_maps_, &pixel_grad_, &pixel_dot_}, tiles_x_,
+             tiles_y_);
+      VkContext::barrier(cmd);
+    }
+  }
   const VkBufferCopy loss{0, 0, tile_loss_.size()};
   vkCmdCopyBuffer(cmd, tile_loss_.handle(), readback_losses_[slot].handle(), 1, &loss);
   const VkBufferCopy pairs{0, 0, 4}, mismatch{0, 4, 4};
@@ -563,19 +588,33 @@ bool Trainer::read_slot(uint32_t slot) {
     abs_sum += v[t * 4];
     sq_sum += v[t * 4 + 1];
   }
+  double ssim_sum = 0.0;
+  for (uint32_t t = 0; t < tiles_x_ * tiles_y_; ++t) ssim_sum += v[t * 4 + 2];
   last_losses_[0] = abs_sum;
   last_losses_[1] = sq_sum;
+  last_losses_[2] = ssim_sum;
   return small[0] > pair_capacity_;
 }
 
+void Trainer::set_view_stats() {
+  const double n = 3.0 * width_ * height_;
+  stats_.l1 = last_losses_[0] / n;
+  stats_.psnr = -10.0 * std::log10(std::max(last_losses_[1] / n, 1e-12));
+  const double lambda = options_.lambda_dssim;
+  stats_.ssim = lambda > 0.0 ? last_losses_[2] / n : 0.0;
+  stats_.loss = (1.0 - lambda) * stats_.l1 + lambda * (1.0 - stats_.ssim);
+}
+
 void Trainer::run_view(const Camera& camera, const uint8_t* target, const float background[3], bool masked_target,
-                       bool train, bool profile, bool retune) {
+                       bool train, bool profile, bool retune, bool ssim) {
   stats_.sh_degree = int(sh_degree_at(stats_.step));
+  const bool ssim_grad = train && options_.lambda_dssim > 0.0f;
+  ssim = ssim || ssim_grad;
   if (target != nullptr) std::memcpy(targets_[0].mapped(), target, size_t(width_) * height_ * 4);
   for (;;) {
     // Before the first count, guess: a few tiles per gaussian.
     reserve_pairs(max_pairs_seen_ > 0 ? max_pairs_seen_ : uint64_t(slots_) * 4);
-    write_frame(0, camera, background, masked_target, stats_.step, needs_bucket_state(train, retune));
+    write_frame(0, camera, background, masked_target, stats_.step, needs_bucket_state(train, retune), ssim);
 
     if (!profile && !retune) {
       // Everything in one submission; the passes read the pair count on the GPU.
@@ -583,6 +622,7 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
         record_project(cmd, 0);
         record_sort(cmd, 0);
         record_rasterize(cmd, 0);
+        record_loss(cmd, 0, ssim, ssim_grad);
         if (train) {
           record_backward(cmd, 0, backwards_[backward_to_run()]);
           record_optimize(cmd, 0);
@@ -617,10 +657,11 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
     profile_ = PassTimes{};
     profile_.project = project_time.best_ms();
     profile_.sort = ctx_.run([&](VkCommandBuffer cmd) { record_sort(cmd, 0); }).best_ms();
-    profile_.rasterize = ctx_.run([&](VkCommandBuffer cmd) {
-                           record_rasterize(cmd, 0);
-                           VkContext::barrier_to_host(cmd);
-                         }).best_ms();
+    profile_.rasterize = ctx_.run([&](VkCommandBuffer cmd) { record_rasterize(cmd, 0); }).best_ms();
+    profile_.ssim = ctx_.run([&](VkCommandBuffer cmd) {
+                      record_loss(cmd, 0, ssim, ssim_grad);
+                      VkContext::barrier_to_host(cmd);
+                    }).best_ms();
     auto optimize = [&] {
       for (int part = 1; part <= 3; ++part) {
         const double ms = ctx_.run([&](VkCommandBuffer cmd) { record_optimize(cmd, 0, part); }).best_ms();
@@ -705,9 +746,7 @@ void Trainer::step_on(size_t frame_index, const float background[3], bool profil
   run_view(dataset_camera(dataset_, frame), frame.rgba.data(), background, options_.masked, true, profile,
            retune_due(stats_.step + 1));
   last_slot_ = 0;
-  const double n = 3.0 * width_ * height_;
-  stats_.l1 = last_losses_[0] / n;
-  stats_.psnr = -10.0 * std::log10(std::max(last_losses_[1] / n, 1e-12));
+  set_view_stats();
   ++stats_.step;
   after_step();
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -749,12 +788,13 @@ void Trainer::run_batch(uint32_t count) {
   reserve_pairs(max_pairs_seen_);
   const size_t backward = backward_to_run();
   const bool buckets = needs_bucket_state(true, false);
+  const bool ssim = options_.lambda_dssim > 0.0f;
   for (uint32_t s = 0; s < count; ++s) {
     size_t frame = 0;
     float bg[3];
     next_view(frame, bg);
     const DatasetFrame& f = dataset_.frames.at(frame);
-    write_frame(s, dataset_camera(dataset_, f), bg, options_.masked, stats_.step + s, buckets);
+    write_frame(s, dataset_camera(dataset_, f), bg, options_.masked, stats_.step + s, buckets, ssim);
     std::memcpy(targets_[s].mapped(), f.rgba.data(), size_t(width_) * height_ * 4);
   }
   const RunTiming time = ctx_.run([&](VkCommandBuffer cmd) {
@@ -762,17 +802,16 @@ void Trainer::run_batch(uint32_t count) {
       record_project(cmd, s);
       record_sort(cmd, s);
       record_rasterize(cmd, s);
+      record_loss(cmd, s, ssim, ssim);
       record_backward(cmd, s, backwards_[backward]);
       record_optimize(cmd, s);
     }
     VkContext::barrier_to_host(cmd);
   });
-  const double n = 3.0 * width_ * height_;
   for (uint32_t s = 0; s < count; ++s) {
     // A step whose pairs did not fit left the model alone; later ones went on.
     if (read_slot(s)) ++stats_.overflow_steps;
-    stats_.l1 = last_losses_[0] / n;
-    stats_.psnr = -10.0 * std::log10(std::max(last_losses_[1] / n, 1e-12));
+    set_view_stats();
     stats_.sh_degree = int(sh_degree_at(stats_.step));
     ++stats_.step;
   }
@@ -854,18 +893,20 @@ std::vector<uint8_t> Trainer::render(const Camera& camera, const float backgroun
 EvalResult Trainer::evaluate() {
   EvalResult result;
   const float black[3] = {0.0f, 0.0f, 0.0f};
-  double psnr_sum = 0.0, l1_sum = 0.0;
+  double psnr_sum = 0.0, l1_sum = 0.0, ssim_sum = 0.0;
   const double n = 3.0 * width_ * height_;
   for (const DatasetFrame& frame : dataset_.frames) {
     if (!frame.holdout) continue;
-    run_view(dataset_camera(dataset_, frame), frame.rgba.data(), black, options_.masked, false);
+    run_view(dataset_camera(dataset_, frame), frame.rgba.data(), black, options_.masked, false, false, false, true);
     const double abs_sum = last_losses_[0], sq_sum = last_losses_[1];
     psnr_sum += -10.0 * std::log10(std::max(sq_sum / n, 1e-12));
     l1_sum += abs_sum / n;
+    ssim_sum += last_losses_[2] / n;
     ++result.views;
   }
   if (result.views > 0) {
     result.psnr = psnr_sum / result.views;
+    result.ssim = ssim_sum / result.views;
     result.l1 = l1_sum / result.views;
   }
   return result;

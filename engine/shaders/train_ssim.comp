@@ -1,0 +1,104 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Training pass 4b, one 16x16 tile per workgroup: SSIM between render x and
+// target y (per channel, 11x11 Gaussian window, zero padding) and the parts
+// of its gradient that train_ssim_grad blurs back. With mu, E the window
+// means of x, y, x^2, y^2, xy:
+//   SSIM = (2 mu_x mu_y + C1)(2 s_xy + C2) / ((mu_x^2 + mu_y^2 + C1)(s_x^2 + s_y^2 + C2)),
+//   s_x^2 = E_xx - mu_x^2, s_xy = E_xy - mu_x mu_y.
+// The sum of SSIM over the image changes with pixel x_q by
+//   sum_p G(p - q) (A(p) + 2 x_q B(p) + y_q C(p)),
+// A = dSSIM/dmu_x (through the variances too), B = dSSIM/dE_xx, C = dSSIM/dE_xy.
+// Writes A, B, C per pixel and channel, and the tile's SSIM sum (tile_loss.z).
+layout(local_size_x = 16, local_size_y = 16) in;
+
+#include "train_common.glsl"
+
+layout(std430, binding = 0) readonly buffer FrameBuf { FrameData frame; };
+layout(std430, binding = 1) readonly buffer SsimInput { vec4 ssim_input[]; };  // render, target
+layout(std430, binding = 2) writeonly buffer SsimMaps { vec4 ssim_maps[]; };  // A, B, C (rgb)
+layout(std430, binding = 3) buffer TileLoss { vec4 tile_loss[]; };
+
+const uint W = kTile + 2u * uint(kSsimRadius);  // tile plus halo
+shared float s_x[W * W];
+shared float s_y[W * W];
+shared float s_h[5u * W * kTile];  // x, y, xx, yy, xy blurred along rows
+shared float s_sum[kTile * kTile];
+
+void main() {
+  uint lid = gl_LocalInvocationIndex;
+  uvec2 tile = gl_WorkGroupID.xy;
+  ivec2 origin = ivec2(tile * kTile) - kSsimRadius;
+  uvec2 pix = tile * kTile + gl_LocalInvocationID.xy;
+  bool inside = pix.x < frame.image.x && pix.y < frame.image.y;
+  uint pix_id = pix.y * frame.image.x + pix.x;
+  float c1 = frame.loss.y, c2 = frame.loss.z;
+  vec3 a = vec3(0.0), b = vec3(0.0), cc = vec3(0.0);
+  float ssim_sum = 0.0;
+
+  for (uint c = 0u; c < 3u; ++c) {
+    for (uint e = lid; e < W * W; e += kTile * kTile) {
+      ivec2 p = origin + ivec2(e % W, e / W);
+      bool in_image = p.x >= 0 && p.y >= 0 && p.x < int(frame.image.x) && p.y < int(frame.image.y);
+      uint id = uint(p.y) * frame.image.x + uint(p.x);
+      s_x[e] = in_image ? ssim_input[id * 2u][c] : 0.0;
+      s_y[e] = in_image ? ssim_input[id * 2u + 1u][c] : 0.0;
+    }
+    barrier();
+    for (uint e = lid; e < W * kTile; e += kTile * kTile) {
+      uint row = e / kTile, col = e % kTile;
+      float m0 = 0.0, m1 = 0.0, m2 = 0.0, m3 = 0.0, m4 = 0.0;
+      for (int k = 0; k <= 2 * kSsimRadius; ++k) {
+        float w = kSsimWindow[k];
+        float x = s_x[row * W + col + uint(k)], y = s_y[row * W + col + uint(k)];
+        m0 += w * x;
+        m1 += w * y;
+        m2 += w * x * x;
+        m3 += w * y * y;
+        m4 += w * x * y;
+      }
+      s_h[e] = m0;
+      s_h[W * kTile + e] = m1;
+      s_h[2u * W * kTile + e] = m2;
+      s_h[3u * W * kTile + e] = m3;
+      s_h[4u * W * kTile + e] = m4;
+    }
+    barrier();
+    float mx = 0.0, my = 0.0, exx = 0.0, eyy = 0.0, exy = 0.0;
+    uint col = gl_LocalInvocationID.x;
+    for (int k = 0; k <= 2 * kSsimRadius; ++k) {
+      float w = kSsimWindow[k];
+      uint e = (gl_LocalInvocationID.y + uint(k)) * kTile + col;
+      mx += w * s_h[e];
+      my += w * s_h[W * kTile + e];
+      exx += w * s_h[2u * W * kTile + e];
+      eyy += w * s_h[3u * W * kTile + e];
+      exy += w * s_h[4u * W * kTile + e];
+    }
+    float vx = exx - mx * mx, vy = eyy - my * my, cxy = exy - mx * my;
+    float l = 2.0 * mx * my + c1, cs = 2.0 * cxy + c2;
+    float m = mx * mx + my * my + c1, v = vx + vy + c2;
+    float inv = 1.0 / (m * v);
+    float ssim = l * cs * inv;
+    float d_cxy = 2.0 * l * inv;  // = dSSIM/dE_xy
+    float d_vx = -ssim / v;       // = dSSIM/dE_xx
+    a[c] = 2.0 * my * cs * inv - ssim * 2.0 * mx / m - 2.0 * mx * d_vx - my * d_cxy;
+    b[c] = d_vx;
+    cc[c] = d_cxy;
+    if (inside) ssim_sum += ssim;
+    barrier();  // before the next channel overwrites the shared arrays
+  }
+
+  if (inside) {
+    ssim_maps[pix_id * 3u] = vec4(a, 0.0);
+    ssim_maps[pix_id * 3u + 1u] = vec4(b, 0.0);
+    ssim_maps[pix_id * 3u + 2u] = vec4(cc, 0.0);
+  }
+  s_sum[lid] = ssim_sum;
+  barrier();
+  for (uint stride = kTile * kTile / 2u; stride > 0u; stride >>= 1u) {
+    if (lid < stride) s_sum[lid] += s_sum[lid + stride];
+    barrier();
+  }
+  if (lid == 0u) tile_loss[tile.y * frame.image.z + tile.x].z = s_sum[0];
+}

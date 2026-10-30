@@ -28,10 +28,17 @@ struct FrameData {
   vec4 densify0;    // grad threshold, clone max scale, prune min opacity, prune max world scale
   vec4 densify1;    // prune max screen radius, random seed (uint bits), split scale divisor, unused
   uvec4 limits;     // pair capacity (more pairs: the step is skipped), unused
+  vec4 loss;        // D-SSIM weight lambda (loss = (1 - lambda) L1 + lambda (1 - SSIM)), C1, C2, unused
 };
 
 const uint kFlagMaskedTarget = 1u;  // composite the target over the background using its alpha
 const uint kFlagBucketState = 2u;   // the forward pass saves state for train_backward_bucket
+const uint kFlagSsim = 4u;          // the forward pass saves render and target colours for train_ssim
+
+// SSIM window: 11x11 Gaussian, sigma 1.5, separable (as in 3D Gaussian Splatting).
+const int kSsimRadius = 5;
+const float kSsimWindow[11] = float[11](0.001028380, 0.007598758, 0.036000772, 0.109360690, 0.213005538, 0.266011725,
+                                        0.213005538, 0.109360690, 0.036000772, 0.007598758, 0.001028380);
 
 const uint kTile = 16u;
 const float kNear = 0.02;

@@ -25,10 +25,14 @@ SplatScene make_test_scene(uint32_t n, int sh_degree, uint32_t seed);
 TrainOptions frozen_train_options(int sh_degree, bool masked);
 
 // CPU render of the training rasteriser (train_project + train_forward) and its
-// L1 loss against `target`. Parameters use the trainer's 16-float slot layout.
+// loss against `target`, (1 - lambda) L1 + lambda (1 - SSIM) as in train_ssim.
+// Parameters use the trainer's 16-float slot layout.
 double reference_loss(const Camera& camera, const std::vector<double>& params, const std::vector<double>& sh,
                       int sh_stride, int sh_degree, const std::vector<uint8_t>& target, const float background[3],
-                      bool masked, std::vector<double>* image = nullptr);
+                      bool masked, double lambda_dssim, std::vector<double>* image = nullptr);
+// Mean SSIM of two images (3 channels per pixel, row-major), 11x11 Gaussian
+// window with sigma 1.5 and zero padding, per channel.
+double reference_ssim(const std::vector<double>& x, const std::vector<double>& y, uint32_t width, uint32_t height);
 
 struct GradientGroup {
   std::string name;
@@ -63,7 +67,8 @@ struct GradientReport {
 
 // One step on a random 10-gaussian scene (64x48); every parameter's GPU
 // gradient against central differences of the reference.
-GradientReport check_gradients(VkContext& ctx, bool masked, TrainOptions::Reduction reduction, int sh_degree = 2);
+GradientReport check_gradients(VkContext& ctx, bool masked, TrainOptions::Reduction reduction, int sh_degree = 2,
+                               float lambda_dssim = TrainOptions{}.lambda_dssim);
 
 struct FitReport {
   std::string reduction;

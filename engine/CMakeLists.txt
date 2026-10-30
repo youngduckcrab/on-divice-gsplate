@@ -82,6 +82,8 @@ set(GS_SHADERS
   train_step.comp
   train_pair_sum.comp
   train_dispatch_args.comp
+  train_ssim.comp
+  train_ssim_grad.comp
   scan_blocks.comp
   train_step_sh.comp
   train_densify_mark.comp

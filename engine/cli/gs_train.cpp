@@ -6,7 +6,7 @@
 //            [--sh 3] [--init-gaussians 150000] [--opacity-reset N (0 = off)] [--grad-threshold 2e-4]
 //            [--reduction bucket|bucket2|subgroup|subgroup_scalar|subgroup_lane4|subgroup_lane1|serial_cut2|serial_cut|serial|shared]
 //            [--alternatives serial_cut2,subgroup_lane4,...] (timed on real steps; the fastest is kept)
-//            [--no-masks] [--preview <dir>] [--eval-every 1000]
+//            [--no-masks] [--preview <dir>] [--eval-every 1000] [--dssim 0.2 (0 = L1 only)]
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -81,6 +81,8 @@ int main(int argc, char** argv) {
         }
       } else if (arg == "--grad-threshold") {
         grad_threshold = std::atof(next());
+      } else if (arg == "--dssim") {
+        options.lambda_dssim = float(std::atof(next()));
       } else if (arg == "--no-masks") {
         options.masked = false;
       } else if (arg == "--preview") {
@@ -135,10 +137,10 @@ int main(int argc, char** argv) {
       const gs::TrainStats& s = trainer.stats();
       if (s.step % 100 == 51 && trainer.last_profile().valid) {
         const gs::PassTimes& p = trainer.last_profile();
-        std::printf("  gpu ms: project %.1f  sort %.1f  forward %.1f  backward %.1f  optimize %.1f (sum %.1f, "
+        std::printf("  gpu ms: project %.1f  sort %.1f  forward %.1f  ssim %.1f  backward %.1f  optimize %.1f (sum %.1f, "
                     "geometry %.1f, sh %.1f)\n",
-                    p.project, p.sort, p.rasterize, p.backward, p.optimize, p.optimize_sum, p.optimize_geometry,
-                    p.optimize_sh);
+                    p.project, p.sort, p.rasterize, p.ssim, p.backward, p.optimize, p.optimize_sum,
+                    p.optimize_geometry, p.optimize_sh);
       }
       if (s.step % 100 == 0 || trainer.finished()) {
         std::printf("step %5u  l1 %.4f  psnr %5.2f  gaussians %7u (+%u -%u)  pairs %8llu  sh %d  %.1f ms/step\n",
@@ -148,7 +150,7 @@ int main(int argc, char** argv) {
       }
       if (eval_every > 0 && (s.step % eval_every == 0 || trainer.finished())) {
         const gs::EvalResult e = trainer.evaluate();
-        std::printf("  eval: held-out PSNR %.2f dB over %u views\n", e.psnr, e.views);
+        std::printf("  eval: held-out PSNR %.2f dB, SSIM %.4f over %u views\n", e.psnr, e.ssim, e.views);
         if (!preview.empty()) {
           for (size_t f = 0; f < ds.frames.size(); f += ds.frames.size() / 4) {
             const float black[3] = {0, 0, 0};

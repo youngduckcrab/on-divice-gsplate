@@ -49,6 +49,8 @@ struct TrainOptions {
   float lr_opacity = 2.5e-2f;
   float lr_sh_dc = 2.5e-3f;
   float lr_sh_rest = 2.5e-3f / 20.0f;
+  // Loss: (1 - lambda) L1 + lambda (1 - SSIM), as in 3D Gaussian Splatting (0: L1 only).
+  float lambda_dssim = 0.2f;
 
   // Adaptive density control.
   uint32_t densify_from = 300;
@@ -83,7 +85,8 @@ TrainOptions scaled_options(uint32_t iterations);
 struct PassTimes {
   double project = 0.0;    // projection + pair count
   double sort = 0.0;       // pair emission, radix sort, tile ranges
-  double rasterize = 0.0;  // forward + loss
+  double rasterize = 0.0;  // forward + L1 loss
+  double ssim = 0.0;       // SSIM and its gradient
   double backward = 0.0;   // per-pair gradients
   double optimize = 0.0;   // the three below
   double optimize_sum = 0.0;       // per-gaussian sum of its pairs' gradients
@@ -99,6 +102,8 @@ struct TrainStats {
   uint64_t pairs = 0;      // (tile, gaussian) pairs of the last step
   double l1 = 0.0;         // mean absolute error of the last step's view
   double psnr = 0.0;       // of the last step's view
+  double ssim = 0.0;       // of the last step's view (0 when not computed: lambda_dssim 0)
+  double loss = 0.0;       // the training loss of the last step's view
   double step_ms = 0.0;    // exponential moving average of the wall-clock step time
   int sh_degree = 0;       // active
   uint32_t densify_events = 0;
@@ -128,6 +133,7 @@ struct RetuneResult {
 
 struct EvalResult {
   double psnr = 0.0;  // mean over the held-out views
+  double ssim = 0.0;
   double l1 = 0.0;
   uint32_t views = 0;
 };
@@ -213,12 +219,13 @@ class Trainer {
   // Per-step inputs live in slot `slot` of frames_/targets_; `step` (0-based)
   // sets the learning-rate schedule, SH degree and seed.
   void write_frame(uint32_t slot, const Camera& camera, const float background[3], bool masked_target,
-                   uint32_t step, bool bucket_state);
+                   uint32_t step, bool bucket_state, bool ssim);
   uint32_t sh_degree_at(uint32_t step) const;
   // Renders `camera` into image_/tile losses; with `train`, also the backward pass and Adam step.
   // With `retune`, every backward variant is timed on this step (implies profiling).
+  // With `ssim`, also measures SSIM (training does whenever lambda_dssim > 0).
   void run_view(const Camera& camera, const uint8_t* target, const float background[3], bool masked_target,
-                bool train, bool profile = false, bool retune = false);
+                bool train, bool profile = false, bool retune = false, bool ssim = false);
   void run_batch(uint32_t count);
   void next_view(size_t& frame, float background[3]);
   bool housekeeping_after(uint32_t step) const;  // densification or opacity reset after this step
@@ -230,7 +237,9 @@ class Trainer {
   // The passes of one view, reading slot `slot`.
   void record_project(VkCommandBuffer cmd, uint32_t slot);
   void record_sort(VkCommandBuffer cmd, uint32_t slot);
-  void record_rasterize(VkCommandBuffer cmd, uint32_t slot);  // + copies of losses and counts to the slot
+  void record_rasterize(VkCommandBuffer cmd, uint32_t slot);
+  // SSIM (`ssim`) and its gradient (`grad`), then copies of losses and counts to the slot.
+  void record_loss(VkCommandBuffer cmd, uint32_t slot, bool ssim, bool grad);
   void record_backward(VkCommandBuffer cmd, uint32_t slot, const Backward& b);
   // The three optimizer kernels; `part` 0 records all, 1..3 one of them (profiling).
   void record_optimize(VkCommandBuffer cmd, uint32_t slot, int part = 0);
@@ -259,7 +268,8 @@ class Trainer {
   size_t active_ = 0;
   std::vector<RetuneResult> retunes_;
   bool bucket_fits_ = true;  // bucket_state_ could be sized for the pair capacity
-  double last_losses_[2] = {0.0, 0.0};  // sum |e|, sum e^2 of the last slot read
+  double last_losses_[3] = {0.0, 0.0, 0.0};  // sum |e|, sum e^2, sum SSIM of the last slot read
+  void set_view_stats();                       // l1, psnr, ssim, loss from last_losses_
   uint64_t max_pairs_seen_ = 0;
   uint32_t last_slot_ = 0;  // slot of the last step, whose frame data densify() reuses
   VkDescriptorPool set_pool_ = VK_NULL_HANDLE;
@@ -277,8 +287,8 @@ class Trainer {
   std::vector<size_t> order_;
   size_t order_pos_ = 0;
 
-  ComputePipeline project_, scan_local_, scan_blocks_, scan_add_, emit_, dispatch_args_, ranges_, forward_, pair_sum_,
-      step_, step_sh_;
+  ComputePipeline project_, scan_local_, scan_blocks_, scan_add_, emit_, dispatch_args_, ranges_, forward_, ssim_,
+      ssim_grad_, pair_sum_, step_, step_sh_;
   ComputePipeline densify_mark_, densify_spawn_, reset_opacity_;
   std::unique_ptr<RadixSort> sort_;
 
@@ -290,6 +300,7 @@ class Trainer {
   Buffer pixel_grad_, pixel_count_, image_, ranges_buf_, tile_loss_, tile_count_;
   Buffer bucket_state_, bucket_list_, pixel_dot_;
   Buffer grad_sum_, sh_input_;
+  Buffer ssim_input_, ssim_maps_;  // per pixel: render and target colour; SSIM gradient parts A, B, C
   Buffer dispatch_args_buf_;  // indirect group counts of the passes over pairs (train_dispatch_args)  // per slot: summed pair gradients; colour gradient and view direction
   std::vector<Buffer> readback_smalls_, readback_losses_;  // per batch slot
   Buffer readback_image_;

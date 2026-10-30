@@ -305,6 +305,8 @@ void write_stats(gs::JsonWriter& w, const gs::Trainer& t) {
   w.field("pairs", s.pairs);
   w.field("l1", s.l1);
   w.field("psnr", s.psnr);
+  w.field("ssim", s.ssim);
+  w.field("loss", s.loss);
   w.field("step_ms", s.step_ms);
   w.field("sh_degree", s.sh_degree);
   w.field("densify_events", s.densify_events);
@@ -440,6 +442,7 @@ Java_com_ondevice_gsplat_NativeTrainer_step(JNIEnv* env, jobject /*this*/, jint 
       w.field("project", p.project);
       w.field("sort", p.sort);
       w.field("rasterize", p.rasterize);
+      w.field("ssim", p.ssim);
       w.field("backward", p.backward);
       w.field("optimize", p.optimize);
       w.field("optimize_sum", p.optimize_sum);
@@ -504,6 +507,7 @@ Java_com_ondevice_gsplat_NativeTrainer_evaluate(JNIEnv* env, jobject /*this*/) {
     w.begin_object();
     w.field("ok", true);
     w.field("psnr", e.psnr);
+    w.field("ssim", e.ssim);
     w.field("l1", e.l1);
     w.field("views", e.views);
     w.field("ms", ms_since(t0));

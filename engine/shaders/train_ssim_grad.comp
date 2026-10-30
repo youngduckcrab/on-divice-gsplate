@@ -1,0 +1,66 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Training pass 4c, one 16x16 tile per workgroup: blurs train_ssim's A, B, C
+// with the same window and adds the D-SSIM part of the loss gradient,
+//   dL/dx_q -= lambda / (3 pixels) * ((G*A)(q) + 2 x_q (G*B)(q) + y_q (G*C)(q)),
+// to the L1 part train_forward left in pixel_grad; then refreshes the bucket
+// backward's D = dL/dC . colour.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+#include "train_common.glsl"
+
+layout(std430, binding = 0) readonly buffer FrameBuf { FrameData frame; };
+layout(std430, binding = 1) readonly buffer SsimInput { vec4 ssim_input[]; };  // render, target
+layout(std430, binding = 2) readonly buffer SsimMaps { vec4 ssim_maps[]; };    // A, B, C (rgb)
+layout(std430, binding = 3) buffer PixelGrad { vec4 pixel_grad[]; };          // dL/dC rgb, final T
+layout(std430, binding = 4) writeonly buffer PixelDot { float pixel_dot[]; };
+
+const uint W = kTile + 2u * uint(kSsimRadius);
+shared float s_m[3u * W * W];      // A, B, C of one channel around the tile
+shared float s_h[3u * W * kTile];  // blurred along rows
+
+void main() {
+  uint lid = gl_LocalInvocationIndex;
+  uvec2 tile = gl_WorkGroupID.xy;
+  ivec2 origin = ivec2(tile * kTile) - kSsimRadius;
+  uvec2 pix = tile * kTile + gl_LocalInvocationID.xy;
+  bool inside = pix.x < frame.image.x && pix.y < frame.image.y;
+  uint pix_id = pix.y * frame.image.x + pix.x;
+  vec3 x = inside ? ssim_input[pix_id * 2u].rgb : vec3(0.0);
+  vec3 y = inside ? ssim_input[pix_id * 2u + 1u].rgb : vec3(0.0);
+  vec3 ds = vec3(0.0);
+
+  for (uint c = 0u; c < 3u; ++c) {
+    for (uint e = lid; e < W * W; e += kTile * kTile) {
+      ivec2 p = origin + ivec2(e % W, e / W);
+      bool in_image = p.x >= 0 && p.y >= 0 && p.x < int(frame.image.x) && p.y < int(frame.image.y);
+      uint id = uint(p.y) * frame.image.x + uint(p.x);
+      for (uint q = 0u; q < 3u; ++q) s_m[q * W * W + e] = in_image ? ssim_maps[id * 3u + q][c] : 0.0;
+    }
+    barrier();
+    for (uint e = lid; e < W * kTile; e += kTile * kTile) {
+      uint row = e / kTile, col = e % kTile;
+      for (uint q = 0u; q < 3u; ++q) {
+        float sum = 0.0;
+        for (int k = 0; k <= 2 * kSsimRadius; ++k) sum += kSsimWindow[k] * s_m[q * W * W + row * W + col + uint(k)];
+        s_h[q * W * kTile + e] = sum;
+      }
+    }
+    barrier();
+    float g[3] = float[3](0.0, 0.0, 0.0);
+    for (uint q = 0u; q < 3u; ++q) {
+      for (int k = 0; k <= 2 * kSsimRadius; ++k) {
+        g[q] += kSsimWindow[k] * s_h[q * W * kTile + (gl_LocalInvocationID.y + uint(k)) * kTile + gl_LocalInvocationID.x];
+      }
+    }
+    ds[c] = g[0] + 2.0 * x[c] * g[1] + y[c] * g[2];
+    barrier();
+  }
+
+  if (inside) {
+    vec4 pg = pixel_grad[pix_id];
+    pg.rgb -= (frame.loss.x * frame.background.w) * ds;
+    pixel_grad[pix_id] = pg;
+    pixel_dot[pix_id] = dot(pg.rgb, x);
+  }
+}

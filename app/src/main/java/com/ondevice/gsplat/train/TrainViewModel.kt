@@ -30,9 +30,10 @@ import org.json.JSONObject
 
 /** Training presets; widths are the training resolution (portrait captures). */
 enum class Preset(val label: String, val width: Int, val iterations: Int, val maxGaussians: Int) {
-    FAST("빠름", 360, 2000, 200_000),
-    STANDARD("표준", 360, 4000, 300_000),
-    HIGH("고품질", 540, 7000, 400_000),
+    // The datasets are 720x1280; 540x960 cost little more per step than 360x640 (v0.3.11).
+    FAST("빠름", 540, 2000, 200_000),
+    STANDARD("표준", 540, 4000, 300_000),
+    HIGH("고품질", 720, 7000, 400_000),
 }
 
 enum class Phase { IDLE, IMPORTING, SELF_TEST, PREPARING, TRAINING, FINISHING, DONE, FAILED }
@@ -108,6 +109,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Average ms per step for each block of [SEGMENT] steps, to see throttling. */
     private val segmentMs = mutableListOf<Double>()
+    private val segmentThermal = mutableListOf<String>()
 
     init {
         refreshDatasets()
@@ -173,6 +175,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         evalJson = null
         history.clear()
         segmentMs.clear()
+        segmentThermal.clear()
         previewRender = null
         previewTarget = null
         elapsedSeconds = 0.0
@@ -216,6 +219,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                 segmentSteps += res.optInt("steps")
                 if (segmentSteps >= SEGMENT) {
                     segmentMs.add((now - segmentStart) / 1e6 / segmentSteps)
+                    segmentThermal.add(thermalShort(Thermal.snapshot(getApplication())))
                     segmentStart = now
                     segmentSteps = 0
                 }
@@ -407,6 +411,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                         "(+${s.optInt("spawned")} −${s.optInt("pruned")}) · " +
                         "쌍 ${s.optLong("pairs")} (타일 불일치 ${s.optInt("tile_mismatch")}) · " +
                         "학습 뷰 PSNR ${"%.2f".format(Locale.US, s.optDouble("psnr"))}" +
+                        (if (s.optDouble("ssim") > 0) " · SSIM ${"%.4f".format(Locale.US, s.optDouble("ssim"))}" else "") +
                         if (r?.stopped == true) " · 중간에 중지" else "",
                 )
             }
@@ -420,10 +425,14 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
             if (segmentMs.isNotEmpty()) {
                 appendLine("ms/회 (${SEGMENT}회 단위): " + segmentMs.joinToString(" ") { "%.0f".format(Locale.US, it) })
             }
+            if (segmentThermal.isNotEmpty()) {
+                appendLine("발열 헤드룸 (${SEGMENT}회마다, 1에 가까울수록 스로틀): " + segmentThermal.joinToString(" "))
+            }
             profile?.let { p ->
                 appendLine(
                     "GPU ms/회: 투영 ${f1(p.optDouble("project"))} · 정렬 ${f1(p.optDouble("sort"))} · " +
-                        "렌더 ${f1(p.optDouble("rasterize"))} · 역전파 ${f1(p.optDouble("backward"))} · " +
+                        "렌더 ${f1(p.optDouble("rasterize"))} · SSIM ${f1(p.optDouble("ssim"))} · " +
+                        "역전파 ${f1(p.optDouble("backward"))} · " +
                         "최적화 ${f1(p.optDouble("optimize"))} (쌍 합 ${f1(p.optDouble("optimize_sum"))} · " +
                         "기하 ${f1(p.optDouble("optimize_geometry"))} · SH ${f1(p.optDouble("optimize_sh"))})",
                 )
@@ -431,7 +440,8 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
             evalJson?.let { e ->
                 if (e.optBoolean("ok")) {
                     appendLine(
-                        "결과: 검증 PSNR ${"%.2f".format(Locale.US, e.optDouble("psnr"))} dB (${e.optInt("views")}장) · " +
+                        "결과: 검증 PSNR ${"%.2f".format(Locale.US, e.optDouble("psnr"))} dB · " +
+                            "SSIM ${"%.4f".format(Locale.US, e.optDouble("ssim"))} (${e.optInt("views")}장) · " +
                             "평가 ${sec(e.optDouble("ms"))}",
                     )
                 } else {
@@ -504,6 +514,13 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         val headroom = if (t.has("headroom")) " (헤드룸 ${"%.2f".format(Locale.US, t.optDouble("headroom"))})" else ""
         val battery = if (t.has("battery_temp_c")) " · 배터리 ${t.optDouble("battery_temp_c")}°C" else ""
         return "${t.optString("status")}$headroom$battery"
+    }
+
+    // Headroom with the status when it is not NONE, e.g. "0.61" or "0.95(MODERATE)".
+    private fun thermalShort(t: JSONObject): String {
+        val headroom = if (t.has("headroom")) "%.2f".format(Locale.US, t.optDouble("headroom")) else "-"
+        val status = t.optString("status")
+        return if (status.isEmpty() || status == "NONE") headroom else "$headroom($status)"
     }
 
     private fun ox(b: Boolean) = if (b) "O" else "X"

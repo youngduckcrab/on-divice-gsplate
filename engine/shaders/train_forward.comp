@@ -24,6 +24,8 @@ layout(std430, binding = 10) writeonly buffer TileCount { uint tile_count[]; };
 layout(std430, binding = 11) writeonly buffer BucketState { vec4 bucket_state[]; };
 layout(std430, binding = 12) buffer BucketList { uint bucket_list[]; };  // count, then tile << 16 | bucket
 layout(std430, binding = 13) writeonly buffer PixelDot { float pixel_dot[]; };
+// kFlagSsim: render and target colour per pixel (2 per pixel) for train_ssim.
+layout(std430, binding = 14) writeonly buffer SsimInput { vec4 ssim_input[]; };
 
 const uint BATCH = 256u;
 shared vec4 s_g0[BATCH];  // centre xy, opacity, unused
@@ -100,7 +102,12 @@ void main() {
     vec4 t = unpackUnorm4x8(target[pix_id]);
     vec3 target_color = (frame.model.w & kFlagMaskedTarget) != 0u ? mix(bg, t.rgb, t.a) : t.rgb;
     vec3 e = out_color - target_color;
-    vec3 dL_dC = sign(e) * frame.background.w;
+    // The L1 part; train_ssim_grad adds the D-SSIM part.
+    vec3 dL_dC = sign(e) * ((1.0 - frame.loss.x) * frame.background.w);
+    if ((frame.model.w & kFlagSsim) != 0u) {
+      ssim_input[pix_id * 2u] = vec4(out_color, 0.0);
+      ssim_input[pix_id * 2u + 1u] = vec4(target_color, 0.0);
+    }
     pixel_grad[pix_id] = vec4(dL_dC, T);
     if (buckets) pixel_dot[pix_id] = dot(dL_dC, out_color);
     pixel_count[pix_id] = last;
