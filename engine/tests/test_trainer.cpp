@@ -84,6 +84,101 @@ void test_cutoff_matches_serial(gs::VkContext& ctx) {
   EXPECT(max_diff <= 1e-5 * max_abs, "serial_cut(2) gradients differ from serial by %.3g", max_diff);
 }
 
+void test_footprint(gs::VkContext& ctx) {
+  // Each gaussian gets a pair in every tile holding a pixel it reaches
+  // (alpha >= 1/255), once, and in few others; half of them stretched.
+  gs::Dataset ds = gs::make_test_dataset(kWidth, kHeight, 1, false, 11);
+  gs::SplatScene scene = gs::make_test_scene(200, 1, 13);
+  for (uint32_t i = 0; i < scene.count; i += 2) scene.log_scales[i * 3] += 1.5f;
+  gs::Trainer trainer(ctx, ds, scene, gs::frozen_train_options(1, false));
+  const float bg[3] = {0, 0, 0};
+  trainer.step_on(0, bg);
+  trainer.step_on(0, bg);  // the mismatch counter is read back one step late
+  const gs::Trainer::DebugSnapshot snap = trainer.debug_snapshot();
+  constexpr uint32_t T = gs::Trainer::kTileSize;
+  const int tiles_x = int((kWidth + T - 1) / T), tiles_y = int((kHeight + T - 1) / T);
+  uint64_t needed = 0, emitted = 0, boxed = 0;
+  int missing = 0, duplicate = 0;
+  for (size_t i = 0; i < snap.tiles.size(); ++i) {
+    if (snap.tiles[i] == 0) continue;
+    const float* q = &snap.projected[i * 16];
+    const double t = 2.0 * std::log(255.0 * q[3]);
+    std::vector<int> want(size_t(tiles_x) * tiles_y, 0), got(want.size(), 0);
+    for (uint32_t y = 0; y < kHeight; ++y) {
+      for (uint32_t x = 0; x < kWidth; ++x) {
+        const double dx = q[0] - (x + 0.5), dy = q[1] - (y + 0.5);
+        if (q[4] * dx * dx + 2.0 * q[5] * dx * dy + q[6] * dy * dy <= t) want[(y / T) * tiles_x + x / T] = 1;
+      }
+    }
+    for (uint32_t k = snap.offsets[i]; k < snap.offsets[i] + snap.tiles[i]; ++k) {
+      const uint32_t tile = snap.pair_tile.at(k);
+      if (tile < got.size() && got[tile]++ > 0) ++duplicate;
+    }
+    for (size_t k = 0; k < want.size(); ++k) {
+      needed += uint64_t(want[k]);
+      if (want[k] != 0 && got[k] == 0) ++missing;
+    }
+    emitted += snap.tiles[i];
+    // The previous bound: a box around the circle of the largest axis.
+    const double a = q[12], b = q[13], c = q[14], mid = 0.5 * (a + c);
+    const double lambda = mid + std::sqrt(std::max(0.1, mid * mid - (a * c - b * b)));
+    const double r = std::ceil(std::sqrt(t * lambda));
+    const int x0 = std::clamp(int(std::floor((q[0] - r) / T)), 0, tiles_x);
+    const int x1 = std::clamp(int(std::floor((q[0] + r) / T)) + 1, 0, tiles_x);
+    const int y0 = std::clamp(int(std::floor((q[1] - r) / T)), 0, tiles_y);
+    const int y1 = std::clamp(int(std::floor((q[1] + r) / T)) + 1, 0, tiles_y);
+    boxed += uint64_t(std::max(x1 - x0, 0) * std::max(y1 - y0, 0));
+  }
+  std::printf("  footprint: %llu pairs needed, %llu emitted, %llu with the circle box; %d missing, %d duplicate, "
+              "%u mismatched\n",
+              (unsigned long long)needed, (unsigned long long)emitted, (unsigned long long)boxed, missing, duplicate,
+              trainer.stats().tile_mismatch);
+  EXPECT(missing == 0 && duplicate == 0, "footprint: %d tiles missing, %d duplicate", missing, duplicate);
+  EXPECT(emitted <= needed + needed / 20, "footprint: %llu pairs for %llu needed", (unsigned long long)emitted,
+         (unsigned long long)needed);
+  EXPECT(trainer.stats().tile_mismatch == 0, "project and emit disagree on %u gaussians",
+         trainer.stats().tile_mismatch);
+}
+
+void test_retune(gs::VkContext& ctx) {
+  // Timing every variant on a step leaves the same gradients as one variant.
+  using R = gs::TrainOptions::Reduction;
+  gs::Dataset ds = gs::make_test_dataset(kWidth, kHeight, 2, false, 3);
+  gs::SplatScene scene = gs::make_test_scene(120, 1, 9);
+  const float bg[3] = {0.2f, 0.3f, 0.4f};
+  gs::TrainOptions o = gs::frozen_train_options(1, false);
+  o.iterations = 4;
+  o.reduction = R::SerialCut;
+  gs::Trainer single(ctx, ds, scene, o);
+  o.reduction = R::Serial;
+  o.alternatives = {R::SerialCut, R::SerialCut2, R::SubgroupLane4};
+  o.retune_first = 1;
+  o.retune_interval = 3;
+  gs::Trainer tuned(ctx, ds, scene, o);
+  for (int s = 0; s < 4; ++s) {
+    single.step_on(size_t(s % 2), bg);
+    tuned.step_on(size_t(s % 2), bg);
+  }
+  const std::vector<float> a = single.first_step_gradients().params, b = tuned.first_step_gradients().params;
+  double max_diff = 0.0, max_abs = 0.0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    max_diff = std::max(max_diff, double(std::fabs(a[i] - b[i])));
+    max_abs = std::max(max_abs, double(std::fabs(a[i])));
+  }
+  std::printf("  retune: %zu timings, last", tuned.retunes().size());
+  if (!tuned.retunes().empty()) {
+    for (const auto& [name, ms] : tuned.retunes().back().ms) std::printf(" %s %.2f", name.c_str(), ms);
+    std::printf(" -> %s", tuned.retunes().back().chosen.c_str());
+  }
+  std::printf("; max |m| %.3g, max diff %.3g\n", max_abs, max_diff);
+  EXPECT(tuned.retunes().size() == 2 && tuned.retunes()[0].step == 1 && tuned.retunes()[1].step == 3,
+         "retunes at the wrong steps (%zu)", tuned.retunes().size());
+  EXPECT(tuned.retunes().front().ms.size() == 4, "%zu variants timed", tuned.retunes().front().ms.size());
+  EXPECT(tuned.reduction() == tuned.retunes().back().chosen, "using %s, chose %s", tuned.reduction().c_str(),
+         tuned.retunes().back().chosen.c_str());
+  EXPECT(max_diff <= 1e-5 * max_abs, "gradients with retuning differ by %.3g", max_diff);
+}
+
 void test_probes(gs::VkContext& ctx) {
   const gs::ProbeReport p = gs::probe_gpu_ops(ctx);
   EXPECT(p.shared_ok, "shared probe: max %u add %u tree %u", p.atomic_max, p.atomic_add, p.tree_max);
@@ -257,6 +352,8 @@ int main() {
     test_gradients(ctx, false, gs::TrainOptions::Reduction::Serial);
     test_gradients(ctx, true, gs::TrainOptions::Reduction::Serial);
     test_cutoff_matches_serial(ctx);
+    test_footprint(ctx);
+    test_retune(ctx);
     test_probes(ctx);
     test_scan_and_densify(ctx);
     test_training_converges(ctx);

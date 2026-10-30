@@ -10,7 +10,7 @@
 //   [0] screen centre (px), camera depth, opacity
 //   [1] conic (inverse 2D covariance a, b, c), 3-sigma radius (px)
 //   [2] colour rgb, clamped-channel bits (as float bits)
-//   [3] tile rect min x, min y, max x, max y (exclusive), as uint bits
+//   [3] footprint: 2D covariance a, b, c (dilated) and threshold (see footprint_threshold)
 
 struct FrameData {
   vec4 rot0;        // world -> camera rotation row 0 (OpenCV axes), w = translation x
@@ -128,6 +128,58 @@ vec3 normal3(inout uint state) {
   float u3 = max(uniform01(state), 1e-7), u4 = uniform01(state);
   float r1 = sqrt(-2.0 * log(u1)), r2 = sqrt(-2.0 * log(u3));
   return vec3(r1 * cos(6.283185307 * u2), r1 * sin(6.283185307 * u2), r2 * cos(6.283185307 * u4));
+}
+
+// Opacity-aware footprint. A pixel gets alpha >= kMinAlpha exactly where
+// d^T cov^-1 d <= 2 ln(255 opacity), d = splat centre - pixel centre (plus a
+// hair of slack for rounding). train_project counts the tiles this ellipse
+// reaches and train_emit writes them, so the two must agree to the bit: the
+// arithmetic is `precise` (no contractions) and both run it on the inputs
+// stored in projected[3].
+float footprint_threshold(float opacity) {
+  precise float t = 2.0 * log(opacity * 255.0);
+  return t * 1.0001 + 1e-4;
+}
+
+// [first, last] of the pixel range covering [lo, hi], within [0, size); first >
+// last if empty. Clamped again after conversion, so even NaN stays in range.
+ivec2 footprint_pixels(float lo, float hi, uint size) {
+  int n = int(size);
+  int first = clamp(int(clamp(ceil(lo), -1.0, float(n))), 0, n);
+  int last = clamp(int(clamp(floor(hi), -1.0, float(n))), -1, n - 1);
+  return ivec2(first, last);
+}
+
+// Pixel rows [x, y] the ellipse (centre m in px, covariance cov, threshold t)
+// reaches; x > y if none.
+ivec2 footprint_rows(vec2 m, vec3 cov, float t, uint height) {
+  precise float ey = sqrt(t * cov.z);
+  precise float v = m.y - 0.5;  // pixel centres at integer rows
+  precise float lo = v - ey, hi = v + ey;
+  return footprint_pixels(lo, hi, height);
+}
+
+// Tiles [x, y) of tile row `ty` the ellipse reaches within pixel rows `rows`.
+uvec2 footprint_row_tiles(vec2 m, vec3 cov, float t, ivec2 rows, uint ty, uint width) {
+  precise float u = m.x - 0.5, v = m.y - 0.5;
+  precise float y0 = float(max(int(ty * kTile), rows.x)) - v;
+  precise float y1 = float(min(int(ty * kTile + kTile - 1u), rows.y)) - v;
+  // q(d) = dy^2 / c + (dx - b dy / c)^2 / (det / c), so at height dy the
+  // ellipse spans dx = b dy / c -+ sqrt(det / c (t - dy^2 / c)). The right
+  // end is concave in dy and the left convex, so over [y0, y1] their extremes
+  // lie at the clamped heights of the rightmost and leftmost points, +-b sqrt(t / a).
+  precise float a = cov.x, b = cov.y, c = cov.z;
+  precise float k = b / c;
+  precise float w = (a * c - b * b) / c;
+  precise float side = b * sqrt(t / a);
+  precise float dr = clamp(side, y0, y1);
+  precise float dl = clamp(-side, y0, y1);
+  precise float x_max = k * dr + sqrt(max(w * (t - dr * dr / c), 0.0));
+  precise float x_min = k * dl - sqrt(max(w * (t - dl * dl / c), 0.0));
+  precise float lo = u + x_min, hi = u + x_max;
+  ivec2 cols = footprint_pixels(lo, hi, width);
+  if (cols.x > cols.y) return uvec2(0u);
+  return uvec2(uint(cols.x) / kTile, uint(cols.y) / kTile + 1u);
 }
 
 // Back-to-front state of one pixel in the backward pass.

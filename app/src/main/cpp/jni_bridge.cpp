@@ -309,6 +309,7 @@ void write_stats(gs::JsonWriter& w, const gs::Trainer& t) {
   w.field("densify_events", s.densify_events);
   w.field("spawned", s.spawned);
   w.field("pruned", s.pruned);
+  w.field("tile_mismatch", s.tile_mismatch);
   w.field("finished", t.finished());
   w.key("timing").begin_object();
   w.field("project_wall", s.timing.project_wall_ms);
@@ -316,6 +317,18 @@ void write_stats(gs::JsonWriter& w, const gs::Trainer& t) {
   w.field("main_wall", s.timing.main_wall_ms);
   w.field("main_gpu", s.timing.main_gpu_ms);
   w.end_object();
+  w.field("reduction", t.reduction());
+  w.key("retunes").begin_array();
+  for (const gs::RetuneResult& r : t.retunes()) {
+    w.begin_object();
+    w.field("step", r.step);
+    w.field("chosen", r.chosen);
+    w.key("ms").begin_object();
+    for (const auto& [name, ms] : r.ms) w.field(name, ms);
+    w.end_object();
+    w.end_object();
+  }
+  w.end_array();
 }
 
 }  // namespace
@@ -347,6 +360,8 @@ Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, js
 
     gs::TrainOptions options = gs::scaled_options(static_cast<uint32_t>(iterations));
     options.reduction = g_reduction->reduction;
+    // Re-timed on real training steps; the synthetic benchmark only picks the start.
+    options.alternatives = g_reduction->others;
     options.max_gaussians = static_cast<uint32_t>(max_gaussians);
     options.sh_degree = sh_degree;
     options.masked = masked == JNI_TRUE;
@@ -388,7 +403,6 @@ Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, js
     w.field("load_ms", load_ms);
     w.field("init_ms", init_ms);
     w.field("setup_ms", setup_ms);
-    w.field("reduction", session->trainer->reduction());
     w.field("reduction_note", session->trainer->reduction_note());
     w.field("reduction_check", g_reduction->log);
     w.field("reduction_check_ms", g_reduction_ms);

@@ -396,7 +396,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                     appendLine("건너뛴 프레임: ${prep.optInt("skipped")}장 (${prep.optString("skipped_first")})")
                 }
                 appendLine(
-                    "역전파 합산: ${prep.optString("reduction")} · GPU 검증: ${prep.optString("reduction_check")} " +
+                    "역전파 시작 방식: ${prep.optString("reduction")} · GPU 검증: ${prep.optString("reduction_check")} " +
                         "(${sec(prep.optDouble("reduction_check_ms"))})",
                 )
             }
@@ -405,7 +405,8 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                     "학습: ${s.optInt("step")}/${s.optInt("iterations")}회 · ${"%.1f".format(Locale.US, elapsedSeconds)} s · " +
                         "최근 ${"%.1f".format(Locale.US, s.optDouble("step_ms"))} ms/회 · 가우시안 ${s.optInt("gaussians")} " +
                         "(+${s.optInt("spawned")} −${s.optInt("pruned")}) · " +
-                        "쌍 ${s.optLong("pairs")} · 학습 뷰 PSNR ${"%.2f".format(Locale.US, s.optDouble("psnr"))}" +
+                        "쌍 ${s.optLong("pairs")} (타일 불일치 ${s.optInt("tile_mismatch")}) · " +
+                        "학습 뷰 PSNR ${"%.2f".format(Locale.US, s.optDouble("psnr"))}" +
                         if (r?.stopped == true) " · 중간에 중지" else "",
                 )
             }
@@ -415,6 +416,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                         "본 단계 ${f1(t.optDouble("main_wall"))}/${f1(t.optDouble("main_gpu"))}",
                 )
             }
+            s?.let { retuneLines(it).forEach { line -> appendLine(line) } }
             if (segmentMs.isNotEmpty()) {
                 appendLine("ms/회 (${SEGMENT}회 단위): " + segmentMs.joinToString(" ") { "%.0f".format(Locale.US, it) })
             }
@@ -441,6 +443,26 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
             selfTestLines().forEach { appendLine(it) }
             if (status.isNotEmpty()) appendLine("상태: $status")
         }.trimEnd()
+    }
+
+    // Backward variants timed on real training steps: the first measurement,
+    // every switch, and the last one.
+    private fun retuneLines(s: JSONObject): List<String> {
+        val all = s.optJSONArray("retunes") ?: return emptyList()
+        if (all.length() == 0) return emptyList()
+        val lines = mutableListOf("역전파 실측 (같은 학습 단계에서, GPU ms) · 최종 ${s.optString("reduction")}:")
+        var previous = ""
+        for (i in 0 until all.length()) {
+            val r = all.getJSONObject(i)
+            val chosen = r.optString("chosen")
+            if (i == 0 || i == all.length() - 1 || chosen != previous) {
+                val ms = r.optJSONObject("ms") ?: JSONObject()
+                val parts = ms.keys().asSequence().joinToString(" · ") { "$it ${f1(ms.optDouble(it))}" }
+                lines += "  ${r.optInt("step")}회: $parts → $chosen"
+            }
+            previous = chosen
+        }
+        return lines
     }
 
     override fun onCleared() {

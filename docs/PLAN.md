@@ -227,7 +227,7 @@ on-divice-gsplate/
 
 **iteration 1회의 흐름** (v0.3.0 구현, `engine/src/trainer.cpp`, `engine/shaders/train_*.comp`)
 
-1. **전처리** (`train_project`) — scale·quaternion으로 3D 공분산 → EWA 투영으로 2D conic → SH에서 색. 타일 범위는 opacity를 반영한 반경(alpha ≥ 1/255인 영역)만큼 잡아 쌍 수를 줄인다. 타일 수를 prefix sum으로 합산(`scan_local` → `radix_scan` → `scan_add`).
+1. **전처리** (`train_project`) — scale·quaternion으로 3D 공분산 → EWA 투영으로 2D conic → SH에서 색. 타일은 opacity를 반영한 타원(alpha ≥ 1/255인 영역)이 실제로 닿는 것만 센다(v0.3.9, 행마다 타원의 x 범위를 구함; 그 전에는 가장 긴 축 반경의 원을 감싼 사각형). 타일 수를 prefix sum으로 합산(`scan_local` → `radix_scan` → `scan_add`).
 2. **정렬** (`train_emit` → radix sort → `train_ranges`) — 키 = (타일 ID << 16) | 16-bit log 깊이. 32-bit 키만 쓰므로 `shaderInt64` 불필요. 정렬 값은 정렬 전 쌍 인덱스.
    - 기기마다 subgroup 크기가 16~128로 다르므로 이에 의존하지 않는 radix sort를 쓴다. GPU 간 forward-progress 보장이 필요한 onesweep 방식은 쓰지 않는다.
    - 쌍 개수는 매 단계 CPU로 읽어 온다(제출 2회/단계). 간접 dispatch로 없애는 것은 M5.
@@ -235,6 +235,9 @@ on-divice-gsplate/
 4. **Loss** — L1. 마스크가 있으면 정답을 무작위 배경색 위에 합성하고 렌더도 같은 배경색 위에 그려, 대상 밖은 투명해지도록 학습한다. (M4: (1−λ)·L1 + λ·D-SSIM)
 5. **Backward 래스터** (`train_backward`) — back-to-front로 다시 순회. **(c) atomic-free 방식 채택**: 가우시안 B개씩 묶어 픽셀별 그래디언트를 subgroupAdd → 공유 메모리에서 subgroup끼리 합산 → (타일, 가우시안) 쌍별 그래디언트를 정렬 전 인덱스 위치에 기록. 가장 작은 subgroup 크기에 맞춰 공유 메모리 크기를 specialization constant로 정한다 (Adreno 64 → B=32, lavapipe 8 → B=8).
    - (a)는 Fold6에서 불가(float atomic 없음), (b)·(d)는 (c)가 느릴 때 비교 후보로 남긴다.
+   - **v0.3.9**: 학습 중 실측 재선택 — 그래디언트가 맞는 변형들을 같은 실제 학습 단계에서 번갈아(A B C C B A) 재고 가장 빠른 것으로 전환(20회째, 이후 500회마다). 시작 전 합성 벤치마크(12k 가우시안)는 첫 선택에만 쓴다. 타원 타일 판정으로 쌍 감소(project와 emit이 `precise` 연산으로 같은 결과를 내고, 어긋나면 빈 타일로 채워 세어 보고).
+   - **v0.3.8**: subgroup_lane4/lane1(subgroup 번호·elect·벡터 덧셈 없이 스칼라 subgroupAdd) — Fold6에서 처음으로 컴파일·그래디언트 정상, 하지만 13~14 ms로 serial_cut(8.9 ms)보다 느림. 같은 코드인데 실행마다 모든 단계가 ~1.7배 차이 → GPU 클럭 상태.
+   - **v0.3.7**: 그래디언트가 맞는 변형들을 폰에서 벤치마크해 가장 빠른 것 선택 → serial_cut, 빠름 105 → 75 s.
    - **v0.3.6**: 역전파 serial_cut2(타일별 마지막 기여 지점에서 멈춤 + barrier 1회당 가우시안 2개) — PC에서 역전파 25~35% 단축, 결과 동일. 제출별 벽시계/GPU 시간 측정, subgroup 조합 probe. 실측: [m3-fold6.md](../experiments/m3-fold6.md).
    - **v0.3.5 Fold6 자가 검사 — 학습 동작 확인**: serial 역전파의 그래디언트가 CPU 기준과 일치(일반·마스크 모두, 0 아닌 쌍 28/36 = PC와 동일), 장면 맞추기 24.9 → 36.5 dB(600회, 2.3 ms/회, PC 36.8 dB). shared는 여전히 0. subgroup 기능은 하나씩(basic/elect/id/float add/ballot)은 모두 컴파일되지만 조합한 probe와 학습 셰이더는 실패 → 다음: 조합(vec4 덧셈, id+add 등) probe로 원인 찾아 빠른 역전파 복구.
    - **v0.3.4 Fold6 자가 검사**: 공유 메모리 atomic 정상, 순전파 기록·갱신 단계 정상, shared 역전파 출력만 거의 전부 0(36쌍 중 1쌍). subgroup은 최소 probe 셰이더도 `VK_ERROR_UNKNOWN`. → v0.3.5: 순전파와 같은 구조(단일 반복문, 가우시안 하나씩, 2단계 공유 메모리 합)의 serial 역전파 추가, 학습 전 폰 GPU에서 변형별 그래디언트를 CPU 기준과 비교해 맞는 첫 변형을 선택(없으면 학습 거부), subgroup 기능별 컴파일 probe.

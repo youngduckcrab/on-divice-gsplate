@@ -1,7 +1,7 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 // Training pass 1: project every gaussian (EWA 2D covariance, SH colour) and
-// count the 16x16 tiles its opacity-aware footprint touches.
+// count the 16x16 tiles its opacity-aware footprint (an ellipse) reaches.
 layout(local_size_x = 128) in;
 
 #include "train_common.glsl"
@@ -20,7 +20,7 @@ void main() {
   vec4 p1 = params[i * 4u + 1u];
   uint tiles = 0u;
   vec4 out0 = vec4(0.0), out1 = vec4(0.0), out2 = vec4(0.0);
-  uvec4 rect = uvec4(0u);
+  vec4 out3 = vec4(0.0);
 
   vec3 p = p0.xyz;
   vec3 t = vec3(dot(frame.rot0.xyz, p) + frame.rot0.w, dot(frame.rot1.xyz, p) + frame.rot1.w,
@@ -52,15 +52,19 @@ void main() {
       float mid = 0.5 * (a + c);
       float lambda = mid + sqrt(max(0.1, mid * mid - det));
       float sigma = sqrt(lambda);
-      // Pixels further out than this have alpha < 1/255 and are skipped anyway.
-      float radius = ceil(sqrt(2.0 * log(opacity * 255.0)) * sigma);
-      ivec2 lo = ivec2(floor((mean - radius) / float(kTile)));
-      ivec2 hi = ivec2(floor((mean + radius) / float(kTile))) + 1;
-      lo = clamp(lo, ivec2(0), ivec2(frame.image.zw));
-      hi = clamp(hi, ivec2(0), ivec2(frame.image.zw));
-      tiles = uint(max(hi.x - lo.x, 0) * max(hi.y - lo.y, 0));
+      // Only tiles the ellipse reaches: a box around the circle of the
+      // largest axis held mostly empty tiles for elongated splats.
+      vec3 cov2 = vec3(a, b, c);
+      float threshold = footprint_threshold(opacity);
+      ivec2 rows = footprint_rows(mean, cov2, threshold, frame.image.y);
+      if (rows.x <= rows.y) {
+        for (uint ty = uint(rows.x) / kTile; ty <= uint(rows.y) / kTile; ++ty) {
+          uvec2 span = footprint_row_tiles(mean, cov2, threshold, rows, ty, frame.image.x);
+          tiles += span.y - span.x;
+        }
+      }
       if (tiles > 0u) {
-        rect = uvec4(lo, hi);
+        out3 = vec4(cov2, threshold);
         uint degree = frame.model.y;
         uint base = i * frame.model.z;
         float basis[16];
@@ -84,6 +88,6 @@ void main() {
   projected[i * 4u] = out0;
   projected[i * 4u + 1u] = out1;
   projected[i * 4u + 2u] = out2;
-  projected[i * 4u + 3u] = uintBitsToFloat(rect);
+  projected[i * 4u + 3u] = out3;
   tiles_touched[i] = tiles;
 }

@@ -15,21 +15,43 @@ layout(std430, binding = 3) readonly buffer Offsets { uint offsets[]; };
 layout(std430, binding = 4) writeonly buffer Keys { uint keys[]; };
 layout(std430, binding = 5) writeonly buffer Values { uint values[]; };
 layout(std430, binding = 6) writeonly buffer PairGaussian { uint pair_gaussian[]; };
+layout(std430, binding = 7) writeonly buffer PairGrads { vec4 pair_grads[]; };
+layout(std430, binding = 8) buffer Mismatch { uint mismatch[]; };  // gaussians whose count differed, ever
 
 void main() {
   uint i = gl_GlobalInvocationID.x;
   if (i >= frame.model.x || tiles_touched[i] == 0u) return;
-  float depth = projected[i * 4u].z;
-  uvec4 rect = floatBitsToUint(projected[i * 4u + 3u]);
+  vec4 q0 = projected[i * 4u];
+  vec4 footprint = projected[i * 4u + 3u];
   // Log depth, front to back, 16 bits.
-  uint d = uint(clamp(log2(depth / kNear) / log2(kFar / kNear), 0.0, 1.0) * 65535.0);
+  uint d = uint(clamp(log2(q0.z / kNear) / log2(kFar / kNear), 0.0, 1.0) * 65535.0);
   uint p = offsets[i];
-  for (uint y = rect.y; y < rect.w; ++y) {
-    for (uint x = rect.x; x < rect.z; ++x) {
-      keys[p] = ((y * frame.image.z + x) << 16u) | d;
-      values[p] = p;
-      pair_gaussian[p] = i;
-      ++p;
+  uint end = p + tiles_touched[i];
+  uint wanted = 0u;
+  ivec2 rows = footprint_rows(q0.xy, footprint.xyz, footprint.w, frame.image.y);
+  if (rows.x <= rows.y) {
+    for (uint ty = uint(rows.x) / kTile; ty <= uint(rows.y) / kTile; ++ty) {
+      uvec2 span = footprint_row_tiles(q0.xy, footprint.xyz, footprint.w, rows, ty, frame.image.x);
+      wanted += span.y - span.x;
+      for (uint x = span.x; x < span.y && p < end; ++x) {
+        keys[p] = ((ty * frame.image.z + x) << 16u) | d;
+        values[p] = p;
+        pair_gaussian[p] = i;
+        ++p;
+      }
     }
+  }
+  if (wanted == tiles_touched[i]) return;
+  // train_project counted the same tiles, so this should not happen. If it
+  // does, no slot is left stale: the rest go to the unused tile after the
+  // last one, which no pass renders, with zero gradient.
+  atomicAdd(mismatch[0], 1u);
+  for (; p < end; ++p) {
+    keys[p] = ((frame.image.z * frame.image.w) << 16u) | d;
+    values[p] = p;
+    pair_gaussian[p] = i;
+    pair_grads[p * 3u] = vec4(0.0);
+    pair_grads[p * 3u + 1u] = vec4(0.0);
+    pair_grads[p * 3u + 2u] = vec4(0.0);
   }
 }

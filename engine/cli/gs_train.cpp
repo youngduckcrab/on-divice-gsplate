@@ -4,7 +4,8 @@
 // Usage:
 //   gs_train <dataset_dir> <out.ply> [--width 360] [--iters 3000] [--max-gaussians 300000]
 //            [--sh 3] [--init-gaussians 150000] [--opacity-reset N (0 = off)] [--grad-threshold 2e-4]
-//            [--reduction subgroup|subgroup_scalar|serial_cut|serial|shared]
+//            [--reduction subgroup|subgroup_scalar|subgroup_lane4|subgroup_lane1|serial_cut2|serial_cut|serial|shared]
+//            [--alternatives serial_cut2,subgroup_lane4,...] (timed on real steps; the fastest is kept)
 //            [--no-masks] [--preview <dir>] [--eval-every 1000]
 #include <chrono>
 #include <cstdio>
@@ -18,6 +19,23 @@
 #include "gs/offscreen.h"
 #include "gs/trainer.h"
 #include "gs/vk_context.h"
+
+namespace {
+
+gs::TrainOptions::Reduction parse_reduction(const std::string& r) {
+  using R = gs::TrainOptions::Reduction;
+  return r == "subgroup"          ? R::Subgroup
+         : r == "subgroup_scalar" ? R::SubgroupScalar
+         : r == "subgroup_lane4"  ? R::SubgroupLane4
+         : r == "subgroup_lane1"  ? R::SubgroupLane1
+         : r == "serial_cut2"     ? R::SerialCut2
+         : r == "serial_cut"      ? R::SerialCut
+         : r == "serial"          ? R::Serial
+         : r == "shared"          ? R::Shared
+                                  : R::Auto;
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
   if (argc < 3) {
@@ -53,17 +71,12 @@ int main(int argc, char** argv) {
       } else if (arg == "--opacity-reset") {
         reset_override = std::atoi(next());
       } else if (arg == "--reduction") {
-        const std::string r = next();
-        using R = gs::TrainOptions::Reduction;
-        options.reduction = r == "subgroup"          ? R::Subgroup
-                            : r == "subgroup_scalar" ? R::SubgroupScalar
-                            : r == "subgroup_lane4"  ? R::SubgroupLane4
-                            : r == "subgroup_lane1"  ? R::SubgroupLane1
-                            : r == "serial_cut2"     ? R::SerialCut2
-                            : r == "serial_cut"      ? R::SerialCut
-                            : r == "serial"          ? R::Serial
-                            : r == "shared"          ? R::Shared
-                                                     : R::Auto;
+        options.reduction = parse_reduction(next());
+      } else if (arg == "--alternatives") {
+        const std::string list = std::string(next()) + ",";
+        for (size_t a = 0, b; (b = list.find(',', a)) != std::string::npos; a = b + 1) {
+          if (b > a) options.alternatives.push_back(parse_reduction(list.substr(a, b - a)));
+        }
       } else if (arg == "--grad-threshold") {
         grad_threshold = std::atof(next());
       } else if (arg == "--no-masks") {
@@ -138,6 +151,11 @@ int main(int argc, char** argv) {
       }
     }
     const double train_s = std::chrono::duration<double>(clock::now() - t2).count();
+    for (const gs::RetuneResult& r : trainer.retunes()) {
+      std::printf("backward timing at step %u:", r.step);
+      for (const auto& [name, ms] : r.ms) std::printf("  %s %.1f", name.c_str(), ms);
+      std::printf("  -> %s\n", r.chosen.c_str());
+    }
     gs::SplatScene out = trainer.export_scene();
     gs::convert_convention(out, gs::AxisConvention::RDF);  // what .ply readers expect
     std::vector<uint8_t> ply = gs::save_ply(out);

@@ -106,6 +106,9 @@ struct ReductionChoice {
   TrainOptions::Reduction reduction = TrainOptions::Reduction::Serial;
   std::string name;
   std::string log;
+  // The other correct, non-fallback variants, fastest first: candidates for
+  // TrainOptions::alternatives.
+  std::vector<TrainOptions::Reduction> others;
 };
 ReductionChoice choose_reduction(VkContext& ctx);
 

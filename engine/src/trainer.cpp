@@ -131,7 +131,7 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
   scan_local_ = make("scan_local", shaders::scan_local, 4, sizeof(ScanPush));
   scan_blocks_ = make("radix_scan", shaders::radix_scan, 1, sizeof(uint32_t));
   scan_add_ = make("scan_add", shaders::scan_add, 4, sizeof(ScanPush));
-  emit_ = make("train_emit", shaders::train_emit, 7, 0);
+  emit_ = make("train_emit", shaders::train_emit, 9, 0);
   ranges_ = make("train_ranges", shaders::train_ranges, 2, sizeof(uint32_t));
   forward_ = make("train_forward", shaders::train_forward, 11, 0);
   step_ = make("train_step", shaders::train_step, 12, 0);
@@ -139,8 +139,8 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
   densify_spawn_ = make("train_densify_spawn", shaders::train_densify_spawn, 11, sizeof(uint32_t));
   reset_opacity_ = make("train_reset_opacity", shaders::train_reset_opacity, 4, sizeof(float));
 
-  // Backward pass: the first subgroup variant the driver accepts (when the
-  // device has subgroup arithmetic), else the shared-memory variant.
+  // Backward pass: the requested variant (Auto: the first subgroup variant the
+  // driver accepts, else serial_cut2), then the alternatives that compile.
   const VkSubgroupFeatureFlags needed = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;
   const bool has_subgroups = (info.subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
                              (info.subgroup.supportedOperations & needed) == needed;
@@ -152,64 +152,78 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
   const uint32_t max_subgroups = std::max(1u, 256u / std::max(min_subgroup, 1u));
   uint32_t batch = 32;
   while (batch > 1 && max_subgroups * batch * 3 > 512) batch /= 2;
-  backward_push_[0] = batch;
-  backward_push_[1] = max_subgroups;
   using Reduction = TrainOptions::Reduction;
   struct Variant {
     Reduction reduction;
     const char* name;
     std::span<const uint32_t> spirv;
+    bool subgroup;
   };
-  const Variant variants[] = {{Reduction::Subgroup, "subgroup", shaders::train_backward},
-                              {Reduction::SubgroupScalar, "subgroup_scalar", shaders::train_backward_scalar},
-                              {Reduction::SubgroupLane4, "subgroup_lane4", shaders::train_backward_sg4},
-                              {Reduction::SubgroupLane1, "subgroup_lane1", shaders::train_backward_sg1}};
-  for (const Variant& v : variants) {
-    if (!reduction_.empty()) break;
-    if (options_.reduction != Reduction::Auto && options_.reduction != v.reduction) continue;
-    if (!has_subgroups || min_subgroup < 4) {
-      reduction_note_ = "subgroup 연산 미지원";
-      break;
+  const Variant variants[] = {{Reduction::Subgroup, "subgroup", shaders::train_backward, true},
+                              {Reduction::SubgroupScalar, "subgroup_scalar", shaders::train_backward_scalar, true},
+                              {Reduction::SubgroupLane4, "subgroup_lane4", shaders::train_backward_sg4, true},
+                              {Reduction::SubgroupLane1, "subgroup_lane1", shaders::train_backward_sg1, true},
+                              {Reduction::SerialCut2, "serial_cut2", shaders::train_backward_cut2, false},
+                              {Reduction::SerialCut, "serial_cut", shaders::train_backward_cut, false},
+                              {Reduction::Serial, "serial", shaders::train_backward_serial, false},
+                              {Reduction::Shared, "shared", shaders::train_backward_shared, false}};
+  auto variant = [&](Reduction r) -> const Variant* {
+    for (const Variant& v : variants) {
+      if (v.reduction == r) return &v;
     }
-    try {
-      backward_ = ctx.create_compute_pipeline(v.spirv, kBackwardBindings, sizeof(backward_push_));
-      reduction_ = v.name;
-    } catch (const VulkanError& e) {
-      log_error("trainer: %s backward rejected (%s)", v.name, e.what());
-      if (!reduction_note_.empty()) reduction_note_ += ", ";
-      reduction_note_ += std::string(v.name) + " 실패: " + vk_result_name(e.result);
+    return nullptr;
+  };
+  // Subgroup variants may be rejected (noted); the others must compile.
+  auto add_backward = [&](const Variant& v) {
+    for (const Backward& b : backwards_) {
+      if (b.name == v.name) return true;
     }
-  }
-  if (reduction_.empty()) {
-    if (options_.reduction == Reduction::Subgroup || options_.reduction == Reduction::SubgroupScalar ||
-        options_.reduction == Reduction::SubgroupLane4 || options_.reduction == Reduction::SubgroupLane1) {
-      throw std::runtime_error("subgroup 역전파를 쓸 수 없음 (" + reduction_note_ + ")");
+    if (v.subgroup && (!has_subgroups || min_subgroup < 4)) {
+      if (reduction_note_.find("미지원") == std::string::npos) {
+        if (!reduction_note_.empty()) reduction_note_ += ", ";
+        reduction_note_ += "subgroup 연산 미지원";
+      }
+      return false;
     }
-    backward_push_[0] = 32;
-    if (options_.reduction == Reduction::Shared) {
-      backward_ = make("train_backward_shared", shaders::train_backward_shared, kBackwardBindings,
-                       sizeof(backward_push_));
-      reduction_ = "shared";
-    } else if (options_.reduction == Reduction::Serial) {
-      backward_ = make("train_backward_serial", shaders::train_backward_serial, kBackwardBindings,
-                       sizeof(backward_push_));
-      reduction_ = "serial";
-    } else if (options_.reduction == Reduction::SerialCut) {
-      backward_ = make("train_backward_cut", shaders::train_backward_cut, kBackwardBindings, sizeof(backward_push_));
-      reduction_ = "serial_cut";
+    Backward b;
+    b.name = v.name;
+    b.push[0] = v.subgroup ? batch : 32;
+    b.push[1] = max_subgroups;
+    if (v.subgroup) {
+      try {
+        b.pipeline = ctx.create_compute_pipeline(v.spirv, kBackwardBindings, sizeof(b.push));
+      } catch (const VulkanError& e) {
+        log_error("trainer: %s backward rejected (%s)", v.name, e.what());
+        if (!reduction_note_.empty()) reduction_note_ += ", ";
+        reduction_note_ += std::string(v.name) + " 실패: " + vk_result_name(e.result);
+        return false;
+      }
     } else {
-      backward_ = make("train_backward_cut2", shaders::train_backward_cut2, kBackwardBindings, sizeof(backward_push_));
-      reduction_ = "serial_cut2";
+      const std::string shader = std::string("train_backward_") + v.name;
+      b.pipeline = make(shader.c_str(), v.spirv, kBackwardBindings, sizeof(b.push));
     }
+    backwards_.push_back(std::move(b));
+    return true;
+  };
+  if (options_.reduction == Reduction::Auto) {
+    for (const Variant& v : variants) {
+      if (v.subgroup && add_backward(v)) break;
+    }
+    if (backwards_.empty()) add_backward(*variant(Reduction::SerialCut2));
+  } else if (!add_backward(*variant(options_.reduction))) {
+    throw std::runtime_error("subgroup 역전파를 쓸 수 없음 (" + reduction_note_ + ")");
+  }
+  for (Reduction r : options_.alternatives) {
+    if (r != Reduction::Auto) add_backward(*variant(r));
   }
   if (!failures.empty()) {
     std::string message = "학습 셰이더를 만들 수 없음:";
     for (const std::string& f : failures) message += " " + f;
     throw std::runtime_error(message);
   }
-  log_info("trainer: %ux%u, %u tiles, capacity %u, sh %d, subgroup %u..%u, backward %s batch %u", width_, height_,
-           tiles_x_ * tiles_y_, capacity_, options_.sh_degree, min_subgroup, info.subgroup.subgroupSize,
-           reduction_.c_str(), backward_push_[0]);
+  log_info("trainer: %ux%u, %u tiles, capacity %u, sh %d, subgroup %u..%u, backward %s batch %u (+%zu alternatives)",
+           width_, height_, tiles_x_ * tiles_y_, capacity_, options_.sh_degree, min_subgroup,
+           info.subgroup.subgroupSize, reduction().c_str(), backwards_[0].push[0], backwards_.size() - 1);
   sort_ = std::make_unique<RadixSort>(ctx);
 
   const uint64_t cap = capacity_;
@@ -230,13 +244,14 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
   spawn_ = ctx.create_buffer(cap * 4, MemoryKind::Device);
   free_list_ = ctx.create_buffer(cap * 4, MemoryKind::Device);
   counters_ = ctx.create_buffer(16, MemoryKind::Device);
+  mismatch_ = ctx.create_buffer(16, MemoryKind::Device);
   block_sums_ = ctx.create_buffer(std::max<uint64_t>(div_up(cap, kScanBlock), 1) * 4, MemoryKind::Device);
   totals_ = ctx.create_buffer(16, MemoryKind::Device);
   target_ = ctx.create_buffer(pixels * 4, MemoryKind::Upload);
   pixel_grad_ = ctx.create_buffer(pixels * 16, MemoryKind::Device);
   pixel_count_ = ctx.create_buffer(pixels * 4, MemoryKind::Device);
   image_ = ctx.create_buffer(pixels * 4, MemoryKind::Device);
-  ranges_buf_ = ctx.create_buffer(tiles * 8, MemoryKind::Device);
+  ranges_buf_ = ctx.create_buffer((tiles + 1) * 8, MemoryKind::Device);  // + the tile emit pads into
   tile_loss_ = ctx.create_buffer(tiles * 16, MemoryKind::Device);
   tile_count_ = ctx.create_buffer(tiles * 4, MemoryKind::Device);
   readback_small_ = ctx.create_buffer(16, MemoryKind::Readback);
@@ -267,7 +282,7 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
     }
   }
   ctx.run([&](VkCommandBuffer cmd) {
-    for (const Buffer* b : {&params_, &sh_, &m_params_, &v_params_, &m_sh_, &v_sh_, &stats_buf_}) {
+    for (const Buffer* b : {&params_, &sh_, &m_params_, &v_params_, &m_sh_, &v_sh_, &stats_buf_, &mismatch_}) {
       vkCmdFillBuffer(cmd, b->handle(), 0, VK_WHOLE_SIZE, 0);
     }
   });
@@ -358,7 +373,7 @@ void Trainer::ensure_pair_capacity(uint64_t pairs) {
 }
 
 void Trainer::run_view(const Camera& camera, const uint8_t* target, const float background[3], bool masked_target,
-                       bool train, bool profile) {
+                       bool train, bool profile, bool retune) {
   const uint32_t degree =
       std::min<uint32_t>(options_.sh_degree, options_.sh_degree_interval > 0 ? stats_.step / options_.sh_degree_interval
                                                                              : options_.sh_degree);
@@ -378,19 +393,24 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
     }
     VkBufferCopy region{0, 0, 4};
     vkCmdCopyBuffer(cmd, totals_.handle(), readback_small_.handle(), 1, &region);
+    VkBufferCopy mismatch{0, 4, 4};
+    vkCmdCopyBuffer(cmd, mismatch_.handle(), readback_small_.handle(), 1, &mismatch);
     VkContext::barrier_to_host(cmd);
   });
   uint32_t pairs = 0;
   std::memcpy(&pairs, readback_small_.mapped(), 4);
+  std::memcpy(&stats_.tile_mismatch, static_cast<const uint8_t*>(readback_small_.mapped()) + 4, 4);
   ensure_pair_capacity(std::max<uint32_t>(pairs, 1));
   stats_.pairs = pairs;
 
   // Phase 2: sort, rasterise, and (training) back-propagate and step.
-  const uint32_t key_bits = 16 + bits_for(tiles_x_ * tiles_y_);
+  const uint32_t key_bits = 16 + bits_for(tiles_x_ * tiles_y_ + 1);  // + the padding tile
   auto sort = [&](VkCommandBuffer cmd) {
     vkCmdFillBuffer(cmd, ranges_buf_.handle(), 0, VK_WHOLE_SIZE, 0);
     if (pairs > 0) {
-      dispatch_kernel(ctx_, cmd, emit_, {&frame_, &projected_, &tiles_, &offsets_, &keys_, &values_, &pair_gaussian_},
+      dispatch_kernel(ctx_, cmd, emit_,
+                      {&frame_, &projected_, &tiles_, &offsets_, &keys_, &values_, &pair_gaussian_, &pair_grads_,
+                       &mismatch_},
                       div_up(slots_, 128));
       VkContext::barrier(cmd);
       sort_->record(cmd, keys_, values_, pairs, key_bits);
@@ -408,13 +428,14 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
     vkCmdCopyBuffer(cmd, tile_loss_.handle(), readback_loss_.handle(), 1, &loss);
     VkContext::barrier_to_host(cmd);
   };
-  auto backward = [&](VkCommandBuffer cmd) {
-    ctx_.dispatch(cmd, backward_,
+  auto backward_with = [&](VkCommandBuffer cmd, const Backward& b) {
+    ctx_.dispatch(cmd, b.pipeline,
                   {&frame_, &projected_, &ranges_buf_, &values_, &pair_gaussian_, &pixel_grad_, &pixel_count_,
                    &pair_grads_, &tile_count_},
-                  backward_push_, tiles_x_, tiles_y_);
+                  b.push, tiles_x_, tiles_y_);
     VkContext::barrier(cmd);
   };
+  auto backward = [&](VkCommandBuffer cmd) { backward_with(cmd, backwards_[active_]); };
   auto optimize = [&](VkCommandBuffer cmd) {
     if (slots_ == 0) return;
     dispatch_kernel(ctx_, cmd, step_,
@@ -424,7 +445,7 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
     VkContext::barrier(cmd);
   };
 
-  if (!profile) {
+  if (!profile && !retune) {
     const RunTiming main_time = ctx_.run([&](VkCommandBuffer cmd) {
       sort(cmd);
       rasterize(cmd);
@@ -446,7 +467,27 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
   profile_.project = project_time.best_ms();
   profile_.sort = ctx_.run(sort).best_ms();
   profile_.rasterize = ctx_.run(rasterize).best_ms();
-  if (train) {
+  if (train && retune && backwards_.size() > 1) {
+    // Each variant twice, in mirrored order (A B C C B A), so a clock change
+    // during the measurement favours none. The backward pass only writes
+    // pair_grads, and every variant writes the same values.
+    const size_t n = backwards_.size();
+    std::vector<double> ms(n, 0.0);
+    for (size_t k = 0; k < 2 * n; ++k) {
+      const size_t v = k < n ? k : 2 * n - 1 - k;
+      ms[v] += 0.5 * ctx_.run([&](VkCommandBuffer cmd) { backward_with(cmd, backwards_[v]); }).best_ms();
+    }
+    RetuneResult r;
+    r.step = stats_.step + 1;
+    for (size_t v = 0; v < n; ++v) {
+      r.ms.emplace_back(backwards_[v].name, ms[v]);
+      if (ms[v] < ms[active_]) active_ = v;
+    }
+    r.chosen = backwards_[active_].name;
+    retunes_.push_back(std::move(r));
+    profile_.backward = ms[active_];
+    profile_.optimize = ctx_.run(optimize).best_ms();
+  } else if (train) {
     profile_.backward = ctx_.run(backward).best_ms();
     profile_.optimize = ctx_.run(optimize).best_ms();
   }
@@ -482,7 +523,12 @@ void Trainer::step(bool profile) {
 void Trainer::step_on(size_t frame_index, const float background[3], bool profile) {
   const auto start = std::chrono::steady_clock::now();
   const DatasetFrame& frame = dataset_.frames.at(frame_index);
-  run_view(dataset_camera(dataset_, frame), frame.rgba.data(), background, options_.masked, true, profile);
+  // Steps are numbered from 1; time the backward variants on the scheduled ones.
+  const uint32_t next = stats_.step + 1;
+  const bool retune = backwards_.size() > 1 &&
+                      (next == options_.retune_first ||
+                       (options_.retune_interval > 0 && next % options_.retune_interval == 0));
+  run_view(dataset_camera(dataset_, frame), frame.rgba.data(), background, options_.masked, true, profile, retune);
   const auto [abs_sum, sq_sum] = read_losses();
   const double n = 3.0 * width_ * height_;
   stats_.l1 = abs_sum / n;
@@ -635,6 +681,16 @@ Trainer::DebugSnapshot Trainer::debug_snapshot() {
     ctx_.download(offsets_, d.offsets.data(), d.offsets.size() * 4);
   }
   if (!d.pair_grads.empty()) ctx_.download(pair_grads_, d.pair_grads.data(), d.pair_grads.size() * 4);
+  if (stats_.pairs > 0) {
+    // The sorted keys carry each pair's pre-sort index along.
+    std::vector<uint32_t> keys(stats_.pairs), values(stats_.pairs);
+    ctx_.download(keys_, keys.data(), keys.size() * 4);
+    ctx_.download(values_, values.data(), values.size() * 4);
+    d.pair_tile.assign(stats_.pairs, ~0u);
+    for (size_t k = 0; k < keys.size(); ++k) {
+      if (values[k] < d.pair_tile.size()) d.pair_tile[values[k]] = keys[k] >> 16;
+    }
+  }
   return d;
 }
 

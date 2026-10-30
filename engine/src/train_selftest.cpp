@@ -497,6 +497,7 @@ ReductionChoice choose_reduction(VkContext& ctx) {
                                   {Reduction::Shared, "shared", true}};
   ReductionChoice choice;
   double best_ms = 0.0;
+  std::vector<std::pair<double, Reduction>> correct;
   char buffer[32];
   for (const Candidate& c : candidates) {
     if (c.fallback && choice.found) break;
@@ -512,6 +513,7 @@ ReductionChoice choose_reduction(VkContext& ctx) {
       const double ms = c.fallback ? 0.0 : benchmark_backward(ctx, c.reduction);
       std::snprintf(buffer, sizeof(buffer), " 정상 %.1f ms", ms);
       choice.log += c.fallback ? std::string(" 정상") : std::string(buffer);
+      if (!c.fallback) correct.emplace_back(ms, c.reduction);
       if (!choice.found || ms < best_ms) {
         choice.found = true;
         choice.reduction = c.reduction;
@@ -523,6 +525,11 @@ ReductionChoice choose_reduction(VkContext& ctx) {
     }
   }
   if (choice.found) choice.log += " → " + choice.name;
+  std::sort(correct.begin(), correct.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+  for (const auto& [ms, reduction] : correct) {
+    if (reduction != choice.reduction) choice.others.push_back(reduction);
+  }
   return choice;
 }
 

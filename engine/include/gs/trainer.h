@@ -4,6 +4,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "gs/camera.h"
@@ -59,6 +60,13 @@ struct TrainOptions {
   float prune_opacity = 0.005f;
 
   Reduction reduction = Reduction::Auto;
+  // More variants known to give correct gradients on this GPU (see
+  // choose_reduction). Early on and then every `retune_interval` steps the
+  // trainer times all of them on the same training step and keeps the
+  // fastest; their gradients agree, so switching does not change training.
+  std::vector<Reduction> alternatives;
+  uint32_t retune_first = 20;
+  uint32_t retune_interval = 500;
   uint32_t seed = 1;
 };
 
@@ -88,6 +96,9 @@ struct TrainStats {
   uint32_t densify_events = 0;
   uint32_t spawned = 0;  // gaussians added by densification, in total
   uint32_t pruned = 0;   // and removed
+  // Gaussians whose emitted tiles differed from the projected count, over the
+  // whole run (lags a step). Both passes compute the same footprint, so 0.
+  uint32_t tile_mismatch = 0;
   // Moving averages per training step: wall clock around each submit + wait,
   // and GPU time from timestamps, for the projection submit and the main one.
   struct Timing {
@@ -96,6 +107,13 @@ struct TrainStats {
     double main_wall_ms = 0.0;
     double main_gpu_ms = 0.0;
   } timing;
+};
+
+// One timing of the backward variants on a training step.
+struct RetuneResult {
+  uint32_t step = 0;
+  std::vector<std::pair<std::string, double>> ms;  // per variant, GPU ms
+  std::string chosen;
 };
 
 struct EvalResult {
@@ -150,12 +168,16 @@ class Trainer {
     std::vector<uint32_t> tiles;        // tiles touched per slot
     std::vector<uint32_t> offsets;      // first pair per slot
     std::vector<float> pair_grads;      // 12 per pair, pre-sort order
+    std::vector<uint32_t> pair_tile;    // per pair, pre-sort order
   };
   DebugSnapshot debug_snapshot();
   uint32_t sh_stride() const { return sh_stride_; }
-  // "subgroup" or "shared", and why the subgroup variant was not used, if it was not.
-  const std::string& reduction() const { return reduction_; }
+  // The backward variant in use ("serial_cut", "subgroup_lane4", ...), and why
+  // subgroup variants were not used, if they were not.
+  const std::string& reduction() const { return backwards_[active_].name; }
   const std::string& reduction_note() const { return reduction_note_; }
+  // Timings of the backward variants on training steps (TrainOptions::alternatives).
+  const std::vector<RetuneResult>& retunes() const { return retunes_; }
 
   static constexpr uint32_t kTileSize = 16;
 
@@ -163,8 +185,9 @@ class Trainer {
   struct FrameData;
   void write_frame(const Camera& camera, const float background[3], bool masked_target, uint32_t sh_degree);
   // Renders `camera` into image_/tile losses; with `train`, also the backward pass and Adam step.
+  // With `retune`, every backward variant is timed on this step (implies profiling).
   void run_view(const Camera& camera, const uint8_t* target, const float background[3], bool masked_target,
-                bool train, bool profile = false);
+                bool train, bool profile = false, bool retune = false);
   void ensure_pair_capacity(uint64_t pairs);
   void record_scan(VkCommandBuffer cmd, const Buffer& values, const Buffer& prefix, uint32_t count,
                    uint32_t total_index);
@@ -179,8 +202,14 @@ class Trainer {
   PassTimes profile_;
   uint32_t width_ = 0, height_ = 0, tiles_x_ = 0, tiles_y_ = 0;
   uint32_t capacity_ = 0;
-  uint32_t backward_push_[2] = {32, 4};  // batch, max subgroups
-  std::string reduction_;
+  struct Backward {
+    std::string name;
+    ComputePipeline pipeline;
+    uint32_t push[2] = {32, 4};  // batch, max subgroups
+  };
+  std::vector<Backward> backwards_;  // the requested variant, then the alternatives that compiled
+  size_t active_ = 0;
+  std::vector<RetuneResult> retunes_;
   std::string reduction_note_;
   uint32_t sh_stride_ = 0;  // floats per slot
   uint32_t slots_ = 0;
@@ -192,13 +221,13 @@ class Trainer {
   std::vector<size_t> order_;
   size_t order_pos_ = 0;
 
-  ComputePipeline project_, scan_local_, scan_blocks_, scan_add_, emit_, ranges_, forward_, backward_, step_;
+  ComputePipeline project_, scan_local_, scan_blocks_, scan_add_, emit_, ranges_, forward_, step_;
   ComputePipeline densify_mark_, densify_spawn_, reset_opacity_;
   std::unique_ptr<RadixSort> sort_;
 
   Buffer frame_;  // FrameData, host-visible
   Buffer params_, sh_, m_params_, v_params_, m_sh_, v_sh_, stats_buf_;
-  Buffer projected_, tiles_, offsets_, spawn_, free_list_, counters_, block_sums_, totals_;
+  Buffer projected_, tiles_, offsets_, spawn_, free_list_, counters_, mismatch_, block_sums_, totals_;
   Buffer keys_, values_, pair_gaussian_, pair_grads_;
   Buffer target_, pixel_grad_, pixel_count_, image_, ranges_buf_, tile_loss_, tile_count_;
   Buffer readback_small_, readback_image_, readback_loss_;
