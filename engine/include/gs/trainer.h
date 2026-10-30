@@ -44,7 +44,10 @@ struct TrainOptions {
   uint32_t densify_from = 300;
   uint32_t densify_until = 2000;
   uint32_t densify_interval = 100;
-  uint32_t opacity_reset_interval = 1000;  // 0 disables
+  // 3DGS resets opacities every 3000 of 30000 steps. In short runs it makes the
+  // model vanish mid-training and did not improve held-out PSNR (lizard and
+  // head, 600 steps), so it is off by default.
+  uint32_t opacity_reset_interval = 0;  // 0 disables
   float densify_grad_threshold = 2e-4f;
   float percent_dense = 0.01f;  // clone below, split above this fraction of the extent
   float prune_opacity = 0.005f;

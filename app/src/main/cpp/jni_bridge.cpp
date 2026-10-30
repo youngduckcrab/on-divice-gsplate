@@ -351,6 +351,8 @@ Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, js
     w.field("ok", true);
     w.field("name", d.name);
     w.field("frames", d.frames.size());
+    w.field("skipped", d.skipped.size());
+    w.field("skipped_first", d.skipped.empty() ? std::string() : d.skipped.front());
     w.field("holdout", d.holdout_count());
     w.field("width", d.width);
     w.field("height", d.height);

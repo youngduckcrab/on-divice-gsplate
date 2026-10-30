@@ -33,13 +33,15 @@ struct Dataset {
   std::vector<uint8_t> point_colors;  // rgb per point
   float camera_center[3] = {0, 0, 0};
   float camera_extent = 1.0f;  // max camera distance from camera_center (3DGS "scene extent")
+  std::vector<std::string> skipped;  // frames left out because their files could not be read
 
   size_t train_count() const;
   size_t holdout_count() const;
 };
 
 // Loads `directory`/transforms.json. Images are resized to `target_width`
-// (aspect kept); every 8th frame is held out. Throws std::runtime_error.
+// (aspect kept); every 8th frame is held out. Frames with unreadable files are
+// skipped (listed in `skipped`); throws std::runtime_error if too few remain.
 Dataset load_dataset(const std::string& directory, uint32_t target_width);
 
 // Pinhole camera (scene -> camera, OpenCV convention) for a frame.

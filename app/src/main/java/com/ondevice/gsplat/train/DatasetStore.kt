@@ -26,6 +26,9 @@ data class DatasetInfo(
     val name: String get() = dir.name
 }
 
+/** An imported dataset, and the zip entries skipped because their data was damaged. */
+data class ImportResult(val dataset: DatasetInfo, val damaged: List<String>)
+
 /** Imports capture zips into app storage and lists them. */
 object DatasetStore {
     /** Large files the trainer does not read. */
@@ -62,9 +65,11 @@ object DatasetStore {
 
     /**
      * Extracts a zip holding a transforms.json (at its root or in one folder) and
-     * returns the new dataset. [onProgress] gets the fraction of the zip read.
+     * returns the new dataset. Entries whose data fails the CRC check (a damaged
+     * download) are left out and reported; the trainer then skips those frames.
+     * [onProgress] gets the fraction of the zip read.
      */
-    fun importZip(context: Context, uri: Uri, onProgress: (Float) -> Unit): DatasetInfo {
+    fun importZip(context: Context, uri: Uri, onProgress: (Float) -> Unit): ImportResult {
         val resolver = context.contentResolver
         var displayName = "dataset"
         var total = -1L
@@ -79,6 +84,7 @@ object DatasetStore {
         try {
             val input = resolver.openInputStream(uri) ?: throw IOException("파일을 열 수 없음")
             var current = ""
+            val damaged = mutableListOf<String>()
             CountingStream(input).use { counting ->
                 ZipInputStream(counting).use { zip ->
                     val buffer = ByteArray(1 shl 16)
@@ -87,7 +93,7 @@ object DatasetStore {
                         val entry = try {
                             zip.nextEntry
                         } catch (e: ZipException) {
-                            throw damaged(current, e)
+                            throw damagedZip(current, e)
                         } ?: break
                         val name = entry.name.replace('\\', '/')
                         current = name
@@ -97,12 +103,14 @@ object DatasetStore {
                         if (entry.isDirectory || skipped.any { name.endsWith(it) || name.contains(it) }) continue
                         val out = File(staging, name)
                         out.parentFile?.mkdirs()
+                        var intact = true
                         out.outputStream().use { stream ->
                             while (true) {
                                 val n = try {
                                     zip.read(buffer)
                                 } catch (e: ZipException) {
-                                    throw damaged(name, e)
+                                    intact = false
+                                    -1
                                 }
                                 if (n < 0) break
                                 stream.write(buffer, 0, n)
@@ -111,6 +119,10 @@ object DatasetStore {
                                     onProgress((counting.count.toFloat() / total).coerceIn(0f, 1f))
                                 }
                             }
+                        }
+                        if (!intact) {
+                            out.delete()
+                            damaged.add(name.substringAfter('/'))
                         }
                     }
                 }
@@ -124,14 +136,15 @@ object DatasetStore {
             var suffix = 2
             while (target.exists()) target = File(root(context), "$base-${suffix++}")
             if (!source.renameTo(target)) throw IOException("데이터셋을 옮길 수 없음")
-            return read(target) ?: throw IOException("transforms.json을 읽을 수 없음")
+            val info = read(target) ?: throw IOException("transforms.json을 읽을 수 없음")
+            return ImportResult(info, damaged)
         } finally {
             staging.deleteRecursively()
         }
     }
 
     /** A CRC or format error means the downloaded file is damaged (e.g. an interrupted download). */
-    private fun damaged(entry: String, e: ZipException) =
+    private fun damagedZip(entry: String, e: ZipException) =
         IOException("zip 파일이 손상됨 (${entry.ifEmpty { "시작 부분" }}: ${e.message}). 파일을 지우고 다시 받아 주세요")
 
     private class CountingStream(input: InputStream) : FilterInputStream(input) {

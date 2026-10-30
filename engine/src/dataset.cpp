@@ -109,32 +109,61 @@ Dataset load_dataset(const std::string& directory, uint32_t target_width) {
   ds.has_masks = std::all_of(mask_paths.begin(), mask_paths.end(), [](const std::string& p) { return !p.empty(); });
   ds.has_depth = std::all_of(depth_paths.begin(), depth_paths.end(), [](const std::string& p) { return !p.empty(); });
 
+  // A frame whose files are missing or unreadable (e.g. a damaged download) is
+  // dropped rather than failing the whole dataset; depth is optional per frame.
+  std::vector<std::string> errors(ds.frames.size());
   parallel_for(ds.frames.size(), [&](size_t i) {
     DatasetFrame& frame = ds.frames[i];
-    Image8 image = decode_image(read_file(join(directory, image_paths[i])), 4);
-    if (image.width != uint32_t(src_w) || image.height != uint32_t(src_h)) {
-      throw std::runtime_error(image_paths[i] + " 크기가 transforms.json과 다름");
-    }
-    frame.rgba = resize_area(image.data.data(), image.width, image.height, 4, ds.width, ds.height);
-    if (ds.has_masks) {
-      Image8 mask = decode_image(read_file(join(directory, mask_paths[i])), 1);
-      std::vector<uint8_t> m = resize_area(mask.data.data(), mask.width, mask.height, 1, ds.width, ds.height);
-      for (size_t p = 0; p < m.size(); ++p) frame.rgba[p * 4 + 3] = m[p];
-    } else {
-      for (size_t p = 0; p < size_t(ds.width) * ds.height; ++p) frame.rgba[p * 4 + 3] = 255;
+    try {
+      Image8 image = decode_image(read_file(join(directory, image_paths[i])), 4);
+      if (image.width != uint32_t(src_w) || image.height != uint32_t(src_h)) {
+        throw std::runtime_error("크기가 transforms.json과 다름");
+      }
+      frame.rgba = resize_area(image.data.data(), image.width, image.height, 4, ds.width, ds.height);
+      if (ds.has_masks) {
+        Image8 mask = decode_image(read_file(join(directory, mask_paths[i])), 1);
+        std::vector<uint8_t> m = resize_area(mask.data.data(), mask.width, mask.height, 1, ds.width, ds.height);
+        for (size_t p = 0; p < m.size(); ++p) frame.rgba[p * 4 + 3] = m[p];
+      } else {
+        for (size_t p = 0; p < size_t(ds.width) * ds.height; ++p) frame.rgba[p * 4 + 3] = 255;
+      }
+    } catch (const std::exception& e) {
+      errors[i] = e.what();
+      frame.rgba.clear();
+      return;
     }
     if (ds.has_depth) {
-      Image16 depth = decode_image16(read_file(join(directory, depth_paths[i])));
-      frame.depth_width = depth.width;
-      frame.depth_height = depth.height;
-      frame.depth.resize(depth.data.size());
-      for (size_t p = 0; p < depth.data.size(); ++p) frame.depth[p] = float(depth.data[p] * depth_scale);
-      if (!conf_paths[i].empty()) {
-        Image8 conf = decode_image(read_file(join(directory, conf_paths[i])), 1);
-        if (conf.width == depth.width && conf.height == depth.height) frame.depth_confidence = std::move(conf.data);
+      try {
+        Image16 depth = decode_image16(read_file(join(directory, depth_paths[i])));
+        frame.depth.resize(depth.data.size());
+        for (size_t p = 0; p < depth.data.size(); ++p) frame.depth[p] = float(depth.data[p] * depth_scale);
+        frame.depth_width = depth.width;
+        frame.depth_height = depth.height;
+        if (!conf_paths[i].empty()) {
+          Image8 conf = decode_image(read_file(join(directory, conf_paths[i])), 1);
+          if (conf.width == depth.width && conf.height == depth.height) frame.depth_confidence = std::move(conf.data);
+        }
+      } catch (const std::exception&) {
+        frame.depth.clear();
+        frame.depth_confidence.clear();
+        frame.depth_width = frame.depth_height = 0;
       }
     }
   });
+  std::vector<DatasetFrame> kept;
+  for (size_t i = 0; i < ds.frames.size(); ++i) {
+    if (errors[i].empty()) {
+      kept.push_back(std::move(ds.frames[i]));
+    } else {
+      ds.skipped.push_back(image_paths[i] + ": " + errors[i]);
+    }
+  }
+  if (kept.size() < 2 || kept.size() * 2 < ds.frames.size()) {
+    throw std::runtime_error("읽을 수 있는 프레임이 너무 적음 (" + std::to_string(kept.size()) + "/" +
+                             std::to_string(ds.frames.size()) + "): " +
+                             (ds.skipped.empty() ? std::string() : ds.skipped.front()));
+  }
+  ds.frames = std::move(kept);
 
   const std::string ply = root.string_or("ply_file_path", "");
   if (!ply.empty()) {

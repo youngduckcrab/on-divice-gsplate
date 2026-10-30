@@ -514,6 +514,25 @@ void test_dataset_loader() {
   init.max_gaussians = 100;
   gs::SplatScene scene = gs::initialize_gaussians(ds, init, &stats);
   EXPECT(stats.source == "random" && scene.count == 100, "random init %s %u", stats.source.c_str(), scene.count);
+
+  // A damaged image drops its frame instead of failing the dataset.
+  write_file(dir / "images/f4.png", "not a png");
+  gs::Dataset partial = gs::load_dataset(dir.string(), 4);
+  EXPECT(partial.frames.size() == 8 && partial.skipped.size() == 1, "damaged frame: %zu frames, %zu skipped",
+         partial.frames.size(), partial.skipped.size());
+  EXPECT(partial.frames[4].name == "images/f5.png", "wrong frame dropped: %s", partial.frames[4].name.c_str());
+  for (int i = 0; i < 6; ++i) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "images/f%d.png", i);
+    write_file(dir / name, "");
+  }
+  bool threw = false;
+  try {
+    gs::load_dataset(dir.string(), 4);
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  EXPECT(threw, "a dataset with most frames unreadable should be rejected");
   std::filesystem::remove_all(dir);
 }
 

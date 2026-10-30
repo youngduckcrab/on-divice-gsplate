@@ -264,7 +264,10 @@ private fun ProgressCard(vm: TrainViewModel) {
             val render = vm.previewRender
             val target = vm.previewTarget
             if (render != null && target != null) {
-                Text("검증 뷰 (왼쪽: 학습 결과, 오른쪽: 정답) · 눌러서 다른 뷰", style = MaterialTheme.typography.labelSmall)
+                Text(
+                    "검증 뷰 · ${vm.previewStep}회째 (1초마다 갱신) · 왼쪽: 학습 결과, 오른쪽: 정답 · 눌러서 다른 뷰",
+                    style = MaterialTheme.typography.labelSmall,
+                )
                 Row(
                     Modifier
                         .fillMaxWidth()

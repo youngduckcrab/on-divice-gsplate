@@ -142,7 +142,13 @@ def render_mesh_subject(name: str, assets: str, k: Intrinsics, frames: int, out:
 
 
 def sparse_points_from_spz(spz: str, out_ply: str, target, radius: float, count: int, seed: int) -> None:
-    """Samples opaque splat centres near the subject, with SfM-like noise, as a coloured PLY."""
+    """Samples opaque splat centres as a coloured PLY with SfM-like noise.
+
+    Half the points are drawn uniformly (most splats sit on the subject, which
+    keeps its detail) and half with probability growing with the squared
+    distance from the subject, so the surroundings get points too, as they
+    would from SfM. Without them the background cannot be trained at all.
+    """
     with gzip.open(spz, "rb") as f:
         raw = f.read()
     magic, version, n = np.frombuffer(raw[:12], dtype="<u4")
@@ -157,9 +163,15 @@ def sparse_points_from_spz(spz: str, out_ply: str, target, radius: float, count:
     color = np.frombuffer(raw, dtype=np.uint8, count=n * 3, offset=16 + n * 10).reshape(n, 3) / 255.0
     rgb = np.clip(0.5 + 0.28209479 * (color - 0.5) / 0.15, 0.0, 1.0)
 
-    keep = (alpha > 0.5) & (np.linalg.norm(xyz - np.asarray(target), axis=1) < radius)
+    dist = np.linalg.norm(xyz - np.asarray(target), axis=1)
+    candidates = np.flatnonzero((alpha > 0.5) & (dist < radius))
     rng = np.random.default_rng(seed)
-    idx = rng.choice(np.flatnonzero(keep), size=min(count, int(keep.sum())), replace=False)
+    count = min(count, len(candidates))
+    uniform = rng.choice(candidates, size=count // 2, replace=False)
+    rest = np.setdiff1d(candidates, uniform)
+    weight = np.clip(dist[rest], 0.5, None) ** 2
+    far = rng.choice(rest, size=count - len(uniform), replace=False, p=weight / weight.sum())
+    idx = np.concatenate([uniform, far])
     pts = (xyz[idx] + rng.normal(scale=0.003, size=(len(idx), 3))).astype("<f4")
     cols = np.round(rgb[idx] * 255).astype(np.uint8)
 
@@ -194,7 +206,7 @@ def render_splat_subject(spz: str, gs_render: str, k: Intrinsics, frames: int, o
             Image.open(os.path.join(tmp, f"view_{i:05d}.ppm")).save(os.path.join(out, "images", stem + ".jpg"),
                                                                     quality=92)
             records.append({"file_path": f"images/{stem}.jpg", "transform_matrix": c2w.tolist(), "timestamp": ts})
-    sparse_points_from_spz(spz, os.path.join(out, "points3d.ply"), spec.target, radius=3.0, count=30000, seed=7)
+    sparse_points_from_spz(spz, os.path.join(out, "points3d.ply"), spec.target, radius=20.0, count=60000, seed=7)
     return records, spec
 
 
@@ -210,8 +222,9 @@ with exact camera poses. Use it to test training without a camera.
 - masks/: soft subject mask (255 = subject). depth/: ARCore-like (160x90 portrait,
   noisy, holes), 16-bit millimetres, 0 = missing. depth_gt/: exact depth at 1/4
   resolution, 16-bit millimetres. Mesh subjects only.
-- points3d.ply: sparse coloured points with ~3 mm noise, standing in for SfM
-  output (transforms.json "ply_file_path"). Lizard only.
+- points3d.ply: 60k coloured points with ~3 mm noise on the subject and its
+  surroundings, standing in for SfM output (transforms.json "ply_file_path").
+  Lizard only.
 - preview.mp4: the frames as a video.
 
 Source: {ATTRIBUTION[name]}

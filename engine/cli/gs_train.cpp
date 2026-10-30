@@ -3,7 +3,8 @@
 //
 // Usage:
 //   gs_train <dataset_dir> <out.ply> [--width 360] [--iters 3000] [--max-gaussians 300000]
-//            [--sh 3] [--init-gaussians 150000] [--no-masks] [--preview <dir>] [--eval-every 1000]
+//            [--sh 3] [--init-gaussians 150000] [--opacity-reset N (0 = off)] [--grad-threshold 2e-4]
+//            [--no-masks] [--preview <dir>] [--eval-every 1000]
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -26,6 +27,8 @@ int main(int argc, char** argv) {
     return 2;
   }
   uint32_t width = 360, eval_every = 1000, max_init = 150000;
+  int reset_override = -1;
+  float grad_threshold = -1.0f;
   std::string preview;
   gs::TrainOptions options;
   uint32_t iterations = options.iterations;
@@ -46,6 +49,10 @@ int main(int argc, char** argv) {
         options.sh_degree = std::atoi(next());
       } else if (arg == "--init-gaussians") {
         max_init = std::atoi(next());
+      } else if (arg == "--opacity-reset") {
+        reset_override = std::atoi(next());
+      } else if (arg == "--grad-threshold") {
+        grad_threshold = std::atof(next());
       } else if (arg == "--no-masks") {
         options.masked = false;
       } else if (arg == "--preview") {
@@ -84,6 +91,8 @@ int main(int argc, char** argv) {
     options.densify_until = defaults.densify_until;
     options.opacity_reset_interval = defaults.opacity_reset_interval;
     options.sh_degree_interval = defaults.sh_degree_interval;
+    if (reset_override >= 0) options.opacity_reset_interval = uint32_t(reset_override);
+    if (grad_threshold >= 0.0f) options.densify_grad_threshold = grad_threshold;
     gs::VkContext ctx;
     gs::Trainer trainer(ctx, ds, scene, options);
     const auto t2 = clock::now();

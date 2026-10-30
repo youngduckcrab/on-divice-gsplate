@@ -85,6 +85,9 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         private set
     var previewIndex by mutableIntStateOf(0)
         private set
+    /** Training step the preview images show. */
+    var previewStep by mutableIntStateOf(0)
+        private set
     var result by mutableStateOf<TrainResult?>(null)
         private set
 
@@ -135,10 +138,16 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             phase = Phase.IDLE
-            imported.onSuccess {
-                status = "불러옴: ${it.name} (${it.frames}장)"
+            imported.onSuccess { result ->
+                val d = result.dataset
+                status = if (result.damaged.isEmpty()) {
+                    "불러옴: ${d.name} (${d.frames}장)"
+                } else {
+                    "불러옴: ${d.name} (${d.frames}장) · 손상된 파일 ${result.damaged.size}개는 빼고 학습함 " +
+                        "(${result.damaged.take(3).joinToString()})"
+                }
                 refreshDatasets()
-                select(datasets.firstOrNull { d -> d.dir == it.dir })
+                select(datasets.firstOrNull { it.dir == d.dir })
             }.onFailure {
                 status = "불러오기 실패: ${it.message ?: it}"
             }
@@ -208,7 +217,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                     thermal = Thermal.snapshot(getApplication())
                     lastThermal = now
                 }
-                if (now - lastPreview > 2_500_000_000L) {
+                if (now - lastPreview > PREVIEW_INTERVAL_NS) {
                     refreshPreview()
                     lastPreview = System.nanoTime()
                 }
@@ -294,6 +303,9 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                         "${prep.optInt("init_gaussians")}개 · 불러오기 ${sec(prep.optDouble("load_ms"))} · " +
                         "초기화 ${sec(prep.optDouble("init_ms"))} · GPU 준비 ${sec(prep.optDouble("setup_ms"))}",
                 )
+                if (prep.optInt("skipped") > 0) {
+                    appendLine("건너뛴 프레임: ${prep.optInt("skipped")}장 (${prep.optString("skipped_first")})")
+                }
                 val note = prep.optString("reduction_note").takeIf { it.isNotEmpty() }?.let { " ($it)" } ?: ""
                 appendLine("역전파 합산: ${prep.optString("reduction")}$note")
             }
@@ -344,6 +356,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         val h = prep.optInt("height")
         if (w <= 0 || h <= 0 || pixels.size < 2 * w * h) return
         previewRender = Bitmap.createBitmap(pixels, 0, w, w, h, Bitmap.Config.ARGB_8888).asImageBitmap()
+        previewStep = stats?.optInt("step") ?: 0
         previewTarget = Bitmap.createBitmap(pixels, w * h, w, w, h, Bitmap.Config.ARGB_8888).asImageBitmap()
     }
 
@@ -382,5 +395,8 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         const val HISTORY_EVERY = 20
         const val SEGMENT = 500
         const val PROFILE_EVERY = 1000
+
+        /** A preview render costs about one forward pass, so it is refreshed on a timer, not every step. */
+        const val PREVIEW_INTERVAL_NS = 1_000_000_000L
     }
 }
