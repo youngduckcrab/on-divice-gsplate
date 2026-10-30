@@ -25,9 +25,11 @@ class RadixSort {
   // when it reallocates.
   void reserve(uint32_t n);
 
-  // Persistent descriptor sets from `pool` (5 sets, 15 storage buffers), for
-  // sorting the same buffers every frame. Call reserve() first.
-  Binding bind(VkDescriptorPool pool, const Buffer& keys, const Buffer& values);
+  // Persistent descriptor sets from `pool` (5 sets, 19 storage buffers), for
+  // sorting the same buffers every frame. Call reserve() first. With `count`,
+  // only the first min(n, count[0]) items are sorted, n as passed to record():
+  // the count can then be written by an earlier pass on the GPU.
+  Binding bind(VkDescriptorPool pool, const Buffer& keys, const Buffer& values, const Buffer* count = nullptr);
 
   // Records the sort into `cmd`; the result ends up in `keys`/`values`. Only
   // the low `key_bits` bits of each key are considered (rounded up to a
@@ -51,6 +53,7 @@ class RadixSort {
   Buffer tmp_keys_;
   Buffer tmp_values_;
   Buffer histogram_;
+  Buffer unlimited_;  // count[0] = UINT32_MAX: sort all n
   uint32_t capacity_ = 0;
 };
 

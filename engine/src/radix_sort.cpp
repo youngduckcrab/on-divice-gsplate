@@ -24,9 +24,12 @@ constexpr uint32_t kBuckets = 1u << kRadixBits;
 
 RadixSort::RadixSort(VkContext& ctx)
     : ctx_(ctx),
-      count_(ctx.create_compute_pipeline(shaders::radix_count, 2, sizeof(PassParams))),
+      count_(ctx.create_compute_pipeline(shaders::radix_count, 3, sizeof(PassParams))),
       scan_(ctx.create_compute_pipeline(shaders::radix_scan, 1, sizeof(ScanParams))),
-      scatter_(ctx.create_compute_pipeline(shaders::radix_scatter, 5, sizeof(PassParams))) {}
+      scatter_(ctx.create_compute_pipeline(shaders::radix_scatter, 6, sizeof(PassParams))),
+      unlimited_(ctx.create_buffer(4, MemoryKind::Device)) {
+  ctx.run([&](VkCommandBuffer cmd) { vkCmdFillBuffer(cmd, unlimited_.handle(), 0, 4, 0xffffffffu); });
+}
 
 void RadixSort::reserve(uint32_t n) {
   if (n <= capacity_) return;
@@ -37,15 +40,17 @@ void RadixSort::reserve(uint32_t n) {
   capacity_ = n;
 }
 
-RadixSort::Binding RadixSort::bind(VkDescriptorPool pool, const Buffer& keys, const Buffer& values) {
+RadixSort::Binding RadixSort::bind(VkDescriptorPool pool, const Buffer& keys, const Buffer& values,
+                                   const Buffer* count) {
+  const Buffer* c = count != nullptr ? count : &unlimited_;
   Binding b;
-  b.count[0] = ctx_.allocate_set(pool, count_.set_layout(), {&keys, &histogram_});
-  b.count[1] = ctx_.allocate_set(pool, count_.set_layout(), {&tmp_keys_, &histogram_});
+  b.count[0] = ctx_.allocate_set(pool, count_.set_layout(), {&keys, &histogram_, c});
+  b.count[1] = ctx_.allocate_set(pool, count_.set_layout(), {&tmp_keys_, &histogram_, c});
   b.scan = ctx_.allocate_set(pool, scan_.set_layout(), {&histogram_});
   b.scatter[0] = ctx_.allocate_set(pool, scatter_.set_layout(),
-                                   {&keys, &values, &tmp_keys_, &tmp_values_, &histogram_});
+                                   {&keys, &values, &tmp_keys_, &tmp_values_, &histogram_, c});
   b.scatter[1] = ctx_.allocate_set(pool, scatter_.set_layout(),
-                                   {&tmp_keys_, &tmp_values_, &keys, &values, &histogram_});
+                                   {&tmp_keys_, &tmp_values_, &keys, &values, &histogram_, c});
   return b;
 }
 
@@ -82,11 +87,13 @@ void RadixSort::record(VkCommandBuffer cmd, const Buffer& keys, const Buffer& va
   if (n <= 1) return;
   reserve(n);
   Binding b;
-  b.count[0] = ctx_.allocate_transient_set(count_, {&keys, &histogram_});
-  b.count[1] = ctx_.allocate_transient_set(count_, {&tmp_keys_, &histogram_});
+  b.count[0] = ctx_.allocate_transient_set(count_, {&keys, &histogram_, &unlimited_});
+  b.count[1] = ctx_.allocate_transient_set(count_, {&tmp_keys_, &histogram_, &unlimited_});
   b.scan = ctx_.allocate_transient_set(scan_, {&histogram_});
-  b.scatter[0] = ctx_.allocate_transient_set(scatter_, {&keys, &values, &tmp_keys_, &tmp_values_, &histogram_});
-  b.scatter[1] = ctx_.allocate_transient_set(scatter_, {&tmp_keys_, &tmp_values_, &keys, &values, &histogram_});
+  b.scatter[0] = ctx_.allocate_transient_set(
+      scatter_, {&keys, &values, &tmp_keys_, &tmp_values_, &histogram_, &unlimited_});
+  b.scatter[1] = ctx_.allocate_transient_set(
+      scatter_, {&tmp_keys_, &tmp_values_, &keys, &values, &histogram_, &unlimited_});
   record(cmd, b, keys, values, n, key_bits);
 }
 

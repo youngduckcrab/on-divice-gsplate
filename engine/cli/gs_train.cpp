@@ -4,7 +4,7 @@
 // Usage:
 //   gs_train <dataset_dir> <out.ply> [--width 360] [--iters 3000] [--max-gaussians 300000]
 //            [--sh 3] [--init-gaussians 150000] [--opacity-reset N (0 = off)] [--grad-threshold 2e-4]
-//            [--reduction subgroup|subgroup_scalar|subgroup_lane4|subgroup_lane1|serial_cut2|serial_cut|serial|shared]
+//            [--reduction bucket|bucket2|subgroup|subgroup_scalar|subgroup_lane4|subgroup_lane1|serial_cut2|serial_cut|serial|shared]
 //            [--alternatives serial_cut2,subgroup_lane4,...] (timed on real steps; the fastest is kept)
 //            [--no-masks] [--preview <dir>] [--eval-every 1000]
 #include <chrono>
@@ -24,7 +24,9 @@ namespace {
 
 gs::TrainOptions::Reduction parse_reduction(const std::string& r) {
   using R = gs::TrainOptions::Reduction;
-  return r == "subgroup"          ? R::Subgroup
+  return r == "bucket"            ? R::Bucket
+         : r == "bucket2"         ? R::Bucket2
+         : r == "subgroup"        ? R::Subgroup
          : r == "subgroup_scalar" ? R::SubgroupScalar
          : r == "subgroup_lane4"  ? R::SubgroupLane4
          : r == "subgroup_lane1"  ? R::SubgroupLane1
@@ -123,7 +125,13 @@ int main(int argc, char** argv) {
     gs::Trainer trainer(ctx, ds, scene, options);
     const auto t2 = clock::now();
     while (!trainer.finished()) {
-      trainer.step(trainer.stats().step % 100 == 50);
+      // Batches up to the next print or profiled step (every 100, at 50).
+      const uint32_t at = trainer.stats().step % 100;
+      if (at == 50) {
+        trainer.step(true);
+      } else {
+        trainer.steps(at < 50 ? 50 - at : 100 - at);
+      }
       const gs::TrainStats& s = trainer.stats();
       if (s.step % 100 == 51 && trainer.last_profile().valid) {
         const gs::PassTimes& p = trainer.last_profile();
@@ -163,6 +171,9 @@ int main(int argc, char** argv) {
     file.write(reinterpret_cast<const char*>(ply.data()), std::streamsize(ply.size()));
     std::printf("trained %u steps in %.1f s; wrote %u gaussians to %s\n", trainer.stats().step, train_s, out.count,
                 argv[2]);
+    std::printf("per step: wall %.1f ms, gpu %.1f ms, %.1f steps per submit; %u overflow steps, %u tile mismatches\n",
+                trainer.stats().timing.wall_ms, trainer.stats().timing.gpu_ms, trainer.stats().timing.batch,
+                trainer.stats().overflow_steps, trainer.stats().tile_mismatch);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;

@@ -19,6 +19,7 @@ layout(std430, binding = 8) readonly buffer Offsets { uint offsets[]; };
 layout(std430, binding = 9) readonly buffer PairGrads { vec4 pair_grads[]; };
 layout(std430, binding = 10) readonly buffer Projected { vec4 projected[]; };
 layout(std430, binding = 11) buffer Stats { vec4 stats[]; };  // grad norm sum, visible count, max radius, abs grad sum
+layout(std430, binding = 12) readonly buffer Totals { uint totals[]; };  // [0] pairs this step
 
 vec4 adam(vec4 p, vec4 g, uint index, vec4 lr) {
   vec4 m = mix(g, m_params[index], frame.adam.x);
@@ -30,7 +31,9 @@ vec4 adam(vec4 p, vec4 g, uint index, vec4 lr) {
 
 void main() {
   uint i = gl_GlobalInvocationID.x;
-  if (i >= frame.model.x) return;
+  // More pairs than the buffers hold: some were dropped, so the gradients are
+  // incomplete. Leave everything as it was; the trainer grows the buffers.
+  if (i >= frame.model.x || totals[0] > frame.limits.x) return;
   vec4 p0 = params[i * 4u], p1 = params[i * 4u + 1u], q = params[i * 4u + 2u], p3 = params[i * 4u + 3u];
   if (p1.w < 0.5) return;  // free slot
 

@@ -10,6 +10,8 @@ layout(std430, binding = 1) readonly buffer ValuesIn { uint values_in[]; };
 layout(std430, binding = 2) writeonly buffer KeysOut { uint keys_out[]; };
 layout(std430, binding = 3) writeonly buffer ValuesOut { uint values_out[]; };
 layout(std430, binding = 4) readonly buffer Hist { uint hist[]; };
+// Items to sort: min(n, count[0]), as in radix_count.
+layout(std430, binding = 5) readonly buffer Count { uint count[]; };
 
 layout(push_constant) uniform Params {
   uint n;
@@ -29,10 +31,11 @@ void main() {
   if (lid < 16u) s_offset[lid] = hist[lid * pc.num_blocks + block];
   barrier();
 
+  uint n = min(pc.n, count[0]);
   uint base = block * WG * ITEMS;
   for (uint i = 0u; i < ITEMS; ++i) {
     uint idx = base + i * WG + lid;
-    bool valid = idx < pc.n;
+    bool valid = idx < n;
     uint key = valid ? keys_in[idx] : 0u;
     uint digit = (key >> pc.shift) & 15u;
     uint comp = digit >> 2u;

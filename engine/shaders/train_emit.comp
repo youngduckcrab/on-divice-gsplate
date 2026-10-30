@@ -26,7 +26,8 @@ void main() {
   // Log depth, front to back, 16 bits.
   uint d = uint(clamp(log2(q0.z / kNear) / log2(kFar / kNear), 0.0, 1.0) * 65535.0);
   uint p = offsets[i];
-  uint end = p + tiles_touched[i];
+  // Past the pair capacity the step is skipped (train_step); write nothing there.
+  uint end = min(p + tiles_touched[i], frame.limits.x);
   uint wanted = 0u;
   ivec2 rows = footprint_rows(q0.xy, footprint.xyz, footprint.w, frame.image.y);
   if (rows.x <= rows.y) {

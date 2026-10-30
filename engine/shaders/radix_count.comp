@@ -6,6 +6,8 @@ layout(local_size_x = 128) in;
 
 layout(std430, binding = 0) readonly buffer Keys { uint keys[]; };
 layout(std430, binding = 1) writeonly buffer Hist { uint hist[]; };
+// Items to sort: min(n, count[0]), so the count can come from an earlier GPU pass.
+layout(std430, binding = 2) readonly buffer Count { uint count[]; };
 
 layout(push_constant) uniform Params {
   uint n;
@@ -24,10 +26,11 @@ void main() {
   if (lid < 16u) s_count[lid] = 0u;
   barrier();
 
+  uint n = min(pc.n, count[0]);
   uint base = block * WG * ITEMS;
   for (uint i = 0u; i < ITEMS; ++i) {
     uint idx = base + i * WG + lid;
-    if (idx < pc.n) atomicAdd(s_count[(keys[idx] >> pc.shift) & 15u], 1u);
+    if (idx < n) atomicAdd(s_count[(keys[idx] >> pc.shift) & 15u], 1u);
   }
   barrier();
 

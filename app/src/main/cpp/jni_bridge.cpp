@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -311,11 +312,11 @@ void write_stats(gs::JsonWriter& w, const gs::Trainer& t) {
   w.field("pruned", s.pruned);
   w.field("tile_mismatch", s.tile_mismatch);
   w.field("finished", t.finished());
+  w.field("overflow_steps", s.overflow_steps);
   w.key("timing").begin_object();
-  w.field("project_wall", s.timing.project_wall_ms);
-  w.field("project_gpu", s.timing.project_gpu_ms);
-  w.field("main_wall", s.timing.main_wall_ms);
-  w.field("main_gpu", s.timing.main_gpu_ms);
+  w.field("wall", s.timing.wall_ms);
+  w.field("gpu", s.timing.gpu_ms);
+  w.field("batch", s.timing.batch);
   w.end_object();
   w.field("reduction", t.reduction());
   w.key("retunes").begin_array();
@@ -421,10 +422,12 @@ Java_com_ondevice_gsplat_NativeTrainer_step(JNIEnv* env, jobject /*this*/, jint 
   return to_jstring(env, with_trainer([&](TrainSession& s) {
     const auto t0 = Clock::now();
     int done = 0;
-    for (; done < count && !s.trainer->finished(); ++done) {
-      // Profile the first step of the batch only.
-      s.trainer->step(profile == JNI_TRUE && done == 0);
+    if (profile == JNI_TRUE && !s.trainer->finished()) {
+      s.trainer->step(true);  // timed pass by pass, on its own
+      done = 1;
     }
+    // The rest in batches of up to kBatch steps per GPU submission.
+    done += int(s.trainer->steps(uint32_t(std::max(count - done, 0))));
     gs::JsonWriter w;
     w.begin_object();
     w.field("ok", true);

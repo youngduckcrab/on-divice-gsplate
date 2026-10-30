@@ -67,6 +67,8 @@ set(GS_SHADERS
   probe_sg_ballot.comp
   train_backward_serial.comp
   train_backward_cut.comp
+  train_backward_bucket.comp
+  train_backward_bucket2.comp
   train_backward_cut2.comp
   train_backward_sg1.comp
   train_backward_sg4.comp

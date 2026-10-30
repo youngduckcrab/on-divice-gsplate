@@ -12,6 +12,8 @@
 #include "shaders/scan_add.h"
 #include "shaders/scan_local.h"
 #include "shaders/train_backward.h"
+#include "shaders/train_backward_bucket.h"
+#include "shaders/train_backward_bucket2.h"
 #include "shaders/train_backward_cut.h"
 #include "shaders/train_backward_cut2.h"
 #include "shaders/train_backward_scalar.h"
@@ -44,6 +46,7 @@ struct Trainer::FrameData {
   float bias[4];
   float densify0[4];
   float densify1[4];
+  uint32_t limits[4];
 };
 
 namespace {
@@ -52,9 +55,12 @@ constexpr float kBeta1 = 0.9f;
 constexpr float kBeta2 = 0.999f;
 constexpr float kEpsilon = 1e-15f;
 constexpr uint32_t kFlagMaskedTarget = 1;
+constexpr uint32_t kFlagBucketState = 2;
+constexpr uint32_t kBucketLanes = 32;   // splats per bucket (train_backward_bucket.comp)
+constexpr uint32_t kBucketGroups = 8;   // buckets per workgroup
 constexpr uint32_t kScanBlock = 1024;
 constexpr uint32_t kPairGradBytes = 48;
-constexpr uint32_t kBackwardBindings = 9;  // the variants use up to 9 (serial_cut reads tile counts)
+constexpr uint32_t kBackwardBindings = 12;  // the variants use up to 12 (bucket reads its state)
 
 struct ScanPush {
   uint32_t count;
@@ -132,9 +138,9 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
   scan_blocks_ = make("radix_scan", shaders::radix_scan, 1, sizeof(uint32_t));
   scan_add_ = make("scan_add", shaders::scan_add, 4, sizeof(ScanPush));
   emit_ = make("train_emit", shaders::train_emit, 9, 0);
-  ranges_ = make("train_ranges", shaders::train_ranges, 2, sizeof(uint32_t));
-  forward_ = make("train_forward", shaders::train_forward, 11, 0);
-  step_ = make("train_step", shaders::train_step, 12, 0);
+  ranges_ = make("train_ranges", shaders::train_ranges, 3, sizeof(uint32_t));
+  forward_ = make("train_forward", shaders::train_forward, 14, 0);
+  step_ = make("train_step", shaders::train_step, 13, 0);
   densify_mark_ = make("train_densify_mark", shaders::train_densify_mark, 11, 0);
   densify_spawn_ = make("train_densify_spawn", shaders::train_densify_spawn, 11, sizeof(uint32_t));
   reset_opacity_ = make("train_reset_opacity", shaders::train_reset_opacity, 4, sizeof(float));
@@ -163,6 +169,8 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
                               {Reduction::SubgroupScalar, "subgroup_scalar", shaders::train_backward_scalar, true},
                               {Reduction::SubgroupLane4, "subgroup_lane4", shaders::train_backward_sg4, true},
                               {Reduction::SubgroupLane1, "subgroup_lane1", shaders::train_backward_sg1, true},
+                              {Reduction::Bucket, "bucket", shaders::train_backward_bucket, false},
+                              {Reduction::Bucket2, "bucket2", shaders::train_backward_bucket2, false},
                               {Reduction::SerialCut2, "serial_cut2", shaders::train_backward_cut2, false},
                               {Reduction::SerialCut, "serial_cut", shaders::train_backward_cut, false},
                               {Reduction::Serial, "serial", shaders::train_backward_serial, false},
@@ -187,6 +195,7 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
     }
     Backward b;
     b.name = v.name;
+    b.bucket = v.reduction == Reduction::Bucket || v.reduction == Reduction::Bucket2;
     b.push[0] = v.subgroup ? batch : 32;
     b.push[1] = max_subgroups;
     if (v.subgroup) {
@@ -216,6 +225,10 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
   for (Reduction r : options_.alternatives) {
     if (r != Reduction::Auto) add_backward(*variant(r));
   }
+  // The bucket variant needs memory per pair; keep another for when it does not fit.
+  if (std::none_of(backwards_.begin(), backwards_.end(), [](const Backward& b) { return !b.bucket; })) {
+    add_backward(*variant(Reduction::SerialCut));
+  }
   if (!failures.empty()) {
     std::string message = "학습 셰이더를 만들 수 없음:";
     for (const std::string& f : failures) message += " " + f;
@@ -230,7 +243,15 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
   const uint64_t sh_bytes = std::max<uint64_t>(cap * sh_stride_ * 4, 16);
   const uint64_t pixels = uint64_t(width_) * height_;
   const uint64_t tiles = uint64_t(tiles_x_) * tiles_y_;
-  frame_ = ctx.create_buffer(sizeof(FrameData), MemoryKind::Upload);
+  for (uint32_t i = 0; i < kBatch; ++i) {
+    frames_.push_back(ctx.create_buffer(sizeof(FrameData), MemoryKind::Upload));
+    targets_.push_back(ctx.create_buffer(pixels * 4, MemoryKind::Upload));
+    readback_smalls_.push_back(ctx.create_buffer(16, MemoryKind::Readback));
+    readback_losses_.push_back(ctx.create_buffer(tiles * 16, MemoryKind::Readback));
+  }
+  // Persistent descriptor sets: per batch slot about 16 pipelines (and one
+  // per backward variant), up to 14 buffers each.
+  set_pool_ = ctx.create_descriptor_pool(64 + kBatch * 32, 512 + kBatch * 384);
   params_ = ctx.create_buffer(cap * 64, MemoryKind::Device);
   sh_ = ctx.create_buffer(sh_bytes, MemoryKind::Device);
   m_params_ = ctx.create_buffer(cap * 64, MemoryKind::Device);
@@ -247,16 +268,14 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
   mismatch_ = ctx.create_buffer(16, MemoryKind::Device);
   block_sums_ = ctx.create_buffer(std::max<uint64_t>(div_up(cap, kScanBlock), 1) * 4, MemoryKind::Device);
   totals_ = ctx.create_buffer(16, MemoryKind::Device);
-  target_ = ctx.create_buffer(pixels * 4, MemoryKind::Upload);
   pixel_grad_ = ctx.create_buffer(pixels * 16, MemoryKind::Device);
   pixel_count_ = ctx.create_buffer(pixels * 4, MemoryKind::Device);
   image_ = ctx.create_buffer(pixels * 4, MemoryKind::Device);
   ranges_buf_ = ctx.create_buffer((tiles + 1) * 8, MemoryKind::Device);  // + the tile emit pads into
   tile_loss_ = ctx.create_buffer(tiles * 16, MemoryKind::Device);
   tile_count_ = ctx.create_buffer(tiles * 4, MemoryKind::Device);
-  readback_small_ = ctx.create_buffer(16, MemoryKind::Readback);
+  pixel_dot_ = ctx.create_buffer(pixels * 4, MemoryKind::Device);
   readback_image_ = ctx.create_buffer(pixels * 4, MemoryKind::Readback);
-  readback_loss_ = ctx.create_buffer(tiles * 16, MemoryKind::Readback);
 
   // Initial parameters; unused slots stay zero (free).
   slots_ = initial.count;
@@ -292,9 +311,17 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
   stats_.gaussians = alive_;
 }
 
-Trainer::~Trainer() = default;
+Trainer::~Trainer() {
+  if (set_pool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(ctx_.device(), set_pool_, nullptr);
+}
 
-void Trainer::write_frame(const Camera& camera, const float background[3], bool masked_target, uint32_t sh_degree) {
+uint32_t Trainer::sh_degree_at(uint32_t step) const {
+  return std::min<uint32_t>(options_.sh_degree, options_.sh_degree_interval > 0 ? step / options_.sh_degree_interval
+                                                                              : options_.sh_degree);
+}
+
+void Trainer::write_frame(uint32_t slot, const Camera& camera, const float background[3], bool masked_target,
+                          uint32_t step, bool bucket_state) {
   FrameData f{};
   for (int r = 0; r < 3; ++r) {
     for (int c = 0; c < 3; ++c) f.rot[r][c] = camera.rotation[r * 3 + c];
@@ -310,13 +337,13 @@ void Trainer::write_frame(const Camera& camera, const float background[3], bool 
   f.image[2] = tiles_x_;
   f.image[3] = tiles_y_;
   f.model[0] = slots_;
-  f.model[1] = sh_degree;
+  f.model[1] = sh_degree_at(step);
   f.model[2] = sh_stride_;
-  f.model[3] = masked_target ? kFlagMaskedTarget : 0;
+  f.model[3] = (masked_target ? kFlagMaskedTarget : 0) | (bucket_state ? kFlagBucketState : 0);
   for (int c = 0; c < 3; ++c) f.background[c] = background[c];
   f.background[3] = 1.0f / (3.0f * float(width_) * float(height_));
 
-  const float t = options_.iterations > 0 ? std::min(1.0f, float(stats_.step) / float(options_.iterations)) : 1.0f;
+  const float t = options_.iterations > 0 ? std::min(1.0f, float(step) / float(options_.iterations)) : 1.0f;
   float lr_pos = options_.lr_position;
   if (lr_pos > 0.0f && options_.lr_position_final > 0.0f) {
     lr_pos = std::exp(std::log(lr_pos) * (1.0f - t) + std::log(options_.lr_position_final) * t);
@@ -330,223 +357,402 @@ void Trainer::write_frame(const Camera& camera, const float background[3], bool 
   f.adam[0] = kBeta1;
   f.adam[1] = kBeta2;
   f.adam[2] = kEpsilon;
-  const double n = double(stats_.step) + 1.0;
+  const double n = double(step) + 1.0;
   f.bias[0] = float(1.0 / (1.0 - std::pow(double(kBeta1), n)));
   f.bias[1] = float(1.0 / (1.0 - std::pow(double(kBeta2), n)));
 
-  const bool prune_big = options_.opacity_reset_interval > 0 && stats_.step > options_.opacity_reset_interval;
+  const bool prune_big = options_.opacity_reset_interval > 0 && step > options_.opacity_reset_interval;
   f.densify0[0] = options_.densify_grad_threshold;
   f.densify0[1] = options_.percent_dense * dataset_.camera_extent;
   f.densify0[2] = options_.prune_opacity;
   f.densify0[3] = prune_big ? 0.1f * dataset_.camera_extent : 0.0f;
   f.densify1[0] = prune_big ? 20.0f : 0.0f;
-  const uint32_t seed = options_.seed * 9781u + stats_.step * 6271u;
+  const uint32_t seed = options_.seed * 9781u + step * 6271u;
   std::memcpy(&f.densify1[1], &seed, 4);
   f.densify1[2] = 1.6f;
-  std::memcpy(frame_.mapped(), &f, sizeof(f));
+  f.limits[0] = uint32_t(pair_capacity_);
+  std::memcpy(frames_[slot].mapped(), &f, sizeof(f));
+}
+
+VkDescriptorSet Trainer::bound(const ComputePipeline& pipeline, std::initializer_list<const Buffer*> buffers) {
+  auto bits = [](auto handle) {
+    uint64_t v = 0;
+    std::memcpy(&v, &handle, sizeof(handle));
+    return v;
+  };
+  std::vector<uint64_t> key{bits(pipeline.set_layout())};
+  for (const Buffer* b : buffers) key.push_back(bits(b->handle()));
+  auto it = sets_.find(key);
+  if (it != sets_.end()) return it->second;
+  VkDescriptorSet set = ctx_.allocate_set(set_pool_, pipeline.set_layout(), buffers);
+  sets_.emplace(std::move(key), set);
+  return set;
+}
+
+void Trainer::kernel(VkCommandBuffer cmd, const ComputePipeline& pipeline, std::initializer_list<const Buffer*> buffers,
+                     uint32_t groups_x, uint32_t groups_y, const void* push, uint32_t push_size) {
+  ctx_.dispatch(cmd, pipeline, bound(pipeline, buffers), push, push_size, groups_x, groups_y);
+}
+
+void Trainer::reset_sets() {
+  GS_VK_CHECK(vkResetDescriptorPool(ctx_.device(), set_pool_, 0));
+  sets_.clear();
+  sort_bound_ = false;
 }
 
 void Trainer::record_scan(VkCommandBuffer cmd, const Buffer& values, const Buffer& prefix, uint32_t count,
                           uint32_t total_index) {
   const uint32_t blocks = div_up(count, kScanBlock);
   ScanPush push{count, total_index};
-  ctx_.dispatch(cmd, scan_local_, {&values, &prefix, &block_sums_, &totals_}, push, blocks);
+  kernel(cmd, scan_local_, {&values, &prefix, &block_sums_, &totals_}, blocks, 1, &push, sizeof(push));
   VkContext::barrier(cmd);
-  ctx_.dispatch(cmd, scan_blocks_, {&block_sums_}, blocks, 1);
+  kernel(cmd, scan_blocks_, {&block_sums_}, 1, 1, &blocks, sizeof(blocks));
   VkContext::barrier(cmd);
-  ctx_.dispatch(cmd, scan_add_, {&values, &prefix, &block_sums_, &totals_}, push, blocks);
+  kernel(cmd, scan_add_, {&values, &prefix, &block_sums_, &totals_}, blocks, 1, &push, sizeof(push));
   VkContext::barrier(cmd);
 }
 
-void Trainer::ensure_pair_capacity(uint64_t pairs) {
-  if (pairs <= pair_capacity_) return;
-  if (pairs > max_pairs_) {
-    throw std::runtime_error("타일-가우시안 쌍이 GPU 버퍼 한도를 넘음 (" + std::to_string(pairs) + ")");
+void Trainer::reserve_pairs(uint64_t expected) {
+  // Views differ in pair count, so keep headroom over the largest seen.
+  const uint64_t wanted = expected + expected / 8;
+  if (wanted <= pair_capacity_) return;
+  if (expected > max_pairs_) {
+    throw std::runtime_error("타일-가우시안 쌍이 GPU 버퍼 한도를 넘음 (" + std::to_string(expected) + ")");
   }
-  const uint64_t n = std::min<uint64_t>(max_pairs_, std::max<uint64_t>(pairs + pairs / 4, 1 << 16));
+  const uint64_t n =
+      std::min<uint64_t>(max_pairs_, std::max<uint64_t>(wanted + wanted / 4, options_.min_pair_capacity));
+  reset_sets();  // the sets point at the buffers replaced below
   keys_ = ctx_.create_buffer(n * 4, MemoryKind::Device);
   values_ = ctx_.create_buffer(n * 4, MemoryKind::Device);
   pair_gaussian_ = ctx_.create_buffer(n * 4, MemoryKind::Device);
   pair_grads_ = ctx_.create_buffer(n * kPairGradBytes, MemoryKind::Device);
   sort_->reserve(static_cast<uint32_t>(n));
   pair_capacity_ = n;
+  // Bucket state: every tile's buckets after the first fit below n / 32 + tiles + 1.
+  const uint64_t buckets = n / kBucketLanes + uint64_t(tiles_x_) * tiles_y_ + 1;
+  const uint64_t state_bytes = buckets * kTileSize * kTileSize * 16;
+  bucket_fits_ = state_bytes <= ctx_.info().properties.limits.maxStorageBufferRange;
+  bucket_state_ = ctx_.create_buffer(bucket_fits_ ? state_bytes : 16, MemoryKind::Device);
+  bucket_list_ = ctx_.create_buffer((buckets + 1) * 4, MemoryKind::Device);
 }
 
-void Trainer::run_view(const Camera& camera, const uint8_t* target, const float background[3], bool masked_target,
-                       bool train, bool profile, bool retune) {
-  const uint32_t degree =
-      std::min<uint32_t>(options_.sh_degree, options_.sh_degree_interval > 0 ? stats_.step / options_.sh_degree_interval
-                                                                             : options_.sh_degree);
-  write_frame(camera, background, masked_target, degree);
-  stats_.sh_degree = int(degree);
-  if (target != nullptr) std::memcpy(target_.mapped(), target, size_t(width_) * height_ * 4);
+size_t Trainer::backward_to_run() const {
+  if (!backwards_[active_].bucket || bucket_fits_) return active_;
+  for (size_t v = 0; v < backwards_.size(); ++v) {
+    if (!backwards_[v].bucket) return v;
+  }
+  return active_;
+}
 
-  // Phase 1: project and count pairs.
-  const RunTiming project_time = ctx_.run([&](VkCommandBuffer cmd) {
-    if (slots_ > 0) {
-      dispatch_kernel(ctx_, cmd, project_, {&frame_, &params_, &sh_, &projected_, &tiles_}, div_up(slots_, 128));
-      VkContext::barrier(cmd);
-      record_scan(cmd, tiles_, offsets_, slots_, 0);
-    } else {
-      vkCmdFillBuffer(cmd, totals_.handle(), 0, 16, 0);
-      VkContext::barrier(cmd);
-    }
-    VkBufferCopy region{0, 0, 4};
-    vkCmdCopyBuffer(cmd, totals_.handle(), readback_small_.handle(), 1, &region);
-    VkBufferCopy mismatch{0, 4, 4};
-    vkCmdCopyBuffer(cmd, mismatch_.handle(), readback_small_.handle(), 1, &mismatch);
-    VkContext::barrier_to_host(cmd);
-  });
-  uint32_t pairs = 0;
-  std::memcpy(&pairs, readback_small_.mapped(), 4);
-  std::memcpy(&stats_.tile_mismatch, static_cast<const uint8_t*>(readback_small_.mapped()) + 4, 4);
-  ensure_pair_capacity(std::max<uint32_t>(pairs, 1));
-  stats_.pairs = pairs;
+bool Trainer::needs_bucket_state(bool train, bool retune) const {
+  if (!train || !bucket_fits_) return false;
+  if (backwards_[backward_to_run()].bucket) return true;
+  return retune && std::any_of(backwards_.begin(), backwards_.end(), [](const Backward& b) { return b.bucket; });
+}
 
-  // Phase 2: sort, rasterise, and (training) back-propagate and step.
+void Trainer::record_project(VkCommandBuffer cmd, uint32_t slot) {
+  if (slots_ > 0) {
+    kernel(cmd, project_, {&frames_[slot], &params_, &sh_, &projected_, &tiles_}, div_up(slots_, 128));
+    VkContext::barrier(cmd);
+    record_scan(cmd, tiles_, offsets_, slots_, 0);
+  } else {
+    vkCmdFillBuffer(cmd, totals_.handle(), 0, 16, 0);
+    VkContext::barrier(cmd);
+  }
+}
+
+void Trainer::record_sort(VkCommandBuffer cmd, uint32_t slot) {
+  // Sized for the capacity: the kernels read the actual count from totals_.
+  const uint32_t capacity = uint32_t(pair_capacity_);
   const uint32_t key_bits = 16 + bits_for(tiles_x_ * tiles_y_ + 1);  // + the padding tile
-  auto sort = [&](VkCommandBuffer cmd) {
-    vkCmdFillBuffer(cmd, ranges_buf_.handle(), 0, VK_WHOLE_SIZE, 0);
-    if (pairs > 0) {
-      dispatch_kernel(ctx_, cmd, emit_,
-                      {&frame_, &projected_, &tiles_, &offsets_, &keys_, &values_, &pair_gaussian_, &pair_grads_,
-                       &mismatch_},
-                      div_up(slots_, 128));
-      VkContext::barrier(cmd);
-      sort_->record(cmd, keys_, values_, pairs, key_bits);
-      ctx_.dispatch(cmd, ranges_, {&keys_, &ranges_buf_}, pairs, div_up(pairs, 256));
+  vkCmdFillBuffer(cmd, ranges_buf_.handle(), 0, VK_WHOLE_SIZE, 0);
+  if (slots_ > 0) {
+    kernel(cmd, emit_,
+           {&frames_[slot], &projected_, &tiles_, &offsets_, &keys_, &values_, &pair_gaussian_, &pair_grads_,
+            &mismatch_},
+           div_up(slots_, 128));
+    VkContext::barrier(cmd);
+    if (!sort_bound_) {
+      sort_binding_ = sort_->bind(set_pool_, keys_, values_, &totals_);
+      sort_bound_ = true;
     }
-    VkContext::barrier(cmd);
-  };
-  auto rasterize = [&](VkCommandBuffer cmd) {
-    dispatch_kernel(ctx_, cmd, forward_,
-                    {&frame_, &projected_, &ranges_buf_, &values_, &pair_gaussian_, &target_, &pixel_grad_,
-                     &pixel_count_, &image_, &tile_loss_, &tile_count_},
-                    tiles_x_, tiles_y_);
-    VkContext::barrier(cmd);
-    VkBufferCopy loss{0, 0, tile_loss_.size()};
-    vkCmdCopyBuffer(cmd, tile_loss_.handle(), readback_loss_.handle(), 1, &loss);
-    VkContext::barrier_to_host(cmd);
-  };
-  auto backward_with = [&](VkCommandBuffer cmd, const Backward& b) {
-    ctx_.dispatch(cmd, b.pipeline,
-                  {&frame_, &projected_, &ranges_buf_, &values_, &pair_gaussian_, &pixel_grad_, &pixel_count_,
-                   &pair_grads_, &tile_count_},
-                  b.push, tiles_x_, tiles_y_);
-    VkContext::barrier(cmd);
-  };
-  auto backward = [&](VkCommandBuffer cmd) { backward_with(cmd, backwards_[active_]); };
-  auto optimize = [&](VkCommandBuffer cmd) {
-    if (slots_ == 0) return;
-    dispatch_kernel(ctx_, cmd, step_,
-                    {&frame_, &params_, &sh_, &m_params_, &v_params_, &m_sh_, &v_sh_, &tiles_, &offsets_,
-                     &pair_grads_, &projected_, &stats_buf_},
-                    div_up(slots_, 128));
-    VkContext::barrier(cmd);
-  };
-
-  if (!profile && !retune) {
-    const RunTiming main_time = ctx_.run([&](VkCommandBuffer cmd) {
-      sort(cmd);
-      rasterize(cmd);
-      if (train) {
-        backward(cmd);
-        optimize(cmd);
-      }
-    });
-    if (train) {
-      auto ema = [](double& avg, double v) { avg = avg == 0.0 ? v : 0.95 * avg + 0.05 * v; };
-      ema(stats_.timing.project_wall_ms, project_time.cpu_ms);
-      ema(stats_.timing.project_gpu_ms, std::max(project_time.gpu_ms, 0.0));
-      ema(stats_.timing.main_wall_ms, main_time.cpu_ms);
-      ema(stats_.timing.main_gpu_ms, std::max(main_time.gpu_ms, 0.0));
-    }
-    return;
+    sort_->record(cmd, sort_binding_, keys_, values_, capacity, key_bits);
+    kernel(cmd, ranges_, {&keys_, &ranges_buf_, &totals_}, div_up(capacity, 256), 1, &capacity, sizeof(capacity));
   }
-  profile_ = PassTimes{};
-  profile_.project = project_time.best_ms();
-  profile_.sort = ctx_.run(sort).best_ms();
-  profile_.rasterize = ctx_.run(rasterize).best_ms();
-  if (train && retune && backwards_.size() > 1) {
-    // Each variant twice, in mirrored order (A B C C B A), so a clock change
-    // during the measurement favours none. The backward pass only writes
-    // pair_grads, and every variant writes the same values.
-    const size_t n = backwards_.size();
-    std::vector<double> ms(n, 0.0);
-    for (size_t k = 0; k < 2 * n; ++k) {
-      const size_t v = k < n ? k : 2 * n - 1 - k;
-      ms[v] += 0.5 * ctx_.run([&](VkCommandBuffer cmd) { backward_with(cmd, backwards_[v]); }).best_ms();
-    }
-    RetuneResult r;
-    r.step = stats_.step + 1;
-    for (size_t v = 0; v < n; ++v) {
-      r.ms.emplace_back(backwards_[v].name, ms[v]);
-      if (ms[v] < ms[active_]) active_ = v;
-    }
-    r.chosen = backwards_[active_].name;
-    retunes_.push_back(std::move(r));
-    profile_.backward = ms[active_];
-    profile_.optimize = ctx_.run(optimize).best_ms();
-  } else if (train) {
-    profile_.backward = ctx_.run(backward).best_ms();
-    profile_.optimize = ctx_.run(optimize).best_ms();
-  }
-  profile_.valid = true;
+  VkContext::barrier(cmd);
 }
 
-std::pair<double, double> Trainer::read_losses() {
-  const float* v = static_cast<const float*>(readback_loss_.mapped());
+void Trainer::record_rasterize(VkCommandBuffer cmd, uint32_t slot) {
+  vkCmdFillBuffer(cmd, bucket_list_.handle(), 0, 4, 0);
+  VkContext::barrier(cmd);
+  kernel(cmd, forward_,
+         {&frames_[slot], &projected_, &ranges_buf_, &values_, &pair_gaussian_, &targets_[slot], &pixel_grad_,
+          &pixel_count_, &image_, &tile_loss_, &tile_count_, &bucket_state_, &bucket_list_, &pixel_dot_},
+         tiles_x_, tiles_y_);
+  VkContext::barrier(cmd);
+  const VkBufferCopy loss{0, 0, tile_loss_.size()};
+  vkCmdCopyBuffer(cmd, tile_loss_.handle(), readback_losses_[slot].handle(), 1, &loss);
+  const VkBufferCopy pairs{0, 0, 4}, mismatch{0, 4, 4};
+  vkCmdCopyBuffer(cmd, totals_.handle(), readback_smalls_[slot].handle(), 1, &pairs);
+  vkCmdCopyBuffer(cmd, mismatch_.handle(), readback_smalls_[slot].handle(), 1, &mismatch);
+}
+
+void Trainer::record_backward(VkCommandBuffer cmd, uint32_t slot, const Backward& b) {
+  // Bucket: enough workgroups for every bucket there can be; the rest exit.
+  const uint32_t groups_x =
+      b.bucket ? div_up(pair_capacity_ / kBucketLanes + tiles_x_ * tiles_y_ + 1, kBucketGroups) : tiles_x_;
+  kernel(cmd, b.pipeline,
+         {&frames_[slot], &projected_, &ranges_buf_, &values_, &pair_gaussian_, &pixel_grad_, &pixel_count_,
+          &pair_grads_, &tile_count_, &bucket_state_, &bucket_list_, &pixel_dot_},
+         groups_x, b.bucket ? 1 : tiles_y_, b.push, sizeof(b.push));
+  VkContext::barrier(cmd);
+}
+
+void Trainer::record_optimize(VkCommandBuffer cmd, uint32_t slot) {
+  if (slots_ == 0) return;
+  kernel(cmd, step_,
+         {&frames_[slot], &params_, &sh_, &m_params_, &v_params_, &m_sh_, &v_sh_, &tiles_, &offsets_, &pair_grads_,
+          &projected_, &stats_buf_, &totals_},
+         div_up(slots_, 128));
+  VkContext::barrier(cmd);
+}
+
+bool Trainer::read_slot(uint32_t slot) {
+  uint32_t small[2];
+  std::memcpy(small, readback_smalls_[slot].mapped(), sizeof(small));
+  stats_.pairs = small[0];
+  stats_.tile_mismatch = small[1];
+  max_pairs_seen_ = std::max<uint64_t>(max_pairs_seen_, small[0]);
+  const float* v = static_cast<const float*>(readback_losses_[slot].mapped());
   double abs_sum = 0.0, sq_sum = 0.0;
   for (uint32_t t = 0; t < tiles_x_ * tiles_y_; ++t) {
     abs_sum += v[t * 4];
     sq_sum += v[t * 4 + 1];
   }
-  return {abs_sum, sq_sum};
+  last_losses_[0] = abs_sum;
+  last_losses_[1] = sq_sum;
+  return small[0] > pair_capacity_;
 }
 
-void Trainer::step(bool profile) {
+void Trainer::run_view(const Camera& camera, const uint8_t* target, const float background[3], bool masked_target,
+                       bool train, bool profile, bool retune) {
+  stats_.sh_degree = int(sh_degree_at(stats_.step));
+  if (target != nullptr) std::memcpy(targets_[0].mapped(), target, size_t(width_) * height_ * 4);
+  for (;;) {
+    // Before the first count, guess: a few tiles per gaussian.
+    reserve_pairs(max_pairs_seen_ > 0 ? max_pairs_seen_ : uint64_t(slots_) * 4);
+    write_frame(0, camera, background, masked_target, stats_.step, needs_bucket_state(train, retune));
+
+    if (!profile && !retune) {
+      // Everything in one submission; the passes read the pair count on the GPU.
+      const RunTiming time = ctx_.run([&](VkCommandBuffer cmd) {
+        record_project(cmd, 0);
+        record_sort(cmd, 0);
+        record_rasterize(cmd, 0);
+        if (train) {
+          record_backward(cmd, 0, backwards_[backward_to_run()]);
+          record_optimize(cmd, 0);
+        }
+        VkContext::barrier_to_host(cmd);
+      });
+      // Too many pairs: the step left the model alone; grow and run it again.
+      if (read_slot(0)) continue;
+      if (train) {
+        auto ema = [](double& avg, double v) { avg = avg == 0.0 ? v : 0.95 * avg + 0.05 * v; };
+        ema(stats_.timing.wall_ms, time.cpu_ms);
+        ema(stats_.timing.gpu_ms, std::max(time.gpu_ms, 0.0));
+        ema(stats_.timing.batch, 1.0);
+      }
+      return;
+    }
+
+    // Profiling and retuning time the passes one submission each, on the full
+    // pair count: read it first.
+    const RunTiming project_time = ctx_.run([&](VkCommandBuffer cmd) {
+      record_project(cmd, 0);
+      const VkBufferCopy region{0, 0, 4};
+      vkCmdCopyBuffer(cmd, totals_.handle(), readback_smalls_[0].handle(), 1, &region);
+      VkContext::barrier_to_host(cmd);
+    });
+    uint32_t pairs = 0;
+    std::memcpy(&pairs, readback_smalls_[0].mapped(), 4);
+    if (pairs > pair_capacity_) {
+      max_pairs_seen_ = std::max<uint64_t>(max_pairs_seen_, pairs);
+      continue;
+    }
+    profile_ = PassTimes{};
+    profile_.project = project_time.best_ms();
+    profile_.sort = ctx_.run([&](VkCommandBuffer cmd) { record_sort(cmd, 0); }).best_ms();
+    profile_.rasterize = ctx_.run([&](VkCommandBuffer cmd) {
+                           record_rasterize(cmd, 0);
+                           VkContext::barrier_to_host(cmd);
+                         }).best_ms();
+    auto optimize = [&](VkCommandBuffer cmd) { record_optimize(cmd, 0); };
+    if (train && retune && backwards_.size() > 1) {
+      // Each variant twice, in mirrored order (A B C C B A), so a clock change
+      // during the measurement favours none. The backward pass only writes
+      // pair_grads, and every variant writes the same values.
+      const size_t n = backwards_.size();
+      std::vector<double> ms(n, 0.0);
+      for (size_t k = 0; k < 2 * n; ++k) {
+        const size_t v = k < n ? k : 2 * n - 1 - k;
+        if (backwards_[v].bucket && !bucket_fits_) continue;  // no state this step
+        ms[v] += 0.5 * ctx_.run([&](VkCommandBuffer cmd) { record_backward(cmd, 0, backwards_[v]); }).best_ms();
+      }
+      for (size_t v = 0; v < n; ++v) {
+        if (backwards_[v].bucket && !bucket_fits_) ms[v] = 1e30;
+      }
+      RetuneResult r;
+      r.step = stats_.step + 1;
+      for (size_t v = 0; v < n; ++v) {
+        r.ms.emplace_back(backwards_[v].name, ms[v]);
+        if (ms[v] < ms[active_]) active_ = v;
+      }
+      r.chosen = backwards_[active_].name;
+      retunes_.push_back(std::move(r));
+      profile_.backward = ms[active_];
+      profile_.optimize = ctx_.run(optimize).best_ms();
+    } else if (train) {
+      profile_.backward =
+          ctx_.run([&](VkCommandBuffer cmd) { record_backward(cmd, 0, backwards_[backward_to_run()]); }).best_ms();
+      profile_.optimize = ctx_.run(optimize).best_ms();
+    }
+    profile_.valid = true;
+    read_slot(0);
+    return;
+  }
+}
+
+void Trainer::next_view(size_t& frame, float background[3]) {
   if (order_pos_ >= order_.size()) {
     order_ = train_frames_;
     std::shuffle(order_.begin(), order_.end(), rng_);
     order_pos_ = 0;
   }
-  float bg[3];
   if (options_.random_background) {
     std::uniform_real_distribution<float> u(0.0f, 1.0f);
-    for (float& c : bg) c = u(rng_);
+    for (int c = 0; c < 3; ++c) background[c] = u(rng_);
   } else {
-    std::copy(options_.background, options_.background + 3, bg);
+    std::copy(options_.background, options_.background + 3, background);
   }
-  step_on(order_[order_pos_++], bg, profile);
+  frame = order_[order_pos_++];
 }
 
-void Trainer::step_on(size_t frame_index, const float background[3], bool profile) {
-  const auto start = std::chrono::steady_clock::now();
-  const DatasetFrame& frame = dataset_.frames.at(frame_index);
-  // Steps are numbered from 1; time the backward variants on the scheduled ones.
-  const uint32_t next = stats_.step + 1;
-  const bool retune = backwards_.size() > 1 &&
-                      (next == options_.retune_first ||
-                       (options_.retune_interval > 0 && next % options_.retune_interval == 0));
-  run_view(dataset_camera(dataset_, frame), frame.rgba.data(), background, options_.masked, true, profile, retune);
-  const auto [abs_sum, sq_sum] = read_losses();
-  const double n = 3.0 * width_ * height_;
-  stats_.l1 = abs_sum / n;
-  stats_.psnr = -10.0 * std::log10(std::max(sq_sum / n, 1e-12));
-  ++stats_.step;
+void Trainer::step(bool profile) {
+  size_t frame = 0;
+  float bg[3];
+  next_view(frame, bg);
+  step_on(frame, bg, profile);
+}
 
+bool Trainer::housekeeping_after(uint32_t t) const {
+  if (t >= options_.densify_until) return false;
+  return (t > options_.densify_from && options_.densify_interval > 0 && t % options_.densify_interval == 0) ||
+         (options_.opacity_reset_interval > 0 && t % options_.opacity_reset_interval == 0);
+}
+
+void Trainer::after_step() {
   const uint32_t t = stats_.step;
   if (t < options_.densify_until) {
     if (t > options_.densify_from && options_.densify_interval > 0 && t % options_.densify_interval == 0) densify();
     if (options_.opacity_reset_interval > 0 && t % options_.opacity_reset_interval == 0) reset_opacity();
   }
+}
+
+void Trainer::step_on(size_t frame_index, const float background[3], bool profile) {
+  const auto start = std::chrono::steady_clock::now();
+  const DatasetFrame& frame = dataset_.frames.at(frame_index);
+  run_view(dataset_camera(dataset_, frame), frame.rgba.data(), background, options_.masked, true, profile,
+           retune_due(stats_.step + 1));
+  last_slot_ = 0;
+  const double n = 3.0 * width_ * height_;
+  stats_.l1 = last_losses_[0] / n;
+  stats_.psnr = -10.0 * std::log10(std::max(last_losses_[1] / n, 1e-12));
+  ++stats_.step;
+  after_step();
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   stats_.step_ms = stats_.step_ms == 0.0 ? ms : 0.9 * stats_.step_ms + 0.1 * ms;
 }
 
+bool Trainer::retune_due(uint32_t s) const {
+  // Not on the last step: nothing would run with the choice.
+  return backwards_.size() > 1 && s < options_.iterations &&
+         (s == options_.retune_first || (options_.retune_interval > 0 && s % options_.retune_interval == 0));
+}
+
+uint32_t Trainer::steps(uint32_t count) {
+  uint32_t done = 0;
+  while (done < count && !finished()) {
+    // Singly: the first step (no pair count yet) and retuning steps.
+    if (max_pairs_seen_ == 0 || retune_due(stats_.step + 1)) {
+      step();
+      ++done;
+      continue;
+    }
+    uint32_t n = 0;
+    for (;;) {
+      ++n;
+      const uint32_t s = stats_.step + n;
+      if (n == kBatch || done + n == count || s >= options_.iterations || housekeeping_after(s) ||
+          retune_due(s + 1)) {
+        break;
+      }
+    }
+    run_batch(n);
+    done += n;
+  }
+  return done;
+}
+
+void Trainer::run_batch(uint32_t count) {
+  const auto start = std::chrono::steady_clock::now();
+  reserve_pairs(max_pairs_seen_);
+  const size_t backward = backward_to_run();
+  const bool buckets = needs_bucket_state(true, false);
+  for (uint32_t s = 0; s < count; ++s) {
+    size_t frame = 0;
+    float bg[3];
+    next_view(frame, bg);
+    const DatasetFrame& f = dataset_.frames.at(frame);
+    write_frame(s, dataset_camera(dataset_, f), bg, options_.masked, stats_.step + s, buckets);
+    std::memcpy(targets_[s].mapped(), f.rgba.data(), size_t(width_) * height_ * 4);
+  }
+  const RunTiming time = ctx_.run([&](VkCommandBuffer cmd) {
+    for (uint32_t s = 0; s < count; ++s) {
+      record_project(cmd, s);
+      record_sort(cmd, s);
+      record_rasterize(cmd, s);
+      record_backward(cmd, s, backwards_[backward]);
+      record_optimize(cmd, s);
+    }
+    VkContext::barrier_to_host(cmd);
+  });
+  const double n = 3.0 * width_ * height_;
+  for (uint32_t s = 0; s < count; ++s) {
+    // A step whose pairs did not fit left the model alone; later ones went on.
+    if (read_slot(s)) ++stats_.overflow_steps;
+    stats_.l1 = last_losses_[0] / n;
+    stats_.psnr = -10.0 * std::log10(std::max(last_losses_[1] / n, 1e-12));
+    stats_.sh_degree = int(sh_degree_at(stats_.step));
+    ++stats_.step;
+  }
+  last_slot_ = count - 1;
+  after_step();  // only the last step of a batch can have any
+  // Moving averages as if each step had been timed alone.
+  const double decay = std::pow(0.95, count);
+  auto ema = [&](double& avg, double v) { avg = avg == 0.0 ? v : v + (avg - v) * decay; };
+  ema(stats_.timing.wall_ms, time.cpu_ms / count);
+  ema(stats_.timing.gpu_ms, std::max(time.gpu_ms, 0.0) / count);
+  ema(stats_.timing.batch, double(count));
+  const double ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() / count;
+  stats_.step_ms = stats_.step_ms == 0.0 ? ms : ms + (stats_.step_ms - ms) * std::pow(0.9, count);
+}
+
 void Trainer::densify() {
   // The frame data still describes the last step; refresh it for the densify thresholds.
-  FrameData* f = static_cast<FrameData*>(frame_.mapped());
+  Buffer& frame = frames_[last_slot_];
+  FrameData* f = static_cast<FrameData*>(frame.mapped());
   const bool prune_big = options_.opacity_reset_interval > 0 && stats_.step > options_.opacity_reset_interval;
   f->densify0[3] = prune_big ? 0.1f * dataset_.camera_extent : 0.0f;
   f->densify1[0] = prune_big ? 20.0f : 0.0f;
@@ -556,7 +762,7 @@ void Trainer::densify() {
   ctx_.run([&](VkCommandBuffer cmd) {
     vkCmdFillBuffer(cmd, counters_.handle(), 0, 16, 0);
     VkContext::barrier(cmd);
-    std::initializer_list<const Buffer*> buffers = {&frame_, &params_,    &sh_,    &m_params_,  &v_params_, &m_sh_,
+    std::initializer_list<const Buffer*> buffers = {&frame, &params_,    &sh_,    &m_params_,  &v_params_, &m_sh_,
                                                     &v_sh_,  &stats_buf_, &spawn_, &free_list_, &counters_};
     dispatch_kernel(ctx_, cmd, densify_mark_, buffers, div_up(slots_, 128));
     VkContext::barrier(cmd);
@@ -564,11 +770,11 @@ void Trainer::densify() {
     VkContext::barrier(cmd);
     vkCmdFillBuffer(cmd, stats_buf_.handle(), 0, VK_WHOLE_SIZE, 0);
     VkBufferCopy region{0, 0, 16};
-    vkCmdCopyBuffer(cmd, counters_.handle(), readback_small_.handle(), 1, &region);
+    vkCmdCopyBuffer(cmd, counters_.handle(), readback_smalls_[0].handle(), 1, &region);
     VkContext::barrier_to_host(cmd);
   });
   uint32_t counters[4];
-  std::memcpy(counters, readback_small_.mapped(), sizeof(counters));
+  std::memcpy(counters, readback_smalls_[0].mapped(), sizeof(counters));
   const uint32_t free_slots = counters[0], spawned = counters[1], pruned = counters[2];
   const uint32_t room = free_slots + (capacity_ - slots_);
   const uint32_t placed = std::min(spawned, room);
@@ -583,9 +789,10 @@ void Trainer::densify() {
 
 void Trainer::reset_opacity() {
   const float max_logit = logit(0.01f);
-  static_cast<FrameData*>(frame_.mapped())->model[0] = slots_;
+  Buffer& frame = frames_[last_slot_];
+  static_cast<FrameData*>(frame.mapped())->model[0] = slots_;
   ctx_.run([&](VkCommandBuffer cmd) {
-    ctx_.dispatch(cmd, reset_opacity_, {&frame_, &params_, &m_params_, &v_params_}, max_logit, div_up(slots_, 128));
+    ctx_.dispatch(cmd, reset_opacity_, {&frame, &params_, &m_params_, &v_params_}, max_logit, div_up(slots_, 128));
   });
 }
 
@@ -612,7 +819,7 @@ EvalResult Trainer::evaluate() {
   for (const DatasetFrame& frame : dataset_.frames) {
     if (!frame.holdout) continue;
     run_view(dataset_camera(dataset_, frame), frame.rgba.data(), black, options_.masked, false);
-    const auto [abs_sum, sq_sum] = read_losses();
+    const double abs_sum = last_losses_[0], sq_sum = last_losses_[1];
     psnr_sum += -10.0 * std::log10(std::max(sq_sum / n, 1e-12));
     l1_sum += abs_sum / n;
     ++result.views;

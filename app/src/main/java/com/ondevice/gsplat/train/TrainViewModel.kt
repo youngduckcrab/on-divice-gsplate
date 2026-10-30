@@ -412,8 +412,8 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
             }
             s?.optJSONObject("timing")?.let { t ->
                 appendLine(
-                    "제출별 ms/회 (벽시계/GPU): 투영 ${f1(t.optDouble("project_wall"))}/${f1(t.optDouble("project_gpu"))} · " +
-                        "본 단계 ${f1(t.optDouble("main_wall"))}/${f1(t.optDouble("main_gpu"))}",
+                    "제출 ms/회 (벽시계/GPU): ${f1(t.optDouble("wall"))}/${f1(t.optDouble("gpu"))} · " +
+                        "제출당 ${f1(t.optDouble("batch"))}회 · 쌍 버퍼 초과 ${s.optInt("overflow_steps")}회",
                 )
             }
             s?.let { retuneLines(it).forEach { line -> appendLine(line) } }

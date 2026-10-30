@@ -27,9 +27,11 @@ struct FrameData {
   vec4 bias;        // 1 / (1 - beta1^t), 1 / (1 - beta2^t), unused, unused
   vec4 densify0;    // grad threshold, clone max scale, prune min opacity, prune max world scale
   vec4 densify1;    // prune max screen radius, random seed (uint bits), split scale divisor, unused
+  uvec4 limits;     // pair capacity (more pairs: the step is skipped), unused
 };
 
 const uint kFlagMaskedTarget = 1u;  // composite the target over the background using its alpha
+const uint kFlagBucketState = 2u;   // the forward pass saves state for train_backward_bucket
 
 const uint kTile = 16u;
 const float kNear = 0.02;

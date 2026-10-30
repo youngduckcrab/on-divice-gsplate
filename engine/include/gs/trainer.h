@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <random>
 #include <string>
@@ -19,6 +20,8 @@ struct TrainOptions {
   // How the backward pass sums gradients over a tile's pixels.
   enum class Reduction {
     Auto,            // the first subgroup variant the driver accepts, else SerialCut2
+    Bucket,          // no subgroups: one thread per splat sweeping the tile's pixels, no reduction
+    Bucket2,         // the same, two pixels per step (half the barriers)
     Subgroup,        // vec4 subgroup adds (fails if unavailable)
     SubgroupScalar,  // scalar subgroup adds (fails if unavailable)
     SubgroupLane4,   // scalar adds without subgroup id/elect, 4 splats per round (fails if unavailable)
@@ -67,6 +70,8 @@ struct TrainOptions {
   std::vector<Reduction> alternatives;
   uint32_t retune_first = 20;
   uint32_t retune_interval = 500;
+  // Smallest pair buffer allocation; tests lower it to exercise overflow.
+  uint32_t min_pair_capacity = 1 << 16;
   uint32_t seed = 1;
 };
 
@@ -97,15 +102,17 @@ struct TrainStats {
   uint32_t spawned = 0;  // gaussians added by densification, in total
   uint32_t pruned = 0;   // and removed
   // Gaussians whose emitted tiles differed from the projected count, over the
-  // whole run (lags a step). Both passes compute the same footprint, so 0.
+  // whole run. Both passes compute the same footprint, so 0.
   uint32_t tile_mismatch = 0;
-  // Moving averages per training step: wall clock around each submit + wait,
-  // and GPU time from timestamps, for the projection submit and the main one.
+  // Steps in a batch whose pairs did not fit the buffers (sized from earlier
+  // steps, with headroom): their update was skipped, and the buffers grew.
+  uint32_t overflow_steps = 0;
+  // Moving averages per training step: wall clock around the submit + wait,
+  // GPU time from timestamps, and steps per submission.
   struct Timing {
-    double project_wall_ms = 0.0;
-    double project_gpu_ms = 0.0;
-    double main_wall_ms = 0.0;
-    double main_gpu_ms = 0.0;
+    double wall_ms = 0.0;
+    double gpu_ms = 0.0;
+    double batch = 0.0;
   } timing;
 };
 
@@ -137,6 +144,12 @@ class Trainer {
   // schedule. With `profile`, the passes are submitted separately and timed
   // (see last_profile()), which costs a little extra.
   void step(bool profile = false);
+  // Up to `count` steps (fewer at the end), recorded kBatch at a time into one
+  // GPU submission: the CPU waits once per batch, not twice per step. Steps
+  // before which the trainer reads results back (the first, retuning,
+  // densification) end a batch. Returns the steps run.
+  uint32_t steps(uint32_t count);
+  static constexpr uint32_t kBatch = 10;
   const PassTimes& last_profile() const { return profile_; }
   bool finished() const { return stats_.step >= options_.iterations; }
   const TrainStats& stats() const { return stats_; }
@@ -183,17 +196,51 @@ class Trainer {
 
  private:
   struct FrameData;
-  void write_frame(const Camera& camera, const float background[3], bool masked_target, uint32_t sh_degree);
+  struct Backward {
+    std::string name;
+    ComputePipeline pipeline;
+    uint32_t push[2] = {32, 4};  // batch, max subgroups
+    bool bucket = false;         // needs the forward pass's bucket state; one workgroup per 8 buckets
+  };
+  // The variant to run: the active one, unless it is the bucket variant and
+  // its state does not fit (then the first other one).
+  size_t backward_to_run() const;
+  // Per-step inputs live in slot `slot` of frames_/targets_; `step` (0-based)
+  // sets the learning-rate schedule, SH degree and seed.
+  void write_frame(uint32_t slot, const Camera& camera, const float background[3], bool masked_target,
+                   uint32_t step, bool bucket_state);
+  uint32_t sh_degree_at(uint32_t step) const;
   // Renders `camera` into image_/tile losses; with `train`, also the backward pass and Adam step.
   // With `retune`, every backward variant is timed on this step (implies profiling).
   void run_view(const Camera& camera, const uint8_t* target, const float background[3], bool masked_target,
                 bool train, bool profile = false, bool retune = false);
-  void ensure_pair_capacity(uint64_t pairs);
+  void run_batch(uint32_t count);
+  void next_view(size_t& frame, float background[3]);
+  bool housekeeping_after(uint32_t step) const;  // densification or opacity reset after this step
+  bool retune_due(uint32_t step) const;          // time the backward variants on this (1-based) step
+  void after_step();                              // runs them
+  // Pair buffers for `expected` pairs plus headroom; grows, never shrinks.
+  void reserve_pairs(uint64_t expected);
+  bool needs_bucket_state(bool train, bool retune) const;
+  // The passes of one view, reading slot `slot`.
+  void record_project(VkCommandBuffer cmd, uint32_t slot);
+  void record_sort(VkCommandBuffer cmd, uint32_t slot);
+  void record_rasterize(VkCommandBuffer cmd, uint32_t slot);  // + copies of losses and counts to the slot
+  void record_backward(VkCommandBuffer cmd, uint32_t slot, const Backward& b);
+  void record_optimize(VkCommandBuffer cmd, uint32_t slot);
   void record_scan(VkCommandBuffer cmd, const Buffer& values, const Buffer& prefix, uint32_t count,
                    uint32_t total_index);
+  // Reads slot `slot`'s pair count, tile mismatches and losses into stats;
+  // true if the pairs did not fit (the step then left the model unchanged).
+  bool read_slot(uint32_t slot);
   void densify();
   void reset_opacity();
-  std::pair<double, double> read_losses();  // sum |e|, sum e^2
+  // Descriptor sets that stay valid across submissions, cached per pipeline
+  // and buffer list; dropped when buffers are reallocated.
+  VkDescriptorSet bound(const ComputePipeline& pipeline, std::initializer_list<const Buffer*> buffers);
+  void kernel(VkCommandBuffer cmd, const ComputePipeline& pipeline, std::initializer_list<const Buffer*> buffers,
+              uint32_t groups_x, uint32_t groups_y = 1, const void* push = nullptr, uint32_t push_size = 0);
+  void reset_sets();
 
   VkContext& ctx_;
   Dataset dataset_;
@@ -202,14 +249,17 @@ class Trainer {
   PassTimes profile_;
   uint32_t width_ = 0, height_ = 0, tiles_x_ = 0, tiles_y_ = 0;
   uint32_t capacity_ = 0;
-  struct Backward {
-    std::string name;
-    ComputePipeline pipeline;
-    uint32_t push[2] = {32, 4};  // batch, max subgroups
-  };
   std::vector<Backward> backwards_;  // the requested variant, then the alternatives that compiled
   size_t active_ = 0;
   std::vector<RetuneResult> retunes_;
+  bool bucket_fits_ = true;  // bucket_state_ could be sized for the pair capacity
+  double last_losses_[2] = {0.0, 0.0};  // sum |e|, sum e^2 of the last slot read
+  uint64_t max_pairs_seen_ = 0;
+  uint32_t last_slot_ = 0;  // slot of the last step, whose frame data densify() reuses
+  VkDescriptorPool set_pool_ = VK_NULL_HANDLE;
+  std::map<std::vector<uint64_t>, VkDescriptorSet> sets_;
+  RadixSort::Binding sort_binding_;
+  bool sort_bound_ = false;
   std::string reduction_note_;
   uint32_t sh_stride_ = 0;  // floats per slot
   uint32_t slots_ = 0;
@@ -225,12 +275,15 @@ class Trainer {
   ComputePipeline densify_mark_, densify_spawn_, reset_opacity_;
   std::unique_ptr<RadixSort> sort_;
 
-  Buffer frame_;  // FrameData, host-visible
+  std::vector<Buffer> frames_;  // FrameData per batch slot, host-visible
   Buffer params_, sh_, m_params_, v_params_, m_sh_, v_sh_, stats_buf_;
   Buffer projected_, tiles_, offsets_, spawn_, free_list_, counters_, mismatch_, block_sums_, totals_;
   Buffer keys_, values_, pair_gaussian_, pair_grads_;
-  Buffer target_, pixel_grad_, pixel_count_, image_, ranges_buf_, tile_loss_, tile_count_;
-  Buffer readback_small_, readback_image_, readback_loss_;
+  std::vector<Buffer> targets_;  // per batch slot
+  Buffer pixel_grad_, pixel_count_, image_, ranges_buf_, tile_loss_, tile_count_;
+  Buffer bucket_state_, bucket_list_, pixel_dot_;
+  std::vector<Buffer> readback_smalls_, readback_losses_;  // per batch slot
+  Buffer readback_image_;
 };
 
 }  // namespace gs

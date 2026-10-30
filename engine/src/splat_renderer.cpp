@@ -134,7 +134,7 @@ SplatRenderer::SplatRenderer(VkContext& ctx, VkRenderPass render_pass)
       preprocess_(ctx.create_compute_pipeline(shaders::splat_preprocess, 6, sizeof(PreprocessParams))),
       sort_(ctx) {
   VkDevice device = ctx_.device();
-  pool_ = ctx_.create_descriptor_pool(16, 64);
+  pool_ = ctx_.create_descriptor_pool(16, 96);
 
   VkDescriptorSetLayoutBinding bindings[2] = {};
   for (uint32_t i = 0; i < 2; ++i) {

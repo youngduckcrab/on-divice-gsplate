@@ -56,13 +56,13 @@ void test_cutoff_matches_serial(gs::VkContext& ctx) {
   for (float& v : scene.opacity_logits) v += 4.0f;
   for (float& v : scene.log_scales) v += 0.7f;
   const float bg[3] = {0.1f, 0.2f, 0.3f};
-  constexpr int kVariants = 5;
+  constexpr int kVariants = 6;
   std::vector<float> grads[kVariants];
   float min_t = 1.0f;
   const gs::TrainOptions::Reduction variants[kVariants] = {
       gs::TrainOptions::Reduction::Serial, gs::TrainOptions::Reduction::SerialCut,
       gs::TrainOptions::Reduction::SerialCut2, gs::TrainOptions::Reduction::SubgroupLane4,
-      gs::TrainOptions::Reduction::SubgroupLane1};
+      gs::TrainOptions::Reduction::SubgroupLane1, gs::TrainOptions::Reduction::Bucket};
   for (int v = 0; v < kVariants; ++v) {
     gs::TrainOptions o = gs::frozen_train_options(1, false);
     o.reduction = variants[v];
@@ -82,6 +82,41 @@ void test_cutoff_matches_serial(gs::VkContext& ctx) {
   std::printf("  cutoff: min transmittance %.2g, max |grad| %.3g, max diff %.3g\n", min_t, max_abs, max_diff);
   EXPECT(min_t < 1e-3f, "test scene does not saturate (min T %.3g)", min_t);
   EXPECT(max_diff <= 1e-5 * max_abs, "serial_cut(2) gradients differ from serial by %.3g", max_diff);
+}
+
+void test_bucket_long_lists(gs::VkContext& ctx) {
+  // Many faint overlapping splats: tiles hold several buckets of 32, so the
+  // bucket variant starts most of them from the state the forward pass saved.
+  gs::Dataset ds = gs::make_test_dataset(kWidth, kHeight, 1, true, 23);
+  gs::SplatScene scene = gs::make_test_scene(700, 1, 29);
+  for (float& v : scene.opacity_logits) v -= 2.5f;
+  for (float& v : scene.log_scales) v += 0.3f;
+  const float bg[3] = {0.3f, 0.2f, 0.1f};
+  std::vector<float> grads[3];
+  uint32_t max_count = 0;
+  const gs::TrainOptions::Reduction variants[3] = {gs::TrainOptions::Reduction::Serial,
+                                                   gs::TrainOptions::Reduction::Bucket,
+                                                   gs::TrainOptions::Reduction::Bucket2};
+  const char* names[3] = {"serial", "bucket", "bucket2"};
+  for (int v = 0; v < 3; ++v) {
+    gs::TrainOptions o = gs::frozen_train_options(1, true);
+    o.reduction = variants[v];
+    gs::Trainer trainer(ctx, ds, scene, o);
+    trainer.step_on(0, bg);
+    EXPECT(trainer.reduction() == names[v], "ran %s", trainer.reduction().c_str());
+    grads[v] = trainer.first_step_gradients().params;
+    const gs::Trainer::DebugSnapshot snap = trainer.debug_snapshot();
+    for (uint32_t c : snap.pixel_count) max_count = std::max(max_count, c);
+  }
+  double max_diff = 0.0, max_abs = 0.0;
+  for (size_t i = 0; i < grads[0].size(); ++i) {
+    for (int v = 1; v < 3; ++v) max_diff = std::max(max_diff, double(std::fabs(grads[0][i] - grads[v][i])));
+    max_abs = std::max(max_abs, double(std::fabs(grads[0][i])));
+  }
+  std::printf("  bucket(2): longest pixel list %u, max |grad| %.3g, max diff to serial %.3g\n", max_count, max_abs,
+              max_diff);
+  EXPECT(max_count > 96, "test scene too thin: longest pixel list %u", max_count);
+  EXPECT(max_diff <= 1e-4 * max_abs, "bucket gradients differ from serial by %.3g", max_diff);
 }
 
 void test_footprint(gs::VkContext& ctx) {
@@ -151,7 +186,7 @@ void test_retune(gs::VkContext& ctx) {
   o.reduction = R::SerialCut;
   gs::Trainer single(ctx, ds, scene, o);
   o.reduction = R::Serial;
-  o.alternatives = {R::SerialCut, R::SerialCut2, R::SubgroupLane4};
+  o.alternatives = {R::SerialCut, R::SerialCut2, R::SubgroupLane4, R::Bucket, R::Bucket2};
   o.retune_first = 1;
   o.retune_interval = 3;
   gs::Trainer tuned(ctx, ds, scene, o);
@@ -173,10 +208,81 @@ void test_retune(gs::VkContext& ctx) {
   std::printf("; max |m| %.3g, max diff %.3g\n", max_abs, max_diff);
   EXPECT(tuned.retunes().size() == 2 && tuned.retunes()[0].step == 1 && tuned.retunes()[1].step == 3,
          "retunes at the wrong steps (%zu)", tuned.retunes().size());
-  EXPECT(tuned.retunes().front().ms.size() == 4, "%zu variants timed", tuned.retunes().front().ms.size());
+  EXPECT(tuned.retunes().front().ms.size() == 6, "%zu variants timed", tuned.retunes().front().ms.size());
   EXPECT(tuned.reduction() == tuned.retunes().back().chosen, "using %s, chose %s", tuned.reduction().c_str(),
          tuned.retunes().back().chosen.c_str());
   EXPECT(max_diff <= 1e-5 * max_abs, "gradients with retuning differ by %.3g", max_diff);
+}
+
+void test_batched_matches_single(gs::VkContext& ctx) {
+  // Steps recorded kBatch to a submission (pair count read on the GPU) must
+  // train exactly like steps run one at a time. Densification places new
+  // gaussians in slots through atomics, in no fixed order, so after it even
+  // two single-step runs differ: compare before it, and check that batches
+  // stop at it.
+  gs::Dataset ds = gs::make_test_dataset(kWidth, kHeight, 6, true, 31);
+  gs::SplatScene scene = gs::make_test_scene(150, 1, 37);
+  gs::TrainOptions o = gs::scaled_options(45);
+  o.sh_degree = 1;
+  o.densify_from = 1000;
+  o.max_gaussians = 400;
+  gs::Trainer single(ctx, ds, scene, o), batched(ctx, ds, scene, o);
+  for (int i = 0; i < 27; ++i) single.step();
+  uint32_t calls = 0;
+  while (batched.stats().step < 27) {
+    batched.steps(std::min(17u, 27 - batched.stats().step));
+    ++calls;
+  }
+  const gs::SplatScene a = single.export_scene(), b = batched.export_scene();
+  double max_diff = 0.0;
+  for (size_t i = 0; i < a.positions.size(); ++i) {
+    max_diff = std::max(max_diff, double(std::fabs(a.positions[i] - b.positions[i])));
+  }
+  for (size_t i = 0; i < a.sh_dc.size(); ++i) max_diff = std::max(max_diff, double(std::fabs(a.sh_dc[i] - b.sh_dc[i])));
+  std::printf("  batched: %u steps in %u calls, %.1f steps per submit, max diff %.3g\n", batched.stats().step, calls,
+              batched.stats().timing.batch, max_diff);
+  EXPECT(a.count == b.count && max_diff == 0.0, "batched training differs by %.3g", max_diff);
+  EXPECT(batched.stats().overflow_steps == 0, "%u overflow steps", batched.stats().overflow_steps);
+
+  o.densify_from = 5;
+  o.densify_until = 40;
+  o.densify_interval = 10;
+  gs::Trainer dense(ctx, ds, scene, o);
+  std::vector<uint32_t> ends;
+  while (!dense.finished()) {
+    dense.steps(17);
+    ends.push_back(dense.stats().step);
+  }
+  bool finite = true;
+  for (float v : dense.export_scene().positions) finite = finite && std::isfinite(v);
+  std::printf("  batched with densification: %u events, calls ended at", dense.stats().densify_events);
+  for (uint32_t e : ends) std::printf(" %u", e);
+  std::printf("\n");
+  EXPECT(dense.stats().densify_events == 3 && finite, "densified %u times (3 expected), finite %d",
+         dense.stats().densify_events, int(finite));
+}
+
+void test_pair_overflow_retry(gs::VkContext& ctx) {
+  // Pair buffers sized from a low guess overflow on the first step: the step
+  // must leave the model alone, grow the buffers and run again.
+  gs::Dataset ds = gs::make_test_dataset(kWidth, kHeight, 1, false, 41);
+  gs::SplatScene scene = gs::make_test_scene(300, 1, 43);
+  for (float& v : scene.log_scales) v += 1.5f;
+  const float bg[3] = {0.1f, 0.1f, 0.1f};
+  gs::TrainOptions o = gs::frozen_train_options(1, false);
+  gs::Trainer normal(ctx, ds, scene, o);
+  o.min_pair_capacity = 16;
+  gs::Trainer small(ctx, ds, scene, o);
+  normal.step_on(0, bg);
+  small.step_on(0, bg);
+  const std::vector<float> a = normal.first_step_gradients().params, b = small.first_step_gradients().params;
+  double max_diff = 0.0;
+  for (size_t i = 0; i < a.size(); ++i) max_diff = std::max(max_diff, double(std::fabs(a[i] - b[i])));
+  std::printf("  overflow: %llu pairs (first guess %u), max diff %.3g\n", (unsigned long long)small.stats().pairs,
+              300u * 4u, max_diff);
+  EXPECT(small.stats().pairs > 300u * 4u * 2u, "test scene too small: %llu pairs",
+         (unsigned long long)small.stats().pairs);
+  EXPECT(small.stats().pairs == normal.stats().pairs && max_diff == 0.0, "retried step differs (%.3g)", max_diff);
 }
 
 void test_probes(gs::VkContext& ctx) {
@@ -345,6 +451,10 @@ int main() {
     test_gradients(ctx, false, gs::TrainOptions::Reduction::SubgroupLane4);
     test_gradients(ctx, true, gs::TrainOptions::Reduction::SubgroupLane4);
     test_gradients(ctx, true, gs::TrainOptions::Reduction::SubgroupLane1);
+    test_gradients(ctx, false, gs::TrainOptions::Reduction::Bucket);
+    test_gradients(ctx, true, gs::TrainOptions::Reduction::Bucket);
+    test_gradients(ctx, false, gs::TrainOptions::Reduction::Bucket2);
+    test_gradients(ctx, true, gs::TrainOptions::Reduction::Bucket2);
     test_gradients(ctx, false, gs::TrainOptions::Reduction::SerialCut2);
     test_gradients(ctx, true, gs::TrainOptions::Reduction::SerialCut2);
     test_gradients(ctx, false, gs::TrainOptions::Reduction::SerialCut);
@@ -352,8 +462,11 @@ int main() {
     test_gradients(ctx, false, gs::TrainOptions::Reduction::Serial);
     test_gradients(ctx, true, gs::TrainOptions::Reduction::Serial);
     test_cutoff_matches_serial(ctx);
+    test_bucket_long_lists(ctx);
     test_footprint(ctx);
     test_retune(ctx);
+    test_batched_matches_single(ctx);
+    test_pair_overflow_retry(ctx);
     test_probes(ctx);
     test_scan_and_densify(ctx);
     test_training_converges(ctx);
