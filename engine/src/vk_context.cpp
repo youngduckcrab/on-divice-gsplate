@@ -130,8 +130,28 @@ void VkContext::init() {
   app.engineVersion = 1;
   app.apiVersion = info_.instance_api_version;
 
+  // Surface extensions are enabled whenever the platform offers them, so the same
+  // context can drive both compute work and an on-screen viewer.
+  uint32_t ext_count = 0;
+  GS_VK_CHECK(vkEnumerateInstanceExtensionProperties(nullptr, &ext_count, nullptr));
+  std::vector<VkExtensionProperties> available(ext_count);
+  GS_VK_CHECK(vkEnumerateInstanceExtensionProperties(nullptr, &ext_count, available.data()));
+  auto instance_has = [&](const char* name) {
+    return std::any_of(available.begin(), available.end(),
+                       [&](const VkExtensionProperties& e) { return std::strcmp(e.extensionName, name) == 0; });
+  };
+  std::vector<const char*> instance_extensions;
+  const char* kAndroidSurface = "VK_KHR_android_surface";
+  if (instance_has(VK_KHR_SURFACE_EXTENSION_NAME) && instance_has(kAndroidSurface)) {
+    instance_extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+    instance_extensions.push_back(kAndroidSurface);
+    enabled_.presentation = true;
+  }
+
   VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
   instance_info.pApplicationInfo = &app;
+  instance_info.enabledExtensionCount = static_cast<uint32_t>(instance_extensions.size());
+  instance_info.ppEnabledExtensionNames = instance_extensions.data();
   GS_VK_CHECK(vkCreateInstance(&instance_info, nullptr, &instance_));
 
   select_physical_device();
@@ -236,6 +256,7 @@ void VkContext::query_device_info() {
   info_.has_subgroup_size_control = v13 || has_extension(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
   info_.has_float16_int8 = v12 || has_extension(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
   info_.has_atomic_float = has_extension(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+  info_.has_atomic_int64 = v12 || has_extension(VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME);
 
   // Properties.
   VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -260,11 +281,13 @@ void VkContext::query_device_info() {
   info_.storage16 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES};
   info_.float16_int8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
   info_.atomic_float = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
+  info_.atomic_int64 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
   info_.subgroup_size_control_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
   next = &features2.pNext;
   chain(info_.storage16);
   if (info_.has_float16_int8) chain(info_.float16_int8);
   if (info_.has_atomic_float) chain(info_.atomic_float);
+  if (info_.has_atomic_int64) chain(info_.atomic_int64);
   if (info_.has_subgroup_size_control) chain(info_.subgroup_size_control_features);
   vkGetPhysicalDeviceFeatures2(physical_, &features2);
   info_.features = features2.features;
@@ -277,6 +300,7 @@ void VkContext::query_device_info() {
   info_.storage16.pNext = nullptr;
   info_.float16_int8.pNext = nullptr;
   info_.atomic_float.pNext = nullptr;
+  info_.atomic_int64.pNext = nullptr;
   info_.subgroup_size_control_features.pNext = nullptr;
 
   vkGetPhysicalDeviceMemoryProperties(physical_, &info_.memory);
@@ -331,6 +355,12 @@ void VkContext::create_device() {
     enabled_.atomic_float_add = true;
   }
 
+  if (enabled_.presentation && has_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
+    extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+  } else {
+    enabled_.presentation = false;
+  }
+
   const float priority = 1.0f;
   VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
   queue_info.queueFamilyIndex = info_.queue_family;
@@ -363,12 +393,12 @@ uint32_t VkContext::find_memory_type(uint32_t type_bits, VkMemoryPropertyFlags r
   throw std::runtime_error("no suitable Vulkan memory type");
 }
 
-Buffer VkContext::create_buffer(VkDeviceSize size, MemoryKind kind) {
+Buffer VkContext::create_buffer(VkDeviceSize size, MemoryKind kind, VkBufferUsageFlags extra_usage) {
   size = std::max<VkDeviceSize>(size, 4);
   VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   buffer_info.size = size;
   buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                      VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                      VK_BUFFER_USAGE_TRANSFER_DST_BIT | extra_usage;
   buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   VkBuffer buffer = VK_NULL_HANDLE;
   GS_VK_CHECK(vkCreateBuffer(device_, &buffer_info, nullptr, &buffer));
@@ -429,6 +459,77 @@ void VkContext::download(const Buffer& src, void* data, VkDeviceSize size) {
   std::memcpy(data, staging.mapped(), size);
 }
 
+VkShaderModule VkContext::create_shader_module(std::span<const uint32_t> spirv) const {
+  VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  module_info.codeSize = spirv.size_bytes();
+  module_info.pCode = spirv.data();
+  VkShaderModule module = VK_NULL_HANDLE;
+  GS_VK_CHECK(vkCreateShaderModule(device_, &module_info, nullptr, &module));
+  return module;
+}
+
+VkDescriptorPool VkContext::create_descriptor_pool(uint32_t max_sets, uint32_t max_storage_buffers) const {
+  VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, max_storage_buffers};
+  VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  info.maxSets = max_sets;
+  info.poolSizeCount = 1;
+  info.pPoolSizes = &pool_size;
+  VkDescriptorPool pool = VK_NULL_HANDLE;
+  GS_VK_CHECK(vkCreateDescriptorPool(device_, &info, nullptr, &pool));
+  return pool;
+}
+
+VkDescriptorSet VkContext::allocate_set(VkDescriptorPool pool, VkDescriptorSetLayout layout,
+                                        std::initializer_list<const Buffer*> buffers) const {
+  VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  alloc.descriptorPool = pool;
+  alloc.descriptorSetCount = 1;
+  alloc.pSetLayouts = &layout;
+  VkDescriptorSet set = VK_NULL_HANDLE;
+  GS_VK_CHECK(vkAllocateDescriptorSets(device_, &alloc, &set));
+
+  std::vector<VkDescriptorBufferInfo> infos;
+  infos.reserve(buffers.size());
+  std::vector<VkWriteDescriptorSet> writes;
+  writes.reserve(buffers.size());
+  uint32_t binding = 0;
+  for (const Buffer* b : buffers) {
+    infos.push_back({b->handle(), 0, VK_WHOLE_SIZE});
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = set;
+    w.dstBinding = binding++;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w.pBufferInfo = &infos.back();
+    writes.push_back(w);
+  }
+  vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+  return set;
+}
+
+VkDescriptorSet VkContext::allocate_transient_set(const ComputePipeline& pipeline,
+                                                  std::initializer_list<const Buffer*> buffers) const {
+  if (buffers.size() != pipeline.binding_count_) {
+    throw std::logic_error("descriptor set: buffer count does not match pipeline bindings");
+  }
+  return allocate_set(descriptor_pool_, pipeline.set_layout_, buffers);
+}
+
+VkResult VkContext::submit(const VkSubmitInfo& submit_info, VkFence fence) {
+  std::lock_guard<std::mutex> lock(queue_mutex_);
+  return vkQueueSubmit(queue_, 1, &submit_info, fence);
+}
+
+VkResult VkContext::present(const VkPresentInfoKHR& present_info) {
+  std::lock_guard<std::mutex> lock(queue_mutex_);
+  return vkQueuePresentKHR(queue_, &present_info);
+}
+
+void VkContext::queue_wait_idle() {
+  std::lock_guard<std::mutex> lock(queue_mutex_);
+  vkQueueWaitIdle(queue_);
+}
+
 ComputePipeline VkContext::create_compute_pipeline(std::span<const uint32_t> spirv,
                                                    uint32_t binding_count,
                                                    uint32_t push_constant_size) {
@@ -457,11 +558,7 @@ ComputePipeline VkContext::create_compute_pipeline(std::span<const uint32_t> spi
   layout_info.pPushConstantRanges = &range;
   GS_VK_CHECK(vkCreatePipelineLayout(device_, &layout_info, nullptr, &p.layout_));
 
-  VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-  module_info.codeSize = spirv.size_bytes();
-  module_info.pCode = spirv.data();
-  VkShaderModule module = VK_NULL_HANDLE;
-  GS_VK_CHECK(vkCreateShaderModule(device_, &module_info, nullptr, &module));
+  VkShaderModule module = create_shader_module(spirv);
 
   VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
   pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -477,6 +574,7 @@ ComputePipeline VkContext::create_compute_pipeline(std::span<const uint32_t> spi
 }
 
 RunTiming VkContext::run(const std::function<void(VkCommandBuffer)>& record) {
+  std::lock_guard<std::recursive_mutex> run_lock(run_mutex_);
   if (in_run_) throw std::logic_error("VkContext::run is not reentrant");
   in_run_ = true;
   struct Reset {
@@ -503,7 +601,7 @@ RunTiming VkContext::run(const std::function<void(VkCommandBuffer)>& record) {
   submit.commandBufferCount = 1;
   submit.pCommandBuffers = &cmd_;
   auto start = std::chrono::steady_clock::now();
-  GS_VK_CHECK(vkQueueSubmit(queue_, 1, &submit, fence_));
+  GS_VK_CHECK(this->submit(submit, fence_));
   VkResult wait = vkWaitForFences(device_, 1, &fence_, VK_TRUE, 60ull * 1000 * 1000 * 1000);
   auto end = std::chrono::steady_clock::now();
   if (wait != VK_SUCCESS) throw VulkanError("vkWaitForFences", wait);
@@ -526,41 +624,12 @@ RunTiming VkContext::run(const std::function<void(VkCommandBuffer)>& record) {
   return timing;
 }
 
-void VkContext::dispatch(VkCommandBuffer cmd, const ComputePipeline& pipeline,
-                         std::initializer_list<const Buffer*> buffers, const void* push,
-                         uint32_t push_size, uint32_t groups_x, uint32_t groups_y,
-                         uint32_t groups_z) {
-  if (buffers.size() != pipeline.binding_count_) {
-    throw std::logic_error("dispatch: buffer count does not match pipeline bindings");
-  }
+void VkContext::dispatch(VkCommandBuffer cmd, const ComputePipeline& pipeline, VkDescriptorSet set,
+                         const void* push, uint32_t push_size, uint32_t groups_x, uint32_t groups_y,
+                         uint32_t groups_z) const {
   if (push_size != pipeline.push_constant_size_) {
     throw std::logic_error("dispatch: push constant size mismatch");
   }
-
-  VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-  alloc.descriptorPool = descriptor_pool_;
-  alloc.descriptorSetCount = 1;
-  alloc.pSetLayouts = &pipeline.set_layout_;
-  VkDescriptorSet set = VK_NULL_HANDLE;
-  GS_VK_CHECK(vkAllocateDescriptorSets(device_, &alloc, &set));
-
-  std::vector<VkDescriptorBufferInfo> infos;
-  infos.reserve(buffers.size());
-  std::vector<VkWriteDescriptorSet> writes;
-  writes.reserve(buffers.size());
-  uint32_t binding = 0;
-  for (const Buffer* b : buffers) {
-    infos.push_back({b->handle(), 0, VK_WHOLE_SIZE});
-    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    w.dstSet = set;
-    w.dstBinding = binding++;
-    w.descriptorCount = 1;
-    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    w.pBufferInfo = &infos.back();
-    writes.push_back(w);
-  }
-  vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline_);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout_, 0, 1, &set, 0,
                           nullptr);
@@ -568,6 +637,14 @@ void VkContext::dispatch(VkCommandBuffer cmd, const ComputePipeline& pipeline,
     vkCmdPushConstants(cmd, pipeline.layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push);
   }
   vkCmdDispatch(cmd, groups_x, groups_y, groups_z);
+}
+
+void VkContext::dispatch(VkCommandBuffer cmd, const ComputePipeline& pipeline,
+                         std::initializer_list<const Buffer*> buffers, const void* push,
+                         uint32_t push_size, uint32_t groups_x, uint32_t groups_y,
+                         uint32_t groups_z) {
+  VkDescriptorSet set = allocate_transient_set(pipeline, buffers);
+  dispatch(cmd, pipeline, set, push, push_size, groups_x, groups_y, groups_z);
 }
 
 void VkContext::barrier(VkCommandBuffer cmd) {

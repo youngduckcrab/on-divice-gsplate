@@ -34,23 +34,29 @@ endif()
 message(STATUS "gsengine: using glslc at ${GS_GLSLC}")
 
 # Each shader is compiled to SPIR-V and embedded as a uint32_t array header
-# (gs::shaders::<name>), so the engine needs no asset loading on any platform.
+# (gs::shaders::<name>: radix_count.comp -> radix_count, splat.vert -> splat_vert),
+# so the engine needs no asset loading on any platform.
 set(GS_SHADERS
-  bandwidth_copy
-  fma_fp32
-  fma_fp16
-  atomic_u32
-  atomic_f32_native
-  atomic_f32_cas
-  radix_count
-  radix_scan
-  radix_scatter
+  bandwidth_copy.comp
+  fma_fp32.comp
+  fma_fp16.comp
+  atomic_u32.comp
+  atomic_f32_native.comp
+  atomic_f32_cas.comp
+  radix_count.comp
+  radix_scan.comp
+  radix_scatter.comp
+  splat_preprocess.comp
+  splat.vert
+  splat.frag
 )
 set(GS_SHADER_OUT "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${GS_SHADER_OUT}/shaders")
 set(GS_SHADER_HEADERS "")
-foreach(name IN LISTS GS_SHADERS)
-  set(src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${name}.comp")
+foreach(file IN LISTS GS_SHADERS)
+  string(REGEX REPLACE "\\.comp$" "" name "${file}")
+  string(REPLACE "." "_" name "${name}")
+  set(src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${file}")
   set(spv "${GS_SHADER_OUT}/shaders/${name}.spv")
   set(hdr "${GS_SHADER_OUT}/shaders/${name}.h")
   add_custom_command(
@@ -59,7 +65,7 @@ foreach(name IN LISTS GS_SHADERS)
     COMMAND "${CMAKE_COMMAND}" -DINPUT=${spv} -DOUTPUT=${hdr} -DNAME=${name}
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spirv.cmake"
     DEPENDS "${src}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spirv.cmake"
-    COMMENT "Compiling shader ${name}"
+    COMMENT "Compiling shader ${file}"
     VERBATIM)
   list(APPEND GS_SHADER_HEADERS "${hdr}")
 endforeach()
@@ -68,9 +74,13 @@ add_custom_target(gs_shaders DEPENDS ${GS_SHADER_HEADERS})
 # --- Engine library -----------------------------------------------------------
 add_library(gsengine STATIC
   src/benchmarks.cpp
+  src/camera.cpp
   src/device_probe.cpp
   src/log.cpp
+  src/offscreen.cpp
   src/radix_sort.cpp
+  src/splat_renderer.cpp
+  src/splat_scene.cpp
   src/vk_context.cpp
 )
 add_dependencies(gsengine gs_shaders)
@@ -81,7 +91,10 @@ target_include_directories(gsengine
   PRIVATE "${GS_SHADER_OUT}")
 target_link_libraries(gsengine PUBLIC ${GS_VULKAN_LIB})
 if(ANDROID)
-  target_link_libraries(gsengine PUBLIC log)
+  target_link_libraries(gsengine PUBLIC log z)
+else()
+  find_package(ZLIB REQUIRED)
+  target_link_libraries(gsengine PUBLIC ZLIB::ZLIB)
 endif()
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(gsengine PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
@@ -94,6 +107,13 @@ if(GS_BUILD_TESTS AND NOT ANDROID)
   target_link_libraries(gs_tests PRIVATE gsengine)
   add_test(NAME gs_tests COMMAND gs_tests)
 
+  add_executable(gs_splat_tests tests/test_splats.cpp)
+  target_link_libraries(gs_splat_tests PRIVATE gsengine)
+  add_test(NAME gs_splat_tests COMMAND gs_splat_tests)
+
   add_executable(gs_probe cli/gs_probe.cpp)
   target_link_libraries(gs_probe PRIVATE gsengine)
+
+  add_executable(gs_render cli/gs_render.cpp)
+  target_link_libraries(gs_render PRIVATE gsengine)
 endif()

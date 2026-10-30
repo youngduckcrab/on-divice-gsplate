@@ -186,56 +186,64 @@ std::string bench_atomics(VkContext& ctx, const BenchOptions& opt) {
 
 std::string bench_radix_sort(VkContext& ctx, const BenchOptions& opt) {
   const uint32_t n = std::max<uint32_t>(4096, uint32_t(1048576 * opt.scale));
-  std::vector<uint32_t> keys(n);
-  std::vector<uint32_t> values(n);
-  std::mt19937 rng(1234);
-  for (uint32_t i = 0; i < n; ++i) {
-    keys[i] = rng();
-    values[i] = i;
-  }
-
   RadixSort sorter(ctx);
   sorter.reserve(n);
   Buffer src_keys = ctx.create_buffer(uint64_t(n) * 4, MemoryKind::Device);
   Buffer src_values = ctx.create_buffer(uint64_t(n) * 4, MemoryKind::Device);
   Buffer work_keys = ctx.create_buffer(uint64_t(n) * 4, MemoryKind::Device);
   Buffer work_values = ctx.create_buffer(uint64_t(n) * 4, MemoryKind::Device);
-  ctx.upload(src_keys, keys.data(), uint64_t(n) * 4);
-  ctx.upload(src_values, values.data(), uint64_t(n) * 4);
-
-  Timing t = time_runs(
-      ctx, opt.repeats, [&](VkCommandBuffer cmd) { sorter.record(cmd, work_keys, work_values, n); },
-      [&](VkCommandBuffer cmd) {
-        VkBufferCopy region{0, 0, uint64_t(n) * 4};
-        vkCmdCopyBuffer(cmd, src_keys.handle(), work_keys.handle(), 1, &region);
-        vkCmdCopyBuffer(cmd, src_values.handle(), work_values.handle(), 1, &region);
-      });
-
-  std::vector<uint32_t> out_keys(n);
-  std::vector<uint32_t> out_values(n);
-  ctx.download(work_keys, out_keys.data(), uint64_t(n) * 4);
-  ctx.download(work_values, out_values.data(), uint64_t(n) * 4);
-
-  std::vector<std::pair<uint32_t, uint32_t>> expected(n);
-  for (uint32_t i = 0; i < n; ++i) expected[i] = {keys[i], values[i]};
-  std::stable_sort(expected.begin(), expected.end(),
-                   [](const auto& a, const auto& b) { return a.first < b.first; });
-  int64_t first_mismatch = -1;
-  for (uint32_t i = 0; i < n; ++i) {
-    if (out_keys[i] != expected[i].first || out_values[i] != expected[i].second) {
-      first_mismatch = i;
-      break;
-    }
-  }
 
   JsonWriter w;
-  w.begin_object().field("name", "radix_sort").field("ok", true);
-  w.field("n", n);
-  w.field("key_bits", 32);
-  write_timing(w, t);
-  w.field("mkeys_per_s", double(n) / (t.median_ms * 1e-3) / 1e6);
-  w.field("correct", first_mismatch < 0);
-  if (first_mismatch >= 0) w.field("first_mismatch", first_mismatch);
+  w.begin_object().field("name", "radix_sort").field("ok", true).field("n", n);
+  w.key("results").begin_array();
+  // 32-bit keys (generic), 16-bit keys (the viewer's depth keys: 4 passes instead of 8).
+  for (uint32_t key_bits : {32u, 16u}) {
+    const uint32_t mask = key_bits >= 32 ? ~0u : ((1u << key_bits) - 1);
+    std::vector<uint32_t> keys(n);
+    std::vector<uint32_t> values(n);
+    std::mt19937 rng(1234 + key_bits);
+    for (uint32_t i = 0; i < n; ++i) {
+      keys[i] = rng() & mask;
+      values[i] = i;
+    }
+    ctx.upload(src_keys, keys.data(), uint64_t(n) * 4);
+    ctx.upload(src_values, values.data(), uint64_t(n) * 4);
+
+    Timing t = time_runs(
+        ctx, opt.repeats,
+        [&](VkCommandBuffer cmd) { sorter.record(cmd, work_keys, work_values, n, key_bits); },
+        [&](VkCommandBuffer cmd) {
+          VkBufferCopy region{0, 0, uint64_t(n) * 4};
+          vkCmdCopyBuffer(cmd, src_keys.handle(), work_keys.handle(), 1, &region);
+          vkCmdCopyBuffer(cmd, src_values.handle(), work_values.handle(), 1, &region);
+        });
+
+    std::vector<uint32_t> out_keys(n);
+    std::vector<uint32_t> out_values(n);
+    ctx.download(work_keys, out_keys.data(), uint64_t(n) * 4);
+    ctx.download(work_values, out_values.data(), uint64_t(n) * 4);
+
+    std::vector<std::pair<uint32_t, uint32_t>> expected(n);
+    for (uint32_t i = 0; i < n; ++i) expected[i] = {keys[i], values[i]};
+    std::stable_sort(expected.begin(), expected.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+    int64_t first_mismatch = -1;
+    for (uint32_t i = 0; i < n; ++i) {
+      if (out_keys[i] != expected[i].first || out_values[i] != expected[i].second) {
+        first_mismatch = i;
+        break;
+      }
+    }
+
+    w.begin_object();
+    w.field("key_bits", key_bits);
+    write_timing(w, t);
+    w.field("mkeys_per_s", double(n) / (t.median_ms * 1e-3) / 1e6);
+    w.field("correct", first_mismatch < 0);
+    if (first_mismatch >= 0) w.field("first_mismatch", first_mismatch);
+    w.end_object();
+  }
+  w.end_array();
   w.end_object();
   return w.str();
 }

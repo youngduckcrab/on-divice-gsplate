@@ -2,16 +2,17 @@
 
 | 항목 | 내용 |
 |---|---|
-| 문서 버전 | v0.2 |
+| 문서 버전 | v0.3 |
 | 작성일 | 2026-10-30 |
 | 대상 플랫폼 | Android (arm64) |
 | 테스트 기기 | **Galaxy Z Fold6** — Snapdragon 8 Gen 3 for Galaxy (GPU: Adreno 750), RAM 12 GB |
 | 촬영 대상 | **사람** (인물 3D 스캔) |
 | 진행 방식 | Claude가 구현 → APK 배포 → 사용자가 설치·실험 → **이 대화로 피드백** → 반복 |
 | 저장소 | private (GitHub Release로 APK 배포) |
-| 상태 | M0 진행 중 |
+| 상태 | M0 완료 (기기 진단), M1 진행 중 |
 
 ### 변경 이력
+- v0.3: M0 기기 진단 결과 반영 ([결과](experiments/m0-fold6.md)) — float atomic 미지원에 따른 그래디언트 누적 방식, 128 MB 바인딩 제한, 1080p 촬영, 정렬 속도 목표, 메모리 예산 갱신.
 - v0.2: 테스트 기기(Fold6), 촬영 대상(사람), 피드백 채널(대화), private 저장소 결정 반영. 인물 스캔 설계(§5.8) 추가, 표준 장면·리스크·마일스톤 갱신.
 - v0.1: 초안.
 
@@ -203,7 +204,7 @@ on-divice-gsplate/
 - **세션 설정**
   - 깊이: 지원 기기면 Raw Depth(+confidence) 사용, 미지원이면 특징점만 사용
   - 포커스 고정 시도 (초점 변화로 intrinsics가 흔들리는 것 방지)
-  - CPU 이미지 해상도: 기본은 640×480. `Session.getSupportedCameraConfigs()`에서 기기가 지원하는 가장 높은 해상도를 고른다 (지원 목록은 M0 진단으로 확인)
+  - CPU 이미지 해상도: 기본은 640×480. `Session.getSupportedCameraConfigs()`에서 가장 높은 해상도를 고른다. **Fold6은 1920×1080 @30fps 지원 확인(M0)** → 1080p로 저장, 학습은 960×540부터
 - **키프레임 선택**
   - 추적 상태가 `TRACKING`인 프레임만 사용
   - 직전 키프레임 대비 이동량이 장면 깊이의 약 5% 이상이거나 회전 5~10° 이상일 때 채택
@@ -233,6 +234,8 @@ on-divice-gsplate/
    - (a) subgroup 합산 후 float atomic add (`VK_EXT_shader_atomic_float` 지원 시)
    - (b) subgroup 합산 후 CAS loop로 float atomic 에뮬레이션
    - (c) **atomic-free**: (타일, 가우시안) 쌍별 부분 그래디언트를 정렬 전 인덱스 위치에 기록 → 가우시안마다 연속 구간을 합산
+   - (d) **고정소수점 정수 atomic**: subgroup 합산 후 그래디언트를 스케일링해 int32 `atomicAdd`
+   - **M0 결과 (Fold6)**: float atomic 미지원, CAS는 경합이 높을 때 u32 atomic보다 16배 느림 → (a)는 불가, (b)·(c)·(d)를 M3에서 비교
 6. **Backward 전처리** — 2D 그래디언트를 3D 파라미터(위치, scale, rotation, opacity, SH) 그래디언트로 변환
 7. **Adam** — 단일 fused kernel. 이번 iteration에 화면에 보이지 않은 가우시안은 건너뛴다(sparse). 위치 학습률은 장면 크기 기준으로 지수 감쇠
 8. **Densify / Prune** (N iteration마다) — 개수 예산을 고정한다. 3DGS-MCMC식 재배치(relocation)를 1순위로 하고, Taming식 점수 기반 방식과 비교 실험한다.
@@ -242,7 +245,10 @@ on-divice-gsplate/
 **메모리 예산** (가우시안 1개당)
 - 파라미터는 SH 1차 기준 23 float(약 92 B). 그래디언트와 Adam 모멘트 2개까지 포함하면 약 0.4 KB. SH 3차면 약 1 KB.
 - 가우시안 30만 개 → 120~300 MB. 여기에 타일 쌍·정렬 버퍼 수십~100 MB, 학습 이미지(200장 × 640×480 RGBA ≈ 245 MB).
-- **전체 1 GB 안팎**을 목표로 한다.
+- **전체 1 GB 안팎**을 목표로 한다 (M0에서 측정 시 가용 RAM 1.8 GB → 상한 1.5 GB).
+- **바인딩 제한**: Adreno 750은 storage buffer 바인딩 1개가 최대 128 MB. 큰 배열은 나누고, 학습 이미지는 이미지 배열(텍스처)에 둔다.
+
+**정렬 속도**: M0에서 32-bit 키 100만 개 정렬이 20.9 ms(50 Mkeys/s, 결과 정확). 학습에는 4~8배 빨라야 하므로 깊이 선정렬 + 타일 ID 키(3~4 패스), subgroup 기반 순위 계산으로 개선한다.
 
 **안정성**: Android GPU 드라이버는 너무 긴 dispatch를 멈춤으로 판단해 `VK_ERROR_DEVICE_LOST`를 낼 수 있다. dispatch를 짧게 나누고, 학습 중 UI 미리보기는 낮은 빈도로 그린다.
 
@@ -340,7 +346,7 @@ on-divice-gsplate/
 
 **목표**: 렌더링 경로와 GPU 정렬을 검증하고, 이후 결과 확인용 도구를 확보한다.
 
-**구현**: PLY / SPZ 로더, 파일 선택, 내장 합성 샘플, Vulkan 렌더러 + GPU 정렬, 터치 조작, HUD
+**구현**: PLY / SPZ(v2·v3, gzip) 로더, 파일 선택, 내장 합성 샘플, Vulkan 렌더러 + GPU 정렬(16-bit log-depth 키), 터치 조작, HUD, 필요할 때만 다시 그리기(발열 절약). 진단 탭 유지(벤치마크 보완: fp16 측정 방식 수정, int64 atomic 확인). SPZ v4(zstd)는 M7 내보내기 작업 때 추가
 
 **사용자 테스트**
 1. 내장 샘플이 제대로 보이는지

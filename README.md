@@ -4,16 +4,16 @@
 
 - 개발 계획서: [docs/PLAN.md](docs/PLAN.md)
 - 릴리즈 노트: [docs/releases/](docs/releases/)
-- 현재 단계: **M0 — 기반 구축 & 기기 진단** (`v0.1.0`)
+- 현재 단계: **M1 — 스플랫 뷰어** (`v0.2.0`). M0 결과: [docs/experiments/m0-fold6.md](docs/experiments/m0-fold6.md)
 
 ## 구조
 
 | 경로 | 내용 |
 |---|---|
-| `app/` | Android 앱 (Kotlin, Jetpack Compose, ARCore). 네이티브 코드는 `app/src/main/cpp/jni_bridge.cpp` |
+| `app/` | Android 앱 (Kotlin, Jetpack Compose, ARCore). 네이티브 코드: `app/src/main/cpp/` (JNI, 화면 출력용 뷰어) |
 | `engine/` | C++20 / Vulkan 엔진. Android와 Linux에서 같은 코드로 빌드됨 |
-| `engine/shaders/` | GLSL compute 셰이더 (빌드 시 SPIR-V로 컴파일되어 바이너리에 포함) |
-| `engine/tests/` | GPU 커널 정합성 테스트 (CI에서는 Mesa lavapipe 소프트웨어 Vulkan 사용) |
+| `engine/shaders/` | GLSL 셰이더 — compute, vertex, fragment (빌드 시 SPIR-V로 컴파일되어 바이너리에 포함) |
+| `engine/tests/` | GPU 커널 정합성 · 파일 입출력 · 렌더링 테스트 (CI에서는 Mesa lavapipe 소프트웨어 Vulkan 사용) |
 | `.github/workflows/build.yml` | 엔진 테스트 + APK 빌드 + 새 버전이면 GitHub Release 생성 |
 
 ## 빌드
@@ -27,4 +27,5 @@ cmake -S engine -B build/engine -G Ninja -DCMAKE_BUILD_TYPE=Release -DGS_BUILD_T
 cmake --build build/engine
 ctest --test-dir build/engine --output-on-failure
 ./build/engine/gs_probe          # 기기 정보 + 벤치마크 JSON 출력
+./build/engine/gs_render scene.spz out.ppm 800 600   # 뷰어와 같은 렌더러로 이미지 저장
 ```

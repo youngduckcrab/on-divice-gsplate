@@ -17,11 +17,13 @@
             android:name="com.google.ar.core"
             android:value="optional" />
 
-        <!-- Handle fold/unfold and rotation ourselves so running work is not restarted. -->
+        <!-- Handle fold/unfold ourselves so running work is not restarted. Portrait only,
+             like most scanning apps; the viewer still handles surface pre-rotation. -->
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboardHidden|uiMode"
-            android:exported="true">
+            android:exported="true"
+            android:screenOrientation="portrait">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

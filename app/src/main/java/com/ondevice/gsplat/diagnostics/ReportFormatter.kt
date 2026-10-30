@@ -28,6 +28,8 @@ object ReportFormatter {
         val sub = g.optJSONObject("subgroup") ?: JSONObject()
         val feat = g.optJSONObject("features") ?: JSONObject()
         val atomic = feat.optJSONObject("atomic_float") ?: JSONObject()
+        val atomic64 = feat.optJSONObject("atomic_int64") ?: JSONObject()
+        val enabled = g.optJSONObject("enabled") ?: JSONObject()
         val lim = g.optJSONObject("limits") ?: JSONObject()
         val mem = g.optJSONObject("memory") ?: JSONObject()
         return buildList {
@@ -40,10 +42,12 @@ object ReportFormatter {
             add("float atomic add" to yesNo(atomic.optBoolean("buffer_add")))
             add("fp16 연산" to yesNo(feat.optBoolean("shader_float16")))
             add("int64" to yesNo(feat.optBoolean("shader_int64")))
+            add("int64 atomic" to yesNo(atomic64.optBoolean("buffer")))
             add("16bit storage" to yesNo(feat.optBoolean("storage_buffer_16bit")))
             add("공유 메모리" to "${lim.optLong("max_compute_shared_memory_size") / 1024} KB")
             add("최대 storage buffer" to "${lim.optLong("max_storage_buffer_range") / (1024 * 1024)} MB")
             add("메모리 힙" to heaps(mem.optJSONArray("heaps")))
+            add("화면 출력(Vulkan)" to yesNo(enabled.optBoolean("presentation")))
         }
     }
 
@@ -75,14 +79,7 @@ object ReportFormatter {
                 name == "fp32" || name == "fp16" ->
                     add("${name.uppercase(Locale.US)} 연산" to "${fmt(r.optDouble("gflops"), 0)} GFLOPS$timer")
                 name == "atomics" -> addAll(atomicRows(r.optJSONArray("results")))
-                name == "radix_sort" -> {
-                    val keys = r.optLong("n") / (1024.0 * 1024.0)
-                    val ok = if (r.optBoolean("correct")) "정확" else "⚠ 결과 오류"
-                    add(
-                        "정렬 ${fmt(keys, 0)}M 키" to
-                            "${fmt(r.optDouble("median_ms"), 2)} ms · ${fmt(r.optDouble("mkeys_per_s"), 0)} Mkeys/s · $ok$timer",
-                    )
-                }
+                name == "radix_sort" -> addAll(sortRows(r))
                 else -> add(name to r.toString())
             }
         }
@@ -105,6 +102,18 @@ object ReportFormatter {
             for ((label, value) in section.rows) appendLine("$label: $value")
         }
     }.trimEnd()
+
+    private fun sortRows(r: JSONObject): List<Pair<String, String>> {
+        val keys = fmt(r.optLong("n") / (1024.0 * 1024.0), 0)
+        val results = r.optJSONArray("results") ?: return emptyList()
+        return (0 until results.length()).map { i ->
+            val item = results.getJSONObject(i)
+            val ok = if (item.optBoolean("correct")) "정확" else "⚠ 결과 오류"
+            val timer = if (item.optString("timer") == "cpu") " (CPU 타이머)" else ""
+            "정렬 ${keys}M 키 (${item.optInt("key_bits")}-bit)" to
+                "${fmt(item.optDouble("median_ms"), 2)} ms · ${fmt(item.optDouble("mkeys_per_s"), 0)} Mkeys/s · $ok$timer"
+        }
+    }
 
     private fun atomicRows(results: JSONArray?): List<Pair<String, String>> {
         if (results == null) return emptyList()

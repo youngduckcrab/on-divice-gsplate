@@ -1,6 +1,7 @@
 #version 450
-// FP32 throughput: 4 independent vec4 FMA chains, unrolled 4x
-// (64 FMA = 128 FLOP per loop iteration per thread).
+// FP32 throughput: 4 independent vec4 multiply-add chains, unrolled 4x
+// (64 MAD = 128 FLOP per loop iteration per thread). Plain a * m + k rather than
+// fma(): fma() demands a fused result, which some GPUs emulate for fp16.
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) writeonly buffer Out { float result[]; };
@@ -19,10 +20,10 @@ void main() {
   const vec4 m = vec4(0.9999);
   const vec4 k = vec4(0.0001);
   for (uint it = 0u; it < pc.iterations; ++it) {
-    a = fma(a, m, k); b = fma(b, m, k); c = fma(c, m, k); d = fma(d, m, k);
-    a = fma(a, m, k); b = fma(b, m, k); c = fma(c, m, k); d = fma(d, m, k);
-    a = fma(a, m, k); b = fma(b, m, k); c = fma(c, m, k); d = fma(d, m, k);
-    a = fma(a, m, k); b = fma(b, m, k); c = fma(c, m, k); d = fma(d, m, k);
+    a = a * m + k; b = b * m + k; c = c * m + k; d = d * m + k;
+    a = a * m + k; b = b * m + k; c = c * m + k; d = d * m + k;
+    a = a * m + k; b = b * m + k; c = c * m + k; d = d * m + k;
+    a = a * m + k; b = b * m + k; c = c * m + k; d = d * m + k;
   }
   vec4 s = a + b + c + d;
   result[i] = s.x + s.y + s.z + s.w;

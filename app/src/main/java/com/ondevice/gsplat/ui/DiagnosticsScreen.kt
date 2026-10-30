@@ -27,7 +27,6 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -61,62 +60,60 @@ fun DiagnosticsScreen(vm: DiagnosticsViewModel = viewModel()) {
     }
 
     val sections = vm.sections()
-    Scaffold { padding ->
-        Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.TopCenter) {
-            LazyColumn(
-                modifier = Modifier.widthIn(max = 720.dp).fillMaxWidth(),
-                contentPadding = PaddingValues(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                item { Header(vm.versionLabel) }
-                item {
-                    ShareButtons(
-                        onCopySummary = { copy(context, "요약", vm.summaryText()) },
-                        onCopyJson = { copy(context, "전체 JSON", vm.fullJson()) },
-                        onShare = { share(context, vm.summaryText()) },
-                    )
-                }
-                item { SectionCard(sections[0]) }
-                item { SectionCard(sections[1]) }
-                item {
-                    SectionCard(sections[2]) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(
-                                enabled = !vm.arcoreBusy,
-                                onClick = {
-                                    if (context.checkSelfPermission(Manifest.permission.CAMERA) ==
-                                        PackageManager.PERMISSION_GRANTED
-                                    ) {
-                                        vm.probeArCore()
-                                    } else {
-                                        cameraPermission.launch(Manifest.permission.CAMERA)
-                                    }
-                                },
-                            ) { Text(if (vm.arcoreBusy) "확인 중…" else "ARCore 확인") }
-                            val availability = vm.arcoreAvailability
-                            if (availability == ArCoreApk.Availability.SUPPORTED_NOT_INSTALLED ||
-                                availability == ArCoreApk.Availability.SUPPORTED_APK_TOO_OLD
-                            ) {
-                                OutlinedButton(onClick = { requestArCoreInstall(context) }) {
-                                    Text("ARCore 설치/업데이트")
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+        LazyColumn(
+            modifier = Modifier.widthIn(max = 720.dp).fillMaxWidth(),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            item { Header(vm.versionLabel) }
+            item {
+                ShareButtons(
+                    onCopySummary = { copy(context, "요약", vm.summaryText()) },
+                    onCopyJson = { copy(context, "전체 JSON", vm.fullJson()) },
+                    onShare = { share(context, vm.summaryText()) },
+                )
+            }
+            item { SectionCard(sections[0]) }
+            item { SectionCard(sections[1]) }
+            item {
+                SectionCard(sections[2]) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            enabled = !vm.arcoreBusy,
+                            onClick = {
+                                if (context.checkSelfPermission(Manifest.permission.CAMERA) ==
+                                    PackageManager.PERMISSION_GRANTED
+                                ) {
+                                    vm.probeArCore()
+                                } else {
+                                    cameraPermission.launch(Manifest.permission.CAMERA)
                                 }
+                            },
+                        ) { Text(if (vm.arcoreBusy) "확인 중…" else "ARCore 확인") }
+                        val availability = vm.arcoreAvailability
+                        if (availability == ArCoreApk.Availability.SUPPORTED_NOT_INSTALLED ||
+                            availability == ArCoreApk.Availability.SUPPORTED_APK_TOO_OLD
+                        ) {
+                            OutlinedButton(onClick = { requestArCoreInstall(context) }) {
+                                Text("ARCore 설치/업데이트")
                             }
                         }
                     }
                 }
-                item {
-                    SectionCard(sections[3]) {
-                        if (vm.benchmarkRunning) {
-                            val done = vm.benchmarks.size
-                            Text(
-                                "실행 중: ${vm.currentBenchmark ?: ""} (${done + 1}/${vm.benchmarkTotal})",
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
-                        }
-                        Button(enabled = !vm.benchmarkRunning, onClick = vm::runBenchmarks) {
-                            Text(if (vm.benchmarks.isEmpty()) "벤치마크 실행" else "벤치마크 다시 실행")
-                        }
+            }
+            item {
+                SectionCard(sections[3]) {
+                    if (vm.benchmarkRunning) {
+                        val done = vm.benchmarks.size
+                        Text(
+                            "실행 중: ${vm.currentBenchmark ?: ""} (${done + 1}/${vm.benchmarkTotal})",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
+                    }
+                    Button(enabled = !vm.benchmarkRunning, onClick = vm::runBenchmarks) {
+                        Text(if (vm.benchmarks.isEmpty()) "벤치마크 실행" else "벤치마크 다시 실행")
                     }
                 }
             }

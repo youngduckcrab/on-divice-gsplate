@@ -12,17 +12,32 @@ namespace gs {
 // every GPU regardless of subgroup size.
 class RadixSort {
  public:
+  // Descriptor sets for sorting one particular (keys, values) pair.
+  struct Binding {
+    VkDescriptorSet count[2] = {};    // [0] reads keys, [1] reads scratch
+    VkDescriptorSet scan = VK_NULL_HANDLE;
+    VkDescriptorSet scatter[2] = {};  // [0] keys -> scratch, [1] scratch -> keys
+  };
+
   explicit RadixSort(VkContext& ctx);
 
-  // Records the sort into `cmd`. The result ends up in `keys`/`values`.
-  // Only the low `key_bits` bits of each key are considered (rounded up to a
-  // multiple of 4). Scratch buffers grow to fit `n` on demand, so call this
-  // outside of an active run() the first time a larger `n` is used, or call
-  // reserve() beforehand.
+  // Grows the scratch buffers to fit `n` pairs. Invalidates existing bindings
+  // when it reallocates.
+  void reserve(uint32_t n);
+
+  // Persistent descriptor sets from `pool` (5 sets, 15 storage buffers), for
+  // sorting the same buffers every frame. Call reserve() first.
+  Binding bind(VkDescriptorPool pool, const Buffer& keys, const Buffer& values);
+
+  // Records the sort into `cmd`; the result ends up in `keys`/`values`. Only
+  // the low `key_bits` bits of each key are considered (rounded up to a
+  // multiple of 4).
+  void record(VkCommandBuffer cmd, const Binding& binding, const Buffer& keys,
+              const Buffer& values, uint32_t n, uint32_t key_bits = 32);
+
+  // One-off variant using transient descriptor sets; only valid inside VkContext::run().
   void record(VkCommandBuffer cmd, const Buffer& keys, const Buffer& values, uint32_t n,
               uint32_t key_bits = 32);
-
-  void reserve(uint32_t n);
 
   static constexpr uint32_t kWorkgroupSize = 128;
   static constexpr uint32_t kItemsPerThread = 8;

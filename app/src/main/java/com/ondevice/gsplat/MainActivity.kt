@@ -4,7 +4,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import com.ondevice.gsplat.ui.DiagnosticsScreen
+import com.ondevice.gsplat.ui.AppScreen
 import com.ondevice.gsplat.ui.GsplatTheme
 
 class MainActivity : ComponentActivity() {
@@ -13,7 +13,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             GsplatTheme {
-                DiagnosticsScreen()
+                AppScreen()
             }
         }
     }

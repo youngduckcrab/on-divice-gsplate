@@ -113,6 +113,10 @@ std::string probe_json(const VkContext& ctx) {
   w.field("buffer_atomics", info.has_atomic_float && info.atomic_float.shaderBufferFloat32Atomics);
   w.field("shared_add", info.has_atomic_float && info.atomic_float.shaderSharedFloat32AtomicAdd);
   w.end_object();
+  w.key("atomic_int64").begin_object();
+  w.field("buffer", info.has_atomic_int64 && info.atomic_int64.shaderBufferInt64Atomics);
+  w.field("shared", info.has_atomic_int64 && info.atomic_int64.shaderSharedInt64Atomics);
+  w.end_object();
   w.end_object();
 
   const EnabledFeatures& en = ctx.enabled();
@@ -120,6 +124,7 @@ std::string probe_json(const VkContext& ctx) {
   w.field("atomic_float_add", en.atomic_float_add);
   w.field("float16", en.float16);
   w.field("timestamps", en.timestamps);
+  w.field("presentation", en.presentation);
   w.end_object();
 
   w.key("limits").begin_object();

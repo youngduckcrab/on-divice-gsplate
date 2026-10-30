@@ -1,0 +1,167 @@
+#version 450
+// Viewer projection pass: for every splat, the EWA screen-space covariance, the
+// ellipse axes, the view-dependent SH colour, and a 16-bit back-to-front depth
+// key. Culled splats get key 0xffff so they sort last, and only visible splats
+// are counted into the indirect draw.
+layout(local_size_x = 256) in;
+
+struct Splat {
+  vec4 pos_opacity;  // xyz position, w opacity (after sigmoid)
+  vec4 rotation;     // normalised quaternion (w, x, y, z)
+  vec4 scale;        // xyz scale (after exp)
+  vec4 sh_dc;        // xyz SH DC coefficient
+};
+
+layout(std430, binding = 0) readonly buffer Splats { Splat splats[]; };
+layout(std430, binding = 1) readonly buffer ShRest { uint sh_rest[]; };  // fp16 pairs, [coeff][rgb]
+layout(std430, binding = 2) writeonly buffer Projected { uvec4 projected[]; };
+layout(std430, binding = 3) writeonly buffer Keys { uint keys[]; };
+layout(std430, binding = 4) writeonly buffer Order { uint order[]; };
+layout(std430, binding = 5) buffer DrawArgs {
+  uint vertex_count;
+  uint instance_count;
+  uint first_vertex;
+  uint first_instance;
+} draw_args;
+
+layout(push_constant) uniform Params {
+  vec4 rot0;        // scene -> camera rotation row 0, w = translation x
+  vec4 rot1;
+  vec4 rot2;
+  vec4 cam_pos;     // camera centre in scene coordinates
+  vec4 intrinsics;  // fx, fy, cx, cy
+  uvec4 info;       // width, height, count, sh_degree | antialiased << 8
+} pc;
+
+const float kNear = 0.02;
+const float kFar = 1000.0;
+const float kDilation = 0.3;  // low-pass filter added to the 2D covariance, in px^2
+const float kMinAlpha = 1.0 / 255.0;
+
+float sh_half(uint base, uint h) {
+  vec2 pair = unpackHalf2x16(sh_rest[base + (h >> 1u)]);
+  return (h & 1u) == 0u ? pair.x : pair.y;
+}
+
+vec3 sh_coeff(uint base, uint j) {
+  uint h = j * 3u;
+  return vec3(sh_half(base, h), sh_half(base, h + 1u), sh_half(base, h + 2u));
+}
+
+// Real spherical harmonics up to degree 3, as used by 3D Gaussian Splatting.
+vec3 eval_sh(vec3 dc, uint degree, uint base, vec3 d) {
+  vec3 c = 0.28209479177387814 * dc;
+  if (degree >= 1u) {
+    float x = d.x, y = d.y, z = d.z;
+    const float C1 = 0.4886025119029199;
+    c += -C1 * y * sh_coeff(base, 0u) + C1 * z * sh_coeff(base, 1u) - C1 * x * sh_coeff(base, 2u);
+    if (degree >= 2u) {
+      float xx = x * x, yy = y * y, zz = z * z, xy = x * y, yz = y * z, xz = x * z;
+      c += 1.0925484305920792 * xy * sh_coeff(base, 3u) +
+           -1.0925484305920792 * yz * sh_coeff(base, 4u) +
+           0.31539156525252005 * (2.0 * zz - xx - yy) * sh_coeff(base, 5u) +
+           -1.0925484305920792 * xz * sh_coeff(base, 6u) +
+           0.5462742152960396 * (xx - yy) * sh_coeff(base, 7u);
+      if (degree >= 3u) {
+        c += -0.5900435899266435 * y * (3.0 * xx - yy) * sh_coeff(base, 8u) +
+             2.890611442640554 * xy * z * sh_coeff(base, 9u) +
+             -0.4570457994644658 * y * (4.0 * zz - xx - yy) * sh_coeff(base, 10u) +
+             0.3731763325901154 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * sh_coeff(base, 11u) +
+             -0.4570457994644658 * x * (4.0 * zz - xx - yy) * sh_coeff(base, 12u) +
+             1.445305721320277 * z * (xx - yy) * sh_coeff(base, 13u) +
+             -0.5900435899266435 * x * (xx - 3.0 * yy) * sh_coeff(base, 14u);
+      }
+    }
+  }
+  return max(c + 0.5, vec3(0.0));
+}
+
+mat3 quat_to_matrix(vec4 q) {
+  float w = q.x, x = q.y, y = q.z, z = q.w;
+  // Column-major: each vec3 below is one column.
+  return mat3(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z), 2.0 * (x * z - w * y),
+              2.0 * (x * y - w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x),
+              2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y));
+}
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.info.z) return;
+  order[i] = i;
+
+  Splat s = splats[i];
+  vec3 p = s.pos_opacity.xyz;
+  vec3 t = vec3(dot(pc.rot0.xyz, p) + pc.rot0.w,
+                dot(pc.rot1.xyz, p) + pc.rot1.w,
+                dot(pc.rot2.xyz, p) + pc.rot2.w);
+  float opacity = s.pos_opacity.w;
+
+  uvec4 out0 = uvec4(0u);
+  uvec4 out1 = uvec4(0u);  // zero alpha marks a culled splat
+  uint key = 0xffffu;
+
+  if (t.z > kNear && opacity >= kMinAlpha) {
+    float fx = pc.intrinsics.x, fy = pc.intrinsics.y;
+    float cx = pc.intrinsics.z, cy = pc.intrinsics.w;
+    float width = float(pc.info.x), height = float(pc.info.y);
+    float inv_z = 1.0 / t.z;
+    vec2 center = vec2(fx * t.x * inv_z + cx, fy * t.y * inv_z + cy);
+
+    // Evaluate the projection Jacobian no further than 1.3x outside the frustum.
+    float lim_x = 1.3 * max(cx, width - cx) / fx;
+    float lim_y = 1.3 * max(cy, height - cy) / fy;
+    float tx = clamp(t.x * inv_z, -lim_x, lim_x);
+    float ty = clamp(t.y * inv_z, -lim_y, lim_y);
+    mat3 J = mat3(fx * inv_z, 0.0, 0.0,
+                  0.0, fy * inv_z, 0.0,
+                  -fx * tx * inv_z, -fy * ty * inv_z, 0.0);
+    mat3 W = transpose(mat3(pc.rot0.xyz, pc.rot1.xyz, pc.rot2.xyz));
+    mat3 R = quat_to_matrix(s.rotation);
+    mat3 M = mat3(R[0] * s.scale.x, R[1] * s.scale.y, R[2] * s.scale.z);
+    mat3 T = J * W;
+    mat3 cov = T * (M * transpose(M)) * transpose(T);
+
+    float a = cov[0][0], b = cov[0][1], c = cov[1][1];
+    float det_raw = a * c - b * b;
+    a += kDilation;
+    c += kDilation;
+    float det = a * c - b * b;
+    if ((pc.info.w & 0x100u) != 0u) {
+      // Mip-splatting style compensation for scenes trained with it.
+      opacity *= sqrt(max(det_raw, 0.0) / max(det, 1e-12));
+    }
+
+    if (det > 0.0 && opacity >= kMinAlpha) {
+      float mid = 0.5 * (a + c);
+      float spread = length(vec2(0.5 * (a - c), b));
+      float l1 = mid + spread;
+      float l2 = max(mid - spread, 0.1);
+      vec2 v1 = vec2(b, l1 - a);
+      float len = length(v1);
+      v1 = len > 1e-12 ? v1 / len : vec2(1.0, 0.0);
+      vec2 v2 = vec2(-v1.y, v1.x);
+      // Quad corners sit at +-2 along each axis, i.e. 2.83 sigma.
+      vec2 axis1 = v1 * min(sqrt(2.0 * l1), 2048.0);
+      vec2 axis2 = v2 * min(sqrt(2.0 * l2), 2048.0);
+      float extent = 2.0 * length(axis1);
+      bool on_screen = center.x + extent > 0.0 && center.x - extent < width &&
+                       center.y + extent > 0.0 && center.y - extent < height;
+      if (on_screen) {
+        uint degree = pc.info.w & 0xffu;
+        uint coeffs = degree == 0u ? 0u : (degree + 1u) * (degree + 1u) - 1u;
+        uint stride = (coeffs * 3u + 1u) / 2u;
+        vec3 color = eval_sh(s.sh_dc.xyz, degree, i * stride, normalize(p - pc.cam_pos.xyz));
+        out0 = uvec4(floatBitsToUint(center), floatBitsToUint(axis1));
+        out1 = uvec4(floatBitsToUint(axis2), packHalf2x16(color.rg), packHalf2x16(vec2(color.b, opacity)));
+        // Log depth spreads the 16-bit key evenly across scales; far splats get small keys.
+        float d = clamp(log2(t.z / kNear) / log2(kFar / kNear), 0.0, 1.0);
+        key = 65534u - uint(d * 65534.0);
+        atomicAdd(draw_args.instance_count, 1u);
+      }
+    }
+  }
+
+  projected[i * 2u] = out0;
+  projected[i * 2u + 1u] = out1;
+  keys[i] = key;
+}

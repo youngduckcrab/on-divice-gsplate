@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -46,6 +47,8 @@ struct DeviceInfo {
   VkPhysicalDeviceShaderFloat16Int8Features float16_int8{};
   bool has_atomic_float = false;
   VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomic_float{};
+  bool has_atomic_int64 = false;
+  VkPhysicalDeviceShaderAtomicInt64Features atomic_int64{};
   VkPhysicalDeviceMemoryProperties memory{};
   std::vector<VkQueueFamilyProperties> queue_families;
   uint32_t queue_family = 0;
@@ -57,6 +60,7 @@ struct EnabledFeatures {
   bool atomic_float_add = false;  // shaderBufferFloat32AtomicAdd
   bool float16 = false;           // shaderFloat16 arithmetic
   bool timestamps = false;        // timestamp queries on the compute queue
+  bool presentation = false;      // surface + swapchain extensions (Android)
 };
 
 enum class MemoryKind {
@@ -101,6 +105,7 @@ class ComputePipeline {
   ComputePipeline& operator=(ComputePipeline&& other) noexcept;
 
   void reset();
+  VkDescriptorSetLayout set_layout() const { return set_layout_; }
 
  private:
   friend class VkContext;
@@ -118,8 +123,10 @@ struct RunTiming {
   double best_ms() const { return gpu_ms >= 0.0 ? gpu_ms : cpu_ms; }
 };
 
-// Headless Vulkan context with a single compute-capable queue. Work is recorded
-// into a one-shot command buffer by run(), which submits and waits.
+// Vulkan context with a single universal (or compute) queue. One-off work is
+// recorded into a command buffer by run(), which submits and waits. Other
+// threads (e.g. a render loop) submit through submit()/present(), which share
+// the queue lock with run().
 class VkContext {
  public:
   VkContext();
@@ -129,20 +136,43 @@ class VkContext {
 
   const DeviceInfo& info() const { return info_; }
   const EnabledFeatures& enabled() const { return enabled_; }
+  VkInstance instance() const { return instance_; }
+  VkPhysicalDevice physical_device() const { return physical_; }
   VkDevice device() const { return device_; }
+  uint32_t queue_family() const { return info_.queue_family; }
   bool has_extension(const char* name) const;
 
-  Buffer create_buffer(VkDeviceSize size, MemoryKind kind);
+  Buffer create_buffer(VkDeviceSize size, MemoryKind kind, VkBufferUsageFlags extra_usage = 0);
   void upload(const Buffer& dst, const void* data, VkDeviceSize size);
   void download(const Buffer& src, void* data, VkDeviceSize size);
+  uint32_t find_memory_type(uint32_t type_bits, VkMemoryPropertyFlags required,
+                            VkMemoryPropertyFlags preferred) const;
 
+  VkShaderModule create_shader_module(std::span<const uint32_t> spirv) const;
   ComputePipeline create_compute_pipeline(std::span<const uint32_t> spirv, uint32_t binding_count,
                                           uint32_t push_constant_size);
 
-  RunTiming run(const std::function<void(VkCommandBuffer)>& record);
+  // Descriptor pools for sets that outlive a single run() (e.g. per-scene bindings).
+  VkDescriptorPool create_descriptor_pool(uint32_t max_sets, uint32_t max_storage_buffers) const;
+  // Allocates a set from `pool` and points bindings 0..n-1 at `buffers`.
+  VkDescriptorSet allocate_set(VkDescriptorPool pool, VkDescriptorSetLayout layout,
+                               std::initializer_list<const Buffer*> buffers) const;
+  // Same, from the context's transient pool; valid until the next run().
+  VkDescriptorSet allocate_transient_set(const ComputePipeline& pipeline,
+                                         std::initializer_list<const Buffer*> buffers) const;
 
-  // Binds `pipeline` with `buffers` at bindings 0..n-1 and dispatches.
-  // Only valid inside a run() callback (descriptor sets live until the next run).
+  RunTiming run(const std::function<void(VkCommandBuffer)>& record);
+  VkResult submit(const VkSubmitInfo& submit_info, VkFence fence);
+  VkResult present(const VkPresentInfoKHR& present_info);
+  // Waits until the queue is idle (e.g. before destroying a swapchain).
+  void queue_wait_idle();
+
+  void dispatch(VkCommandBuffer cmd, const ComputePipeline& pipeline, VkDescriptorSet set,
+                const void* push, uint32_t push_size, uint32_t groups_x, uint32_t groups_y = 1,
+                uint32_t groups_z = 1) const;
+
+  // Binds `buffers` at bindings 0..n-1 through a transient set and dispatches.
+  // Only valid inside a run() callback.
   void dispatch(VkCommandBuffer cmd, const ComputePipeline& pipeline,
                 std::initializer_list<const Buffer*> buffers, const void* push, uint32_t push_size,
                 uint32_t groups_x, uint32_t groups_y = 1, uint32_t groups_z = 1);
@@ -154,6 +184,13 @@ class VkContext {
     dispatch(cmd, pipeline, buffers, &push, sizeof(Push), groups_x, groups_y, groups_z);
   }
 
+  template <typename Push>
+  void dispatch(VkCommandBuffer cmd, const ComputePipeline& pipeline, VkDescriptorSet set,
+                const Push& push, uint32_t groups_x, uint32_t groups_y = 1,
+                uint32_t groups_z = 1) const {
+    dispatch(cmd, pipeline, set, &push, sizeof(Push), groups_x, groups_y, groups_z);
+  }
+
   // Full compute/transfer memory barrier between consecutive commands.
   static void barrier(VkCommandBuffer cmd);
 
@@ -163,8 +200,6 @@ class VkContext {
   void select_physical_device();
   void query_device_info();
   void create_device();
-  uint32_t find_memory_type(uint32_t type_bits, VkMemoryPropertyFlags required,
-                            VkMemoryPropertyFlags preferred) const;
 
   DeviceInfo info_;
   EnabledFeatures enabled_;
@@ -177,7 +212,9 @@ class VkContext {
   VkFence fence_ = VK_NULL_HANDLE;
   VkQueryPool query_pool_ = VK_NULL_HANDLE;
   VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
-  bool in_run_ = false;
+  std::recursive_mutex run_mutex_;  // serialises run(), which owns cmd_/fence_/descriptor_pool_
+  bool in_run_ = false;              // detects re-entrant run() on the same thread
+  std::mutex queue_mutex_;           // vkQueueSubmit/vkQueuePresentKHR need external synchronisation
 };
 
 inline uint32_t div_up(uint64_t value, uint32_t divisor) {

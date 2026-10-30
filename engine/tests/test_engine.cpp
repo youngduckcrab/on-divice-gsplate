@@ -10,22 +10,11 @@
 #include "gs/device_probe.h"
 #include "gs/radix_sort.h"
 #include "gs/vk_context.h"
+#include "test_util.h"
 
 namespace {
 
-int g_failures = 0;
-
-#define EXPECT(cond, ...)                                     \
-  do {                                                        \
-    if (!(cond)) {                                            \
-      ++g_failures;                                           \
-      std::fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); \
-      std::fprintf(stderr, __VA_ARGS__);                      \
-      std::fputc('\n', stderr);                               \
-    }                                                         \
-  } while (0)
-
-bool contains(const std::string& s, const char* needle) { return s.find(needle) != std::string::npos; }
+using test::contains;
 
 void test_probe(const gs::VkContext& ctx) {
   std::string json = gs::probe_json(ctx);
@@ -104,8 +93,8 @@ int main() {
     std::fprintf(stderr, "FAIL: exception: %s\n", e.what());
     return 1;
   }
-  if (g_failures > 0) {
-    std::fprintf(stderr, "%d failure(s)\n", g_failures);
+  if (test::failures > 0) {
+    std::fprintf(stderr, "%d failure(s)\n", test::failures);
     return 1;
   }
   std::printf("all tests passed\n");
