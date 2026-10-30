@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <random>
@@ -457,33 +458,69 @@ ProbeReport probe_gpu_ops(VkContext& ctx) {
   return r;
 }
 
+double benchmark_backward(VkContext& ctx, TrainOptions::Reduction reduction) {
+  // A mid-size, unsaturated load at the app's training size: 12k small
+  // gaussians, a few hundred pairs per tile in the busy tiles.
+  Dataset ds = make_test_dataset(360, 640, 1, false, 13);
+  SplatScene scene = make_test_scene(12000, 1, 17);
+  for (float& v : scene.log_scales) v -= 1.0f;
+  TrainOptions options = frozen_train_options(1, false);
+  options.reduction = reduction;
+  Trainer trainer(ctx, ds, scene, options);
+  const float bg[3] = {0.5f, 0.5f, 0.5f};
+  double total = 0.0;
+  int measured = 0;
+  for (int i = 0; i < 4; ++i) {
+    trainer.step_on(0, bg, true);
+    if (i > 0 && trainer.last_profile().valid) {  // the first step warms up
+      total += trainer.last_profile().backward;
+      ++measured;
+    }
+  }
+  return measured > 0 ? total / measured : 1e9;
+}
+
 ReductionChoice choose_reduction(VkContext& ctx) {
   using Reduction = TrainOptions::Reduction;
-  const std::pair<Reduction, const char*> candidates[] = {{Reduction::Subgroup, "subgroup"},
-                                                          {Reduction::SubgroupScalar, "subgroup_scalar"},
-                                                          {Reduction::SerialCut2, "serial_cut2"},
-                                                          {Reduction::SerialCut, "serial_cut"},
-                                                          {Reduction::Serial, "serial"},
-                                                          {Reduction::Shared, "shared"}};
+  struct Candidate {
+    Reduction reduction;
+    const char* name;
+    bool fallback;  // only when no faster variant is correct
+  };
+  const Candidate candidates[] = {{Reduction::Subgroup, "subgroup", false},
+                                  {Reduction::SubgroupScalar, "subgroup_scalar", false},
+                                  {Reduction::SerialCut, "serial_cut", false},
+                                  {Reduction::SerialCut2, "serial_cut2", false},
+                                  {Reduction::Serial, "serial", true},
+                                  {Reduction::Shared, "shared", true}};
   ReductionChoice choice;
-  for (const auto& [reduction, name] : candidates) {
+  double best_ms = 0.0;
+  char buffer[32];
+  for (const Candidate& c : candidates) {
+    if (c.fallback && choice.found) break;
     if (!choice.log.empty()) choice.log += ", ";
-    choice.log += name;
+    choice.log += c.name;
     try {
       // SH degree 1 keeps the CPU side short; every parameter group is still checked.
-      const GradientReport r = check_gradients(ctx, true, reduction, 1);
-      if (r.ok()) {
-        choice.found = true;
-        choice.reduction = reduction;
-        choice.name = name;
-        choice.log += " 정상";
-        return choice;
+      if (!check_gradients(ctx, true, c.reduction, 1).ok()) {
+        choice.log += " 틀림";
+        continue;
       }
-      choice.log += " 틀림";
+      // Among correct variants, the fastest backward on this GPU wins.
+      const double ms = c.fallback ? 0.0 : benchmark_backward(ctx, c.reduction);
+      std::snprintf(buffer, sizeof(buffer), " 정상 %.1f ms", ms);
+      choice.log += c.fallback ? std::string(" 정상") : std::string(buffer);
+      if (!choice.found || ms < best_ms) {
+        choice.found = true;
+        choice.reduction = c.reduction;
+        choice.name = c.name;
+        best_ms = ms;
+      }
     } catch (const std::exception&) {
       choice.log += " 사용 불가";
     }
   }
+  if (choice.found) choice.log += " → " + choice.name;
   return choice;
 }
 

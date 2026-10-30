@@ -87,7 +87,8 @@ void test_probes(gs::VkContext& ctx) {
          p.subgroups, p.subgroup_size);
   for (const auto& [name, result] : p.subgroup_parts) EXPECT(result == "ok", "subgroup %s: %s", name.c_str(), result.c_str());
   const gs::ReductionChoice choice = gs::choose_reduction(ctx);
-  EXPECT(choice.found && choice.name == "subgroup", "chosen %s (%s)", choice.name.c_str(), choice.log.c_str());
+  std::printf("  backward choice: %s\n", choice.log.c_str());
+  EXPECT(choice.found, "no backward variant chosen (%s)", choice.log.c_str());
 }
 
 void test_scan_and_densify(gs::VkContext& ctx) {

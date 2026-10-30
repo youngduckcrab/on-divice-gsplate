@@ -95,8 +95,12 @@ struct ProbeReport {
 };
 ProbeReport probe_gpu_ops(VkContext& ctx);
 
-// The first backward variant (fastest first) whose gradients match the CPU
-// reference on this GPU. `log` says what happened to each one tried.
+// GPU milliseconds of one backward pass on a mid-size synthetic load.
+double benchmark_backward(VkContext& ctx, TrainOptions::Reduction reduction);
+
+// The fastest backward variant (benchmark_backward) among those whose
+// gradients match the CPU reference on this GPU; the slow fallbacks only if
+// none does. `log` says what happened to each one tried.
 struct ReductionChoice {
   bool found = false;
   TrainOptions::Reduction reduction = TrainOptions::Reduction::Serial;
