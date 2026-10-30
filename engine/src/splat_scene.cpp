@@ -10,7 +10,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 
 namespace gs {
 namespace {
@@ -191,7 +190,7 @@ SceneBounds compute_bounds(const SplatScene& scene) {
   return bounds;
 }
 
-SplatScene load_ply(const uint8_t* data, size_t size) {
+PlyVertices::PlyVertices(const uint8_t* data, size_t size) {
   const std::string_view text(reinterpret_cast<const char*>(data), std::min<size_t>(size, 1 << 16));
   const size_t header_end = text.find("end_header\n");
   if (text.substr(0, 3) != "ply" || header_end == std::string_view::npos) {
@@ -242,53 +241,70 @@ SplatScene load_ply(const uint8_t* data, size_t size) {
   if (vertex->count > 0xffffffffull || offset + vertex->count * vertex->stride > size) {
     throw std::runtime_error("PLY 파일이 잘려 있음 (크기가 헤더와 맞지 않음)");
   }
+  base_ = data + offset;
+  count_ = vertex->count;
+  stride_ = vertex->stride;
+  for (const PlyProperty& p : vertex->properties) {
+    properties_.push_back({p.name, static_cast<int>(p.type), p.offset});
+  }
+}
 
-  std::unordered_map<std::string, const PlyProperty*> props;
-  for (const PlyProperty& p : vertex->properties) props[p.name] = &p;
+int PlyVertices::find(const std::string& name) const {
+  for (size_t i = 0; i < properties_.size(); ++i) {
+    if (properties_[i].name == name) return static_cast<int>(i);
+  }
+  return -1;
+}
+
+float PlyVertices::value(uint64_t vertex, int property) const {
+  const Property& p = properties_[property];
+  return read_ply_value(base_ + vertex * stride_ + p.offset, static_cast<PlyType>(p.type));
+}
+
+SplatScene load_ply(const uint8_t* data, size_t size) {
+  const PlyVertices ply(data, size);
   auto require = [&](const std::string& name) {
-    auto it = props.find(name);
-    if (it == props.end()) {
-      if (name == "f_dc_0" && props.count("packed_position")) {
+    const int index = ply.find(name);
+    if (index < 0) {
+      if (name == "f_dc_0" && ply.find("packed_position") >= 0) {
         throw std::runtime_error("압축 PLY(SuperSplat 등)는 아직 지원하지 않음");
       }
       throw std::runtime_error("가우시안 스플랫 PLY가 아님 (" + name + " 속성 없음)");
     }
-    return it->second;
+    return index;
   };
 
   int rest_count = 0;
-  while (props.count("f_rest_" + std::to_string(rest_count))) ++rest_count;
+  while (ply.find("f_rest_" + std::to_string(rest_count)) >= 0) ++rest_count;
   const int file_coeffs = rest_count / 3;
   const int file_degree = degree_for_rest_coeffs(file_coeffs);
   if (file_degree < 0) throw std::runtime_error("f_rest 개수가 SH 차수와 맞지 않음");
   const int degree = std::min(file_degree, 3);
   const int coeffs = sh_rest_coeffs(degree);
 
-  const PlyProperty* xyz[3] = {require("x"), require("y"), require("z")};
-  const PlyProperty* dc[3] = {require("f_dc_0"), require("f_dc_1"), require("f_dc_2")};
-  const PlyProperty* opacity = require("opacity");
-  const PlyProperty* scale[3] = {require("scale_0"), require("scale_1"), require("scale_2")};
-  const PlyProperty* rot[4] = {require("rot_0"), require("rot_1"), require("rot_2"), require("rot_3")};
-  std::vector<const PlyProperty*> rest(rest_count);
-  for (int i = 0; i < rest_count; ++i) rest[i] = props["f_rest_" + std::to_string(i)];
+  const int xyz[3] = {require("x"), require("y"), require("z")};
+  const int dc[3] = {require("f_dc_0"), require("f_dc_1"), require("f_dc_2")};
+  const int opacity = require("opacity");
+  const int scale[3] = {require("scale_0"), require("scale_1"), require("scale_2")};
+  const int rot[4] = {require("rot_0"), require("rot_1"), require("rot_2"), require("rot_3")};
+  std::vector<int> rest(rest_count);
+  for (int i = 0; i < rest_count; ++i) rest[i] = ply.find("f_rest_" + std::to_string(i));
 
   SplatScene scene;
   scene.convention = AxisConvention::RDF;
-  scene.resize(static_cast<uint32_t>(vertex->count), degree);
+  scene.resize(static_cast<uint32_t>(ply.count()), degree);
   for (uint32_t i = 0; i < scene.count; ++i) {
-    const uint8_t* v = data + offset + size_t(i) * vertex->stride;
     for (int k = 0; k < 3; ++k) {
-      scene.positions[i * 3 + k] = read_ply_value(v + xyz[k]->offset, xyz[k]->type);
-      scene.sh_dc[i * 3 + k] = read_ply_value(v + dc[k]->offset, dc[k]->type);
-      scene.log_scales[i * 3 + k] = read_ply_value(v + scale[k]->offset, scale[k]->type);
+      scene.positions[i * 3 + k] = ply.value(i, xyz[k]);
+      scene.sh_dc[i * 3 + k] = ply.value(i, dc[k]);
+      scene.log_scales[i * 3 + k] = ply.value(i, scale[k]);
     }
-    for (int k = 0; k < 4; ++k) scene.rotations[i * 4 + k] = read_ply_value(v + rot[k]->offset, rot[k]->type);
-    scene.opacity_logits[i] = read_ply_value(v + opacity->offset, opacity->type);
+    for (int k = 0; k < 4; ++k) scene.rotations[i * 4 + k] = ply.value(i, rot[k]);
+    scene.opacity_logits[i] = ply.value(i, opacity);
     // PLY stores f_rest channel-major: f_rest_[channel * file_coeffs + coeff].
     for (int j = 0; j < coeffs; ++j) {
       for (int c = 0; c < 3; ++c) {
-        const PlyProperty* p = rest[c * file_coeffs + j];
-        scene.sh_rest[(size_t(i) * coeffs + j) * 3 + c] = read_ply_value(v + p->offset, p->type);
+        scene.sh_rest[(size_t(i) * coeffs + j) * 3 + c] = ply.value(i, rest[c * file_coeffs + j]);
       }
     }
   }

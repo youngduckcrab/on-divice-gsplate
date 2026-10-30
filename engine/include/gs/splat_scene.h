@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace gs {
@@ -37,6 +38,27 @@ struct SceneBounds {
   float radius;     // 90th percentile distance from the center
 };
 SceneBounds compute_bounds(const SplatScene& scene);
+
+// The vertex element of a binary little-endian PLY, with typed property access
+// (point clouds as well as splats). Keeps a pointer into `data`.
+class PlyVertices {
+ public:
+  PlyVertices(const uint8_t* data, size_t size);  // throws std::runtime_error
+  uint64_t count() const { return count_; }
+  int find(const std::string& name) const;  // property index, -1 if absent
+  float value(uint64_t vertex, int property) const;
+
+ private:
+  struct Property {
+    std::string name;
+    int type;
+    size_t offset;
+  };
+  const uint8_t* base_ = nullptr;
+  uint64_t count_ = 0;
+  size_t stride_ = 0;
+  std::vector<Property> properties_;
+};
 
 // Loaders throw std::runtime_error with a user-presentable message.
 SplatScene load_ply(const uint8_t* data, size_t size);

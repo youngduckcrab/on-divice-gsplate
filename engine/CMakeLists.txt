@@ -75,7 +75,10 @@ add_custom_target(gs_shaders DEPENDS ${GS_SHADER_HEADERS})
 add_library(gsengine STATIC
   src/benchmarks.cpp
   src/camera.cpp
+  src/dataset.cpp
   src/device_probe.cpp
+  src/image_io.cpp
+  src/json_parse.cpp
   src/log.cpp
   src/offscreen.cpp
   src/radix_sort.cpp
@@ -88,7 +91,7 @@ add_dependencies(gsengine gs_shaders)
 target_compile_features(gsengine PUBLIC cxx_std_20)
 target_include_directories(gsengine
   PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
-  PRIVATE "${GS_SHADER_OUT}")
+  PRIVATE "${GS_SHADER_OUT}" "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb")
 target_link_libraries(gsengine PUBLIC ${GS_VULKAN_LIB})
 if(ANDROID)
   target_link_libraries(gsengine PUBLIC log z)
@@ -98,6 +101,8 @@ else()
 endif()
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(gsengine PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
+  # Third-party single-header code is compiled in image_io.cpp only.
+  set_source_files_properties(src/image_io.cpp PROPERTIES COMPILE_OPTIONS "-w")
 endif()
 
 # --- Desktop tests and tools --------------------------------------------------
