@@ -97,6 +97,7 @@ add_library(gsengine STATIC
   src/radix_sort.cpp
   src/splat_renderer.cpp
   src/splat_scene.cpp
+  src/train_selftest.cpp
   src/trainer.cpp
   src/vk_context.cpp
 )

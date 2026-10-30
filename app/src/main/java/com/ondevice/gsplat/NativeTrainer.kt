@@ -31,6 +31,12 @@ object NativeTrainer {
     /** Writes the current model as a 3DGS .ply. */
     external fun exportPly(path: String): String
 
+    /**
+     * Checks the trainer on this GPU: every parameter's gradient against a CPU
+     * reference (both backward variants) and a small fit of a known scene.
+     */
+    external fun selfTest(): String
+
     /** Frees the dataset and GPU buffers. */
     external fun release()
 }

@@ -455,6 +455,7 @@ void VkContext::download(const Buffer& src, void* data, VkDeviceSize size) {
   run([&](VkCommandBuffer cmd) {
     VkBufferCopy region{0, 0, size};
     vkCmdCopyBuffer(cmd, src.handle(), staging.handle(), 1, &region);
+    barrier_to_host(cmd);
   });
   std::memcpy(data, staging.mapped(), size);
 }
@@ -651,6 +652,14 @@ void VkContext::dispatch(VkCommandBuffer cmd, const ComputePipeline& pipeline,
                          uint32_t groups_z) {
   VkDescriptorSet set = allocate_transient_set(pipeline, buffers);
   dispatch(cmd, pipeline, set, push, push_size, groups_x, groups_y, groups_z);
+}
+
+void VkContext::barrier_to_host(VkCommandBuffer cmd) {
+  VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
 }
 
 void VkContext::barrier(VkCommandBuffer cmd) {

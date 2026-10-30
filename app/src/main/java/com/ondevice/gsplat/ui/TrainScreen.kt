@@ -114,7 +114,20 @@ fun TrainScreen(onOpenModel: (File) -> Unit, vm: TrainViewModel = viewModel()) {
                 }
             }
         }
-        if (vm.prepared != null || vm.phase == Phase.FAILED) {
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("엔진 자가 검사", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "이 폰의 GPU로 계산한 그래디언트를 CPU 기준값과 비교하고, 알려진 작은 장면을 학습해 봅니다.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                OutlinedButton(enabled = !vm.running, onClick = vm::runSelfTest) {
+                    Text(if (vm.phase == Phase.SELF_TEST) "검사 중…" else "자가 검사 실행")
+                }
+                for (line in vm.selfTestLines()) Text(line, style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        if (vm.prepared != null || vm.phase == Phase.FAILED || vm.selfTest != null) {
             Button(
                 onClick = {
                     val clipboard = context.getSystemService(ClipboardManager::class.java)

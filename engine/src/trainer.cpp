@@ -340,6 +340,7 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
     }
     VkBufferCopy region{0, 0, 4};
     vkCmdCopyBuffer(cmd, totals_.handle(), readback_small_.handle(), 1, &region);
+    VkContext::barrier_to_host(cmd);
   });
   uint32_t pairs = 0;
   std::memcpy(&pairs, readback_small_.mapped(), 4);
@@ -367,6 +368,7 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
     VkContext::barrier(cmd);
     VkBufferCopy loss{0, 0, tile_loss_.size()};
     vkCmdCopyBuffer(cmd, tile_loss_.handle(), readback_loss_.handle(), 1, &loss);
+    VkContext::barrier_to_host(cmd);
   };
   auto backward = [&](VkCommandBuffer cmd) {
     ctx_.dispatch(cmd, backward_,
@@ -472,6 +474,7 @@ void Trainer::densify() {
     vkCmdFillBuffer(cmd, stats_buf_.handle(), 0, VK_WHOLE_SIZE, 0);
     VkBufferCopy region{0, 0, 16};
     vkCmdCopyBuffer(cmd, counters_.handle(), readback_small_.handle(), 1, &region);
+    VkContext::barrier_to_host(cmd);
   });
   uint32_t counters[4];
   std::memcpy(counters, readback_small_.mapped(), sizeof(counters));
@@ -503,6 +506,7 @@ std::vector<uint8_t> Trainer::render(const Camera& camera, const float backgroun
   ctx_.run([&](VkCommandBuffer cmd) {
     VkBufferCopy region{0, 0, image_.size()};
     vkCmdCopyBuffer(cmd, image_.handle(), readback_image_.handle(), 1, &region);
+    VkContext::barrier_to_host(cmd);
   });
   std::vector<uint8_t> out(size_t(width_) * height_ * 4);
   std::memcpy(out.data(), readback_image_.mapped(), out.size());

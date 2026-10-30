@@ -195,6 +195,8 @@ class VkContext {
 
   // Full compute/transfer memory barrier between consecutive commands.
   static void barrier(VkCommandBuffer cmd);
+  // Makes transfer writes (e.g. copies into Readback buffers) visible to host reads.
+  static void barrier_to_host(VkCommandBuffer cmd);
 
  private:
   void init();

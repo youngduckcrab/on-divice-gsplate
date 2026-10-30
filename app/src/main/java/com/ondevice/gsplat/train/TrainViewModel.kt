@@ -35,7 +35,7 @@ enum class Preset(val label: String, val width: Int, val iterations: Int, val ma
     HIGH("고품질", 540, 7000, 400_000),
 }
 
-enum class Phase { IDLE, IMPORTING, PREPARING, TRAINING, FINISHING, DONE, FAILED }
+enum class Phase { IDLE, IMPORTING, SELF_TEST, PREPARING, TRAINING, FINISHING, DONE, FAILED }
 
 data class TrainResult(
     val modelFile: File,
@@ -91,7 +91,13 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
     var result by mutableStateOf<TrainResult?>(null)
         private set
 
-    val running: Boolean get() = phase == Phase.PREPARING || phase == Phase.TRAINING || phase == Phase.FINISHING
+    /** Result of the engine self-test (gradients against the CPU reference on this GPU). */
+    var selfTest by mutableStateOf<JSONObject?>(null)
+        private set
+
+    val running: Boolean
+        get() = phase == Phase.PREPARING || phase == Phase.TRAINING || phase == Phase.FINISHING ||
+            phase == Phase.SELF_TEST
 
     private val trainThread = Executors.newSingleThreadExecutor { Thread(it, "gsplat-train") }
     private val trainDispatcher = trainThread.asCoroutineDispatcher()
@@ -253,6 +259,58 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** Stops after the current batch; the model so far is still evaluated and saved. */
+    fun runSelfTest() {
+        if (running || loadError != null) return
+        viewModelScope.launch {
+            val previous = phase
+            phase = Phase.SELF_TEST
+            status = "엔진 자가 검사 중… (1분 안쪽)"
+            selfTest = nativeCall { NativeTrainer.selfTest() }
+            status = ""
+            phase = if (previous == Phase.SELF_TEST) Phase.IDLE else previous
+        }
+    }
+
+    /** One line per check, for the screen and the summary. */
+    fun selfTestLines(): List<String> {
+        val t = selfTest ?: return emptyList()
+        if (t.has("error") && !t.has("gradients")) return listOf("자가 검사 오류: ${t.optString("error")}")
+        return buildList {
+            add("자가 검사: ${if (t.optBoolean("ok")) "정상" else "문제 있음"} (${sec(t.optDouble("ms"))})")
+            val grads = t.optJSONArray("gradients")
+            for (i in 0 until (grads?.length() ?: 0)) {
+                val g = grads!!.getJSONObject(i)
+                val label = "${g.optString("requested")} · ${if (g.optBoolean("masked")) "마스크" else "일반"}"
+                if (g.has("error")) {
+                    add("  $label: 실행 안 됨 (${g.optString("error")})")
+                    continue
+                }
+                val groups = g.optJSONArray("groups")
+                val wrong = (0 until (groups?.length() ?: 0)).map { groups!!.getJSONObject(it) }
+                    .filter { it.optInt("bad") > 0 }
+                    .joinToString(", ") { "${it.optString("name")} ${it.optInt("bad")}/${it.optInt("checked")}" }
+                add(
+                    "  $label: ${if (g.optBoolean("ok")) "정상" else "틀림"} · 이미지 차 " +
+                        "${"%.4f".format(Locale.US, g.optDouble("image_max_diff"))} · loss " +
+                        "${"%.5f".format(Locale.US, g.optDouble("loss_gpu"))}/${"%.5f".format(Locale.US, g.optDouble("loss_ref"))}" +
+                        if (wrong.isNotEmpty()) " · 틀린 그래디언트: $wrong" else "",
+                )
+            }
+            t.optJSONObject("fit")?.let { f ->
+                if (f.has("error")) {
+                    add("  장면 맞추기: 오류 (${f.optString("error")})")
+                } else {
+                    add(
+                        "  장면 맞추기(${f.optString("reduction")}): ${if (f.optBoolean("ok")) "정상" else "실패"} · " +
+                            "PSNR ${"%.1f".format(Locale.US, f.optDouble("psnr_before"))} → " +
+                            "${"%.1f".format(Locale.US, f.optDouble("psnr_after"))} dB · ${f.optInt("steps")}회 · " +
+                            "${"%.1f".format(Locale.US, f.optDouble("ms_per_step"))} ms/회",
+                    )
+                }
+            }
+        }
+    }
+
     fun stop() {
         if (phase == Phase.TRAINING || phase == Phase.PREPARING) {
             stopRequested = true
@@ -339,7 +397,9 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             if (r != null) appendLine("저장: ${r.modelFile.name} · ${r.gaussians}개 · ${"%.1f".format(Locale.US, r.bytes / 1e6)} MB")
+            psnrTrend()?.let { appendLine("학습 뷰 PSNR 추이 (구간 평균): $it") }
             appendLine("발열: ${thermalText(thermalStart)} → ${thermalText(thermalEnd ?: thermal)}")
+            selfTestLines().forEach { appendLine(it) }
             if (status.isNotEmpty()) appendLine("상태: $status")
         }.trimEnd()
     }
@@ -389,6 +449,19 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
     private fun sec(ms: Double) = "%.1f s".format(Locale.US, ms / 1000.0)
 
     private fun f1(v: Double) = "%.1f".format(Locale.US, v)
+
+    /** Training-view PSNR averaged over ten equal stretches of the run, e.g. "0-400: 18.2, 400-800: 22.5". */
+    private fun psnrTrend(): String? {
+        val points = history.toList()
+        if (points.size < 2) return null
+        val last = points.last().first.coerceAtLeast(1)
+        val buckets = 10
+        val size = (last + buckets - 1) / buckets
+        return points.groupBy { (it.first - 1).coerceAtLeast(0) / size }
+            .toSortedMap()
+            .map { (b, list) -> "${b * size}-${(b + 1) * size}: ${"%.1f".format(Locale.US, list.map { it.second }.average())}" }
+            .joinToString(", ")
+    }
 
     private companion object {
         const val BATCH = 10

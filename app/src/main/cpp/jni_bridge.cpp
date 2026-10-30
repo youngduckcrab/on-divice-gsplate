@@ -21,6 +21,7 @@
 #include "gs/json.h"
 #include "gs/splat_renderer.h"
 #include "gs/splat_scene.h"
+#include "gs/train_selftest.h"
 #include "gs/trainer.h"
 #include "gs/vk_context.h"
 #include "viewer.h"
@@ -489,6 +490,27 @@ Java_com_ondevice_gsplat_NativeTrainer_exportPly(JNIEnv* env, jobject /*this*/, 
     w.end_object();
     return w.str();
   }));
+}
+
+// Gradient checks against the CPU reference and a small fit, on this GPU.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ondevice_gsplat_NativeTrainer_selfTest(JNIEnv* env, jobject /*this*/) {
+  std::lock_guard<std::mutex> lock(g_train_mutex);
+  try {
+    std::shared_ptr<gs::VkContext> ctx;
+    {
+      std::lock_guard<std::mutex> ctx_lock(g_mutex);
+      ctx = context_locked();
+    }
+    const auto t0 = Clock::now();
+    std::string json = gs::trainer_self_test_json(*ctx);
+    // Append the duration before the closing brace.
+    json.pop_back();
+    json += ",\"ms\":" + std::to_string(ms_since(t0)) + "}";
+    return to_jstring(env, json);
+  } catch (const std::exception& e) {
+    return to_jstring(env, error_json(e.what()));
+  }
 }
 
 extern "C" JNIEXPORT void JNICALL
