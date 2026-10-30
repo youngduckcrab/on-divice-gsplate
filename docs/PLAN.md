@@ -9,7 +9,7 @@
 | 촬영 대상 | **사람** (인물 3D 스캔) |
 | 진행 방식 | Claude가 구현 → APK 배포 → 사용자가 설치·실험 → **이 대화로 피드백** → 반복 |
 | 저장소 | private (GitHub Release로 APK 배포) |
-| 상태 | **M3 첫 빌드(v0.3.0) 배포** — 가상 촬영 데이터셋으로 폰에서 학습. 기기 실측 대기 중. 촬영(M2)은 보류 |
+| 상태 | **M3 진행 중** — v0.3.5에서 폰 GPU 학습이 처음으로 맞게 동작(자가 검사 통과). 실제 데이터셋 학습 결과 대기. 촬영(M2)은 보류 |
 
 ### 변경 이력
 - v0.5: M3 1차 구현 반영 — atomic-free 그래디언트 방식 (c) 채택, densify를 M3로 앞당김(3DGS 방식, GPU에서 free list로 처리), D-SSIM은 M4로, 학습 이미지는 매 단계 업로드(128 MB 바인딩 제한 회피). §5.3 갱신.
@@ -235,6 +235,7 @@ on-divice-gsplate/
 4. **Loss** — L1. 마스크가 있으면 정답을 무작위 배경색 위에 합성하고 렌더도 같은 배경색 위에 그려, 대상 밖은 투명해지도록 학습한다. (M4: (1−λ)·L1 + λ·D-SSIM)
 5. **Backward 래스터** (`train_backward`) — back-to-front로 다시 순회. **(c) atomic-free 방식 채택**: 가우시안 B개씩 묶어 픽셀별 그래디언트를 subgroupAdd → 공유 메모리에서 subgroup끼리 합산 → (타일, 가우시안) 쌍별 그래디언트를 정렬 전 인덱스 위치에 기록. 가장 작은 subgroup 크기에 맞춰 공유 메모리 크기를 specialization constant로 정한다 (Adreno 64 → B=32, lavapipe 8 → B=8).
    - (a)는 Fold6에서 불가(float atomic 없음), (b)·(d)는 (c)가 느릴 때 비교 후보로 남긴다.
+   - **v0.3.5 Fold6 자가 검사 — 학습 동작 확인**: serial 역전파의 그래디언트가 CPU 기준과 일치(일반·마스크 모두, 0 아닌 쌍 28/36 = PC와 동일), 장면 맞추기 24.9 → 36.5 dB(600회, 2.3 ms/회, PC 36.8 dB). shared는 여전히 0. subgroup 기능은 하나씩(basic/elect/id/float add/ballot)은 모두 컴파일되지만 조합한 probe와 학습 셰이더는 실패 → 다음: 조합(vec4 덧셈, id+add 등) probe로 원인 찾아 빠른 역전파 복구.
    - **v0.3.4 Fold6 자가 검사**: 공유 메모리 atomic 정상, 순전파 기록·갱신 단계 정상, shared 역전파 출력만 거의 전부 0(36쌍 중 1쌍). subgroup은 최소 probe 셰이더도 `VK_ERROR_UNKNOWN`. → v0.3.5: 순전파와 같은 구조(단일 반복문, 가우시안 하나씩, 2단계 공유 메모리 합)의 serial 역전파 추가, 학습 전 폰 GPU에서 변형별 그래디언트를 CPU 기준과 비교해 맞는 첫 변형을 선택(없으면 학습 거부), subgroup 기능별 컴파일 probe.
    - **v0.3.3 Fold6 자가 검사**: 순전파는 CPU 기준과 일치(이미지 차 0.002, loss 일치)하지만 shared 역전파의 그래디언트가 전부 0 → 학습이 전혀 진행되지 않음(장면 맞추기 24.9 → 24.9 dB). subgroup 역전파는 vote·특수 상수 없이도 `VK_ERROR_UNKNOWN`. 유력 원인: 타일의 기여 수 최댓값을 구하던 공유 메모리 `atomicMax`(radix sort가 쓰는 atomicAdd는 정상) → v0.3.4에서 트리 최댓값으로 대체, 스칼라 subgroupAdd 버전 추가, GPU 기본 연산 probe와 단계별(순전파 기록 → 역전파 출력 → 갱신) 검사 추가. shared 역전파는 1회 214 ms 중 173 ms로 매우 느림.
    - **v0.3.1 Fold6 결과**: 학습은 돌았으나 lizard 결과가 "색이 사라지고 흰색만 조금". 원인: 점 구름(3만 개, 조각상 반경 3 m)이 거의 조각상 위에만 있어 공원 배경을 학습할 수 없었음 → 주변까지 6만 개로 다시 뽑아 90×160·600회 hold-out PSNR 15.5 → 24.1 dB. opacity 리셋은 짧은 학습에서 이득이 없고(head 36.1 → 36.5 dB, lizard 15.5 → 15.1 dB) 중간에 모델이 사라지는 것처럼 보여 기본값에서 뺌.
