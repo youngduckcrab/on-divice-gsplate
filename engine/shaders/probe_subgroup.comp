@@ -1,0 +1,23 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Self-test probe of subgroup arithmetic. Per subgroup (first lane writes):
+// [4i] scalar sum of the invocation indices, [4i+1] vec4 lane count,
+// [4i+2] vec4 sum of the indices, [4i+3] gl_SubgroupSize; [255] subgroups.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Out { uint result[]; };
+
+void main() {
+  uint lid = gl_LocalInvocationIndex;
+  float f = float(lid);
+  float s = subgroupAdd(f);
+  vec4 v = subgroupAdd(vec4(1.0, f, 2.0, 0.5));
+  if (subgroupElect() && gl_SubgroupID < 63u) {
+    result[gl_SubgroupID * 4u] = uint(s);
+    result[gl_SubgroupID * 4u + 1u] = uint(v.x);
+    result[gl_SubgroupID * 4u + 2u] = uint(v.y);
+    result[gl_SubgroupID * 4u + 3u] = gl_SubgroupSize;
+  }
+  if (lid == 0u) result[255] = gl_NumSubgroups;
+}

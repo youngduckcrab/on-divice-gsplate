@@ -17,9 +17,10 @@ namespace gs {
 struct TrainOptions {
   // How the backward pass sums gradients over a tile's pixels.
   enum class Reduction {
-    Auto,      // subgroup adds when available and accepted by the driver, else Shared
-    Subgroup,  // subgroup adds (fails if unavailable)
-    Shared,    // shared-memory tree, no subgroup operations (slower)
+    Auto,            // the first of the variants below the driver accepts
+    Subgroup,        // vec4 subgroup adds (fails if unavailable)
+    SubgroupScalar,  // scalar subgroup adds (fails if unavailable)
+    Shared,          // shared-memory tree, no subgroup operations (slower)
   };
 
   uint32_t iterations = 3000;
@@ -128,6 +129,16 @@ class Trainer {
     std::vector<float> sh;      // sh_stride() per slot
   };
   Gradients first_step_gradients();
+  // Testing: intermediate buffers of the most recent step.
+  struct DebugSnapshot {
+    std::vector<uint32_t> pixel_count;  // pairs up to the last contributor, per pixel
+    std::vector<float> pixel_grad;      // 4 per pixel: dL/dC rgb, final transmittance
+    std::vector<float> projected;       // 16 per slot
+    std::vector<uint32_t> tiles;        // tiles touched per slot
+    std::vector<uint32_t> offsets;      // first pair per slot
+    std::vector<float> pair_grads;      // 12 per pair, pre-sort order
+  };
+  DebugSnapshot debug_snapshot();
   uint32_t sh_stride() const { return sh_stride_; }
   // "subgroup" or "shared", and why the subgroup variant was not used, if it was not.
   const std::string& reduction() const { return reduction_; }

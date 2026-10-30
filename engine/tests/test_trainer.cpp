@@ -34,7 +34,25 @@ void test_gradients(gs::VkContext& ctx, bool masked,
     EXPECT(g.bad <= g.checked / 20, "%s gradients: %d of %d off (masked %d, %s)", g.name.c_str(), g.bad, g.checked,
            int(masked), r.reduction.c_str());
   }
+  const gs::StageReport& st = r.stages;
+  std::printf("  stages %s %-15s: covered %u (no count %u), max count %u, pairs %llu (nonzero %llu), "
+              "colour bad backward %d / step %d of %d\n",
+              masked ? "masked" : "plain ", r.reduction.c_str(), st.covered, st.covered_no_count, st.max_count,
+              (unsigned long long)st.pairs, (unsigned long long)st.pairs_nonzero, st.backward_colour_bad,
+              st.step_colour_bad, st.colour_checked);
+  EXPECT(st.covered > 0 && st.covered_no_count == 0, "forward bookkeeping: %u covered, %u without count",
+         st.covered, st.covered_no_count);
+  EXPECT(st.pairs_nonzero > 0, "backward wrote no gradients");
+  EXPECT(st.backward_colour_bad == 0 && st.step_colour_bad == 0, "stage colour checks: backward %d, step %d",
+         st.backward_colour_bad, st.step_colour_bad);
   EXPECT(r.ok(), "gradient report not ok");
+}
+
+void test_probes(gs::VkContext& ctx) {
+  const gs::ProbeReport p = gs::probe_gpu_ops(ctx);
+  EXPECT(p.shared_ok, "shared probe: max %u add %u tree %u", p.atomic_max, p.atomic_add, p.tree_max);
+  EXPECT(p.subgroup_compiled && p.subgroup_ok, "subgroup probe: %s, %u subgroups of %u", p.subgroup_error.c_str(),
+         p.subgroups, p.subgroup_size);
 }
 
 void test_scan_and_densify(gs::VkContext& ctx) {
@@ -188,6 +206,8 @@ int main() {
     test_gradients(ctx, false);
     test_gradients(ctx, true);
     test_gradients(ctx, true, gs::TrainOptions::Reduction::Shared);
+    test_gradients(ctx, true, gs::TrainOptions::Reduction::SubgroupScalar);
+    test_probes(ctx);
     test_scan_and_densify(ctx);
     test_training_converges(ctx);
     test_self_test_json(ctx);

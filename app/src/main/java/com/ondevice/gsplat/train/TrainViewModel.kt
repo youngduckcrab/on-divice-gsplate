@@ -277,6 +277,22 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         if (t.has("error") && !t.has("gradients")) return listOf("자가 검사 오류: ${t.optString("error")}")
         return buildList {
             add("자가 검사: ${if (t.optBoolean("ok")) "정상" else "문제 있음"} (${sec(t.optDouble("ms"))})")
+            t.optJSONObject("probes")?.let { p ->
+                if (p.has("error")) {
+                    add("  GPU 기본 연산: 오류 (${p.optString("error")})")
+                } else {
+                    add(
+                        "  GPU 기본 연산: 공유 메모리 ${if (p.optBoolean("shared_ok")) "정상" else "틀림"} " +
+                            "(max ${p.optInt("atomic_max")}/250, add ${p.optInt("atomic_add")}/32640, " +
+                            "tree ${p.optInt("tree_max")}/250) · subgroup " +
+                            when {
+                                !p.optBoolean("subgroup_compiled") -> "컴파일 실패 (${p.optString("subgroup_error")})"
+                                p.optBoolean("subgroup_ok") -> "정상"
+                                else -> "틀림"
+                            } + " (${p.optInt("subgroups")}개 × ${p.optInt("subgroup_size")})",
+                    )
+                }
+            }
             val grads = t.optJSONArray("gradients")
             for (i in 0 until (grads?.length() ?: 0)) {
                 val g = grads!!.getJSONObject(i)
@@ -295,6 +311,14 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                         "${"%.5f".format(Locale.US, g.optDouble("loss_gpu"))}/${"%.5f".format(Locale.US, g.optDouble("loss_ref"))}" +
                         if (wrong.isNotEmpty()) " · 틀린 그래디언트: $wrong" else "",
                 )
+                g.optJSONObject("stages")?.let { st ->
+                    add(
+                        "    단계: 덮인 픽셀 ${st.optInt("covered")} (기여 수 0: ${st.optInt("covered_no_count")}, " +
+                            "최대 ${st.optInt("max_count")}) · 쌍 ${st.optInt("pairs")} (0 아님: ${st.optInt("pairs_nonzero")}) · " +
+                            "색 그래디언트 틀림 역전파 ${st.optInt("backward_colour_bad")} / 갱신 ${st.optInt("step_colour_bad")} " +
+                            "(${st.optInt("colour_checked")}개 중)",
+                    )
+                }
             }
             t.optJSONObject("fit")?.let { f ->
                 if (f.has("error")) {

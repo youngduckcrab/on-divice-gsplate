@@ -1,0 +1,5 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Backward pass, subgroup reduction with scalar adds (see train_backward.glsl).
+#define GS_SUBGROUP_SCALAR
+#include "train_backward.glsl"

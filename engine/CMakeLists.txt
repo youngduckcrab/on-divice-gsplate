@@ -57,6 +57,9 @@ set(GS_SHADERS
   train_forward.comp
   train_backward.comp
   train_backward_shared.comp
+  train_backward_scalar.comp
+  probe_ops.comp
+  probe_subgroup.comp
   train_step.comp
   train_densify_mark.comp
   train_densify_spawn.comp

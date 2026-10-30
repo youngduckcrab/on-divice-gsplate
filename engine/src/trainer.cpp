@@ -12,6 +12,7 @@
 #include "shaders/scan_add.h"
 #include "shaders/scan_local.h"
 #include "shaders/train_backward.h"
+#include "shaders/train_backward_scalar.h"
 #include "shaders/train_backward_shared.h"
 #include "shaders/train_densify_mark.h"
 #include "shaders/train_densify_spawn.h"
@@ -132,10 +133,9 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
   densify_spawn_ = make("train_densify_spawn", shaders::train_densify_spawn, 11, sizeof(uint32_t));
   reset_opacity_ = make("train_reset_opacity", shaders::train_reset_opacity, 4, sizeof(float));
 
-  // Backward pass: subgroup reduction when the device has it and the driver
-  // compiles it, else the shared-memory variant.
-  const VkSubgroupFeatureFlags needed =
-      VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT;
+  // Backward pass: the first subgroup variant the driver accepts (when the
+  // device has subgroup arithmetic), else the shared-memory variant.
+  const VkSubgroupFeatureFlags needed = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;
   const bool has_subgroups = (info.subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
                              (info.subgroup.supportedOperations & needed) == needed;
   uint32_t min_subgroup = info.subgroup.subgroupSize;
@@ -148,18 +148,33 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
   while (batch > 1 && max_subgroups * batch * 3 > 512) batch /= 2;
   backward_push_[0] = batch;
   backward_push_[1] = max_subgroups;
-  if (has_subgroups && min_subgroup >= 4 && options_.reduction != TrainOptions::Reduction::Shared) {
+  using Reduction = TrainOptions::Reduction;
+  struct Variant {
+    Reduction reduction;
+    const char* name;
+    std::span<const uint32_t> spirv;
+  };
+  const Variant variants[] = {{Reduction::Subgroup, "subgroup", shaders::train_backward},
+                              {Reduction::SubgroupScalar, "subgroup_scalar", shaders::train_backward_scalar}};
+  for (const Variant& v : variants) {
+    if (!reduction_.empty()) break;
+    if (options_.reduction != Reduction::Auto && options_.reduction != v.reduction) continue;
+    if (!has_subgroups || min_subgroup < 4) {
+      reduction_note_ = "subgroup 연산 미지원";
+      break;
+    }
     try {
-      backward_ = ctx.create_compute_pipeline(shaders::train_backward, 8, sizeof(backward_push_));
-      reduction_ = "subgroup";
+      backward_ = ctx.create_compute_pipeline(v.spirv, 8, sizeof(backward_push_));
+      reduction_ = v.name;
     } catch (const VulkanError& e) {
-      log_error("trainer: subgroup backward rejected (%s), using shared-memory reduction", e.what());
-      reduction_note_ = std::string("subgroup 버전 실패: ") + vk_result_name(e.result);
+      log_error("trainer: %s backward rejected (%s)", v.name, e.what());
+      if (!reduction_note_.empty()) reduction_note_ += ", ";
+      reduction_note_ += std::string(v.name) + " 실패: " + vk_result_name(e.result);
     }
   }
   if (reduction_.empty()) {
-    if (options_.reduction == TrainOptions::Reduction::Subgroup) {
-      throw std::runtime_error("subgroup 역전파를 쓸 수 없음");
+    if (options_.reduction != Reduction::Auto && options_.reduction != Reduction::Shared) {
+      throw std::runtime_error("subgroup 역전파를 쓸 수 없음 (" + reduction_note_ + ")");
     }
     backward_push_[0] = 32;
     backward_ = make("train_backward_shared", shaders::train_backward_shared, 8, sizeof(backward_push_));
@@ -571,6 +586,26 @@ Trainer::Gradients Trainer::first_step_gradients() {
   for (float& v : g.params) v /= (1.0f - kBeta1);
   for (float& v : g.sh) v /= (1.0f - kBeta1);
   return g;
+}
+
+Trainer::DebugSnapshot Trainer::debug_snapshot() {
+  DebugSnapshot d;
+  const size_t pixels = size_t(width_) * height_;
+  d.pixel_count.resize(pixels);
+  d.pixel_grad.resize(pixels * 4);
+  d.projected.resize(size_t(slots_) * 16);
+  d.tiles.resize(slots_);
+  d.offsets.resize(slots_);
+  d.pair_grads.resize(size_t(stats_.pairs) * 12);
+  ctx_.download(pixel_count_, d.pixel_count.data(), d.pixel_count.size() * 4);
+  ctx_.download(pixel_grad_, d.pixel_grad.data(), d.pixel_grad.size() * 4);
+  if (slots_ > 0) {
+    ctx_.download(projected_, d.projected.data(), d.projected.size() * 4);
+    ctx_.download(tiles_, d.tiles.data(), d.tiles.size() * 4);
+    ctx_.download(offsets_, d.offsets.data(), d.offsets.size() * 4);
+  }
+  if (!d.pair_grads.empty()) ctx_.download(pair_grads_, d.pair_grads.data(), d.pair_grads.size() * 4);
+  return d;
 }
 
 }  // namespace gs

@@ -1,0 +1,33 @@
+#version 450
+// Self-test probe of shared-memory operations the training kernels rely on.
+// result[0] = atomicMax, [1] = atomicAdd, [2] = tree max over 256 invocations.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Out { uint result[]; };
+
+shared uint s_max;
+shared uint s_sum;
+shared uint s_tree[256];
+
+void main() {
+  uint lid = gl_LocalInvocationIndex;
+  if (lid == 0u) {
+    s_max = 0u;
+    s_sum = 0u;
+  }
+  barrier();
+  uint v = (lid * 7u) % 251u;  // max over 0..255 is 250
+  atomicMax(s_max, v);
+  atomicAdd(s_sum, lid);  // 32640
+  s_tree[lid] = v;
+  barrier();
+  for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+    if (lid < stride) s_tree[lid] = max(s_tree[lid], s_tree[lid + stride]);
+    barrier();
+  }
+  if (lid == 0u) {
+    result[0] = s_max;
+    result[1] = s_sum;
+    result[2] = s_tree[0];
+  }
+}

@@ -37,6 +37,18 @@ struct GradientGroup {
   int checked = 0;
 };
 
+// Where a wrong gradient comes from: each stage of the step checked on its own.
+struct StageReport {
+  uint32_t covered = 0;           // pixels with final transmittance < 0.999
+  uint32_t covered_no_count = 0;  // ...whose last-contributor count is 0 (forward bookkeeping lost)
+  uint32_t max_count = 0;
+  uint64_t pairs = 0;
+  uint64_t pairs_nonzero = 0;     // pairs with any nonzero gradient (backward output)
+  int colour_checked = 0;
+  int backward_colour_bad = 0;    // per-gaussian sums of the pairs' dL/dcolour vs the reference
+  int step_colour_bad = 0;        // the step kernel's SH DC gradient vs those sums
+};
+
 struct GradientReport {
   std::string reduction;  // backward variant that ran
   bool masked = false;
@@ -44,6 +56,7 @@ struct GradientReport {
   double loss_gpu = 0.0;
   double loss_ref = 0.0;
   std::vector<GradientGroup> groups;
+  StageReport stages;
   bool ok() const;
 };
 
@@ -64,8 +77,21 @@ struct FitReport {
 FitReport fit_known_scene(VkContext& ctx, uint32_t steps = 600,
                           TrainOptions::Reduction reduction = TrainOptions::Reduction::Auto);
 
-// Gradient checks for each available backward variant (plain and masked
-// targets) and the fit, as JSON with "ok".
+// The shared-memory and subgroup primitives the kernels use, on this GPU.
+struct ProbeReport {
+  uint32_t atomic_max = 0;  // expected 250
+  uint32_t atomic_add = 0;  // expected 32640
+  uint32_t tree_max = 0;    // expected 250
+  bool shared_ok = false;
+  bool subgroup_compiled = false;
+  std::string subgroup_error;
+  bool subgroup_ok = false;
+  uint32_t subgroups = 0;     // per 256-invocation workgroup
+  uint32_t subgroup_size = 0;
+};
+ProbeReport probe_gpu_ops(VkContext& ctx);
+
+// GPU probes, gradient checks for each backward variant and the fit, as JSON with "ok".
 std::string trainer_self_test_json(VkContext& ctx);
 
 }  // namespace gs

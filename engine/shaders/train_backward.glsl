@@ -5,13 +5,14 @@
 // Mobile GPUs lack float atomics, so instead of accumulating into the
 // gaussian, each pair's gradient is summed over the tile's pixels and stored
 // at the pair's pre-sort index; train_step then sums each gaussian's
-// contiguous pairs. The sum over pixels uses subgroup adds and then shared
-// memory across subgroups, or, with GS_SHARED_REDUCTION (for drivers without
-// usable subgroup arithmetic), a slower shared-memory tree per gaussian.
+// contiguous pairs. The sum over pixels uses subgroup adds (vec4, or scalar
+// with GS_SUBGROUP_SCALAR) and then shared memory across subgroups, or, with
+// GS_SHARED_REDUCTION (drivers without usable subgroup arithmetic), a slower
+// shared-memory tree per gaussian. No atomics: Fold6 returned all-zero
+// gradients when the tile's pair count came from a shared atomicMax.
 #ifndef GS_SHARED_REDUCTION
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
-#extension GL_KHR_shader_subgroup_vote : require
 #endif
 layout(local_size_x = 16, local_size_y = 16) in;
 
@@ -44,7 +45,7 @@ shared vec4 s_red[256u * 3u];  // one gaussian at a time, every pixel
 #else
 shared vec4 s_red[512u];  // [subgroup][gaussian][3]
 #endif
-shared uint s_max_last;
+shared uint s_last[256];
 
 void main() {
   uint lid = gl_LocalInvocationIndex;
@@ -62,11 +63,14 @@ void main() {
   uint last = inside ? pixel_count[pix_id] : 0u;
   float bg_dot = dot(frame.background.rgb, dL_dC);
 
-  if (lid == 0u) s_max_last = 0u;
+  // The tile's furthest last contributor, by a shared-memory tree.
+  s_last[lid] = last;
   barrier();
-  atomicMax(s_max_last, last);
-  barrier();
-  uint count = s_max_last;
+  for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+    if (lid < stride) s_last[lid] = max(s_last[lid], s_last[lid + stride]);
+    barrier();
+  }
+  uint count = s_last[0];
   uint end = range.x + count;
 
   // Pairs behind every pixel's last contributor get no gradient.
@@ -103,7 +107,6 @@ void main() {
     for (uint j = 0u; j < nb; ++j) {
       uint rel = count - done_n - j;  // 1-based position in the tile's range
       vec4 g0 = vec4(0.0), g1 = vec4(0.0), g2 = vec4(0.0);
-      bool contributes = false;
       if (inside && rel <= last) {
         vec2 d = s_g0[j].xy - center;
         vec3 con = s_g1[j].xyz;
@@ -113,7 +116,6 @@ void main() {
         float raw_alpha = opacity * G;
         float alpha = min(kMaxAlpha, raw_alpha);
         if (power <= 0.0 && alpha >= kMinAlpha) {
-          contributes = true;
           vec3 color = s_g2[j].rgb;
           T = T / (1.0 - alpha);
           accum = last_alpha * last_color + (1.0 - last_alpha) * accum;
@@ -146,11 +148,15 @@ void main() {
       if (lid < 3u) pair_grads[s_pair[j] * 3u + lid] = s_red[lid];
       barrier();
 #else
-      if (subgroupAny(contributes)) {
-        g0 = subgroupAdd(g0);
-        g1 = subgroupAdd(g1);
-        g2 = subgroupAdd(g2);
-      }
+#ifdef GS_SUBGROUP_SCALAR
+      g0 = vec4(subgroupAdd(g0.x), subgroupAdd(g0.y), subgroupAdd(g0.z), subgroupAdd(g0.w));
+      g1 = vec4(subgroupAdd(g1.x), subgroupAdd(g1.y), subgroupAdd(g1.z), subgroupAdd(g1.w));
+      g2 = vec4(subgroupAdd(g2.x), subgroupAdd(g2.y), subgroupAdd(g2.z), 0.0);
+#else
+      g0 = subgroupAdd(g0);
+      g1 = subgroupAdd(g1);
+      g2 = subgroupAdd(g2);
+#endif
       if (subgroupElect() && gl_SubgroupID < num_subgroups) {
         uint r = (gl_SubgroupID * batch + j) * 3u;
         s_red[r] = g0;

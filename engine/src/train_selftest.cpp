@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <cmath>
 #include <random>
 
 #include "gs/json.h"
+#include "shaders/probe_ops.h"
+#include "shaders/probe_subgroup.h"
 
 namespace gs {
 namespace {
@@ -320,6 +323,7 @@ GradientReport check_gradients(VkContext& ctx, bool masked, TrainOptions::Reduct
                                {"rotation", {8, 9, 10, 11}}, {"sh_dc", {12, 13, 14}}, {"sh_rest", {}}};
   for (int k = 0; k < stride; ++k) groups.back().offsets.push_back(-1 - k);
   const double eps = 1e-5;
+  std::vector<double> dc_fd(size_t(kCount) * 3, 0.0);
   for (const Group& group : groups) {
     GradientGroup out;
     out.name = group.name;
@@ -333,6 +337,7 @@ GradientReport check_gradients(VkContext& ctx, bool masked, TrainOptions::Reduct
         const double down = reference_loss(cam, params, sh, stride, degree, ds.frames[0].rgba, bg, masked);
         value = saved;
         const double fd = (up - down) / (2 * eps);
+        if (off >= 12 && off < 15) dc_fd[i * 3 + (off - 12)] = fd;
         const double gpu = off >= 0 ? g.params[i * 16 + off] : g.sh[i * stride + (-1 - off)];
         const double err = std::fabs(gpu - fd);
         out.max_err = std::max(out.max_err, std::isfinite(err) ? err : 1e30);
@@ -343,7 +348,80 @@ GradientReport check_gradients(VkContext& ctx, bool masked, TrainOptions::Reduct
     }
     if (out.checked > 0) report.groups.push_back(out);
   }
+
+  // Stage by stage, from the step's intermediate buffers.
+  const Trainer::DebugSnapshot snap = trainer.debug_snapshot();
+  StageReport& st = report.stages;
+  for (size_t p = 0; p < snap.pixel_count.size(); ++p) {
+    if (snap.pixel_grad[p * 4 + 3] < 0.999f) {
+      ++st.covered;
+      if (snap.pixel_count[p] == 0) ++st.covered_no_count;
+    }
+    st.max_count = std::max(st.max_count, snap.pixel_count[p]);
+  }
+  st.pairs = snap.pair_grads.size() / 12;
+  for (size_t k = 0; k < st.pairs; ++k) {
+    bool nonzero = false;
+    for (int c = 0; c < 12; ++c) nonzero = nonzero || snap.pair_grads[k * 12 + c] != 0.0f;
+    st.pairs_nonzero += nonzero ? 1 : 0;
+  }
+  const double c0 = 0.28209479177387814;
+  auto close = [](double a, double b) { return std::fabs(a - b) <= 0.05 * std::fabs(b) + 2e-6; };
+  for (uint32_t i = 0; i < kCount; ++i) {
+    double colour[3] = {0, 0, 0};
+    for (uint32_t k = snap.offsets[i]; k < snap.offsets[i] + snap.tiles[i] && size_t(k) < st.pairs; ++k) {
+      colour[0] += snap.pair_grads[size_t(k) * 12 + 6];
+      colour[1] += snap.pair_grads[size_t(k) * 12 + 7];
+      colour[2] += snap.pair_grads[size_t(k) * 12 + 8];
+    }
+    uint32_t clamped = 0;
+    std::memcpy(&clamped, &snap.projected[size_t(i) * 16 + 11], 4);
+    for (int c = 0; c < 3; ++c) {
+      const double expected = (clamped >> c) & 1u ? 0.0 : c0 * colour[c];
+      ++st.colour_checked;
+      if (!((clamped >> c) & 1u) && !close(expected, dc_fd[i * 3 + c])) ++st.backward_colour_bad;
+      if (!close(g.params[i * 16 + 12 + c], expected)) ++st.step_colour_bad;
+    }
+  }
   return report;
+}
+
+ProbeReport probe_gpu_ops(VkContext& ctx) {
+  ProbeReport r;
+  Buffer out = ctx.create_buffer(256 * 4, MemoryKind::Device);
+  std::vector<uint32_t> result(256, 0);
+  auto run = [&](const ComputePipeline& pipeline) {
+    ctx.run([&](VkCommandBuffer cmd) {
+      vkCmdFillBuffer(cmd, out.handle(), 0, VK_WHOLE_SIZE, 0);
+      VkContext::barrier(cmd);
+      ctx.dispatch(cmd, pipeline, {&out}, static_cast<const void*>(nullptr), 0u, 1);
+    });
+    ctx.download(out, result.data(), result.size() * 4);
+  };
+  run(ctx.create_compute_pipeline(shaders::probe_ops, 1, 0));
+  r.atomic_max = result[0];
+  r.atomic_add = result[1];
+  r.tree_max = result[2];
+  r.shared_ok = r.atomic_max == 250 && r.atomic_add == 32640 && r.tree_max == 250;
+  try {
+    ComputePipeline pipeline = ctx.create_compute_pipeline(shaders::probe_subgroup, 1, 0);
+    r.subgroup_compiled = true;
+    run(pipeline);
+    r.subgroups = result[255];
+    bool ok = r.subgroups > 0 && r.subgroups <= 63;
+    uint64_t lanes = 0, total = 0;
+    for (uint32_t sg = 0; ok && sg < r.subgroups; ++sg) {
+      const uint32_t sum = result[sg * 4], count = result[sg * 4 + 1], vsum = result[sg * 4 + 2];
+      r.subgroup_size = result[sg * 4 + 3];
+      ok = ok && count == r.subgroup_size && sum == vsum;
+      lanes += count;
+      total += sum;
+    }
+    r.subgroup_ok = ok && lanes == 256 && total == 32640;
+  } catch (const VulkanError& e) {
+    r.subgroup_error = vk_result_name(e.result);
+  }
+  return r;
 }
 
 FitReport fit_known_scene(VkContext& ctx, uint32_t steps, TrainOptions::Reduction reduction) {
@@ -399,18 +477,36 @@ std::string trainer_self_test_json(VkContext& ctx) {
   JsonWriter w;
   w.begin_object();
   bool ok = true;
+  try {
+    const ProbeReport p = probe_gpu_ops(ctx);
+    w.key("probes").begin_object();
+    w.field("shared_ok", p.shared_ok);
+    w.field("atomic_max", p.atomic_max);
+    w.field("atomic_add", p.atomic_add);
+    w.field("tree_max", p.tree_max);
+    w.field("subgroup_compiled", p.subgroup_compiled);
+    w.field("subgroup_error", p.subgroup_error);
+    w.field("subgroup_ok", p.subgroup_ok);
+    w.field("subgroups", p.subgroups);
+    w.field("subgroup_size", p.subgroup_size);
+    w.end_object();
+  } catch (const std::exception& e) {
+    w.key("probes").begin_object().field("error", e.what()).end_object();
+  }
   w.key("gradients").begin_array();
   struct Case {
     TrainOptions::Reduction reduction;
     bool masked;
   };
-  const Case cases[] = {{TrainOptions::Reduction::Subgroup, false},
-                        {TrainOptions::Reduction::Subgroup, true},
+  const Case cases[] = {{TrainOptions::Reduction::Subgroup, true},
+                        {TrainOptions::Reduction::SubgroupScalar, true},
                         {TrainOptions::Reduction::Shared, false},
                         {TrainOptions::Reduction::Shared, true}};
   for (const Case& c : cases) {
     w.begin_object();
-    w.field("requested", c.reduction == TrainOptions::Reduction::Subgroup ? "subgroup" : "shared");
+    w.field("requested", c.reduction == TrainOptions::Reduction::Subgroup         ? "subgroup"
+                         : c.reduction == TrainOptions::Reduction::SubgroupScalar ? "subgroup_scalar"
+                                                                                  : "shared");
     w.field("masked", c.masked);
     try {
       const GradientReport r = check_gradients(ctx, c.masked, c.reduction);
@@ -430,6 +526,17 @@ std::string trainer_self_test_json(VkContext& ctx) {
         w.end_object();
       }
       w.end_array();
+      const StageReport& st = r.stages;
+      w.key("stages").begin_object();
+      w.field("covered", st.covered);
+      w.field("covered_no_count", st.covered_no_count);
+      w.field("max_count", st.max_count);
+      w.field("pairs", st.pairs);
+      w.field("pairs_nonzero", st.pairs_nonzero);
+      w.field("colour_checked", st.colour_checked);
+      w.field("backward_colour_bad", st.backward_colour_bad);
+      w.field("step_colour_bad", st.step_colour_bad);
+      w.end_object();
       ok = ok && r.ok();
     } catch (const std::exception& e) {
       // The subgroup variant may be unavailable; that alone is not a failure.
