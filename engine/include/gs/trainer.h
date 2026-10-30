@@ -51,6 +51,8 @@ struct TrainOptions {
   float lr_sh_rest = 2.5e-3f / 20.0f;
   // Loss: (1 - lambda) L1 + lambda (1 - SSIM), as in 3D Gaussian Splatting (0: L1 only).
   float lambda_dssim = 0.2f;
+  // Experiments: >= 0 ramps lambda linearly from lambda_dssim (first step) to this (last).
+  float lambda_dssim_end = -1.0f;
 
   // Adaptive density control.
   uint32_t densify_from = 300;
@@ -221,6 +223,8 @@ class Trainer {
   void write_frame(uint32_t slot, const Camera& camera, const float background[3], bool masked_target,
                    uint32_t step, bool bucket_state, bool ssim);
   uint32_t sh_degree_at(uint32_t step) const;
+  float lambda_at(uint32_t step) const;  // the D-SSIM weight of a step
+  bool uses_ssim() const;                // any step has a D-SSIM part
   // Renders `camera` into image_/tile losses; with `train`, also the backward pass and Adam step.
   // With `retune`, every backward variant is timed on this step (implies profiling).
   // With `ssim`, also measures SSIM (training does whenever lambda_dssim > 0).

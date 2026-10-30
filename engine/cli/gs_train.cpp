@@ -6,7 +6,7 @@
 //            [--sh 3] [--init-gaussians 150000] [--opacity-reset N (0 = off)] [--grad-threshold 2e-4]
 //            [--reduction bucket|bucket2|subgroup|subgroup_scalar|subgroup_lane4|subgroup_lane1|serial_cut2|serial_cut|serial|shared]
 //            [--alternatives serial_cut2,subgroup_lane4,...] (timed on real steps; the fastest is kept)
-//            [--no-masks] [--preview <dir>] [--eval-every 1000] [--dssim 0.2 (0 = L1 only)]
+//            [--no-masks] [--preview <dir>] [--eval-every 1000] [--dssim 0.2 (0 = L1 only)] [--dssim-end L (ramp to L)]
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -83,6 +83,8 @@ int main(int argc, char** argv) {
         grad_threshold = std::atof(next());
       } else if (arg == "--dssim") {
         options.lambda_dssim = float(std::atof(next()));
+      } else if (arg == "--dssim-end") {
+        options.lambda_dssim_end = float(std::atof(next()));
       } else if (arg == "--no-masks") {
         options.masked = false;
       } else if (arg == "--preview") {

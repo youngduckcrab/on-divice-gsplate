@@ -332,6 +332,14 @@ Trainer::~Trainer() {
   if (set_pool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(ctx_.device(), set_pool_, nullptr);
 }
 
+float Trainer::lambda_at(uint32_t step) const {
+  if (options_.lambda_dssim_end < 0.0f || options_.iterations <= 1) return options_.lambda_dssim;
+  const float t = std::min(1.0f, float(step) / float(options_.iterations - 1));
+  return options_.lambda_dssim + (options_.lambda_dssim_end - options_.lambda_dssim) * t;
+}
+
+bool Trainer::uses_ssim() const { return options_.lambda_dssim > 0.0f || options_.lambda_dssim_end > 0.0f; }
+
 uint32_t Trainer::sh_degree_at(uint32_t step) const {
   return std::min<uint32_t>(options_.sh_degree, options_.sh_degree_interval > 0 ? step / options_.sh_degree_interval
                                                                               : options_.sh_degree);
@@ -389,7 +397,7 @@ void Trainer::write_frame(uint32_t slot, const Camera& camera, const float backg
   std::memcpy(&f.densify1[1], &seed, 4);
   f.densify1[2] = 1.6f;
   f.limits[0] = uint32_t(pair_capacity_);
-  f.loss[0] = options_.lambda_dssim;
+  f.loss[0] = lambda_at(step);
   f.loss[1] = 0.01f * 0.01f;  // SSIM constants for colours in [0, 1]
   f.loss[2] = 0.03f * 0.03f;
   std::memcpy(frames_[slot].mapped(), &f, sizeof(f));
@@ -600,15 +608,15 @@ void Trainer::set_view_stats() {
   const double n = 3.0 * width_ * height_;
   stats_.l1 = last_losses_[0] / n;
   stats_.psnr = -10.0 * std::log10(std::max(last_losses_[1] / n, 1e-12));
-  const double lambda = options_.lambda_dssim;
-  stats_.ssim = lambda > 0.0 ? last_losses_[2] / n : 0.0;
+  const double lambda = lambda_at(stats_.step);
+  stats_.ssim = uses_ssim() ? last_losses_[2] / n : 0.0;
   stats_.loss = (1.0 - lambda) * stats_.l1 + lambda * (1.0 - stats_.ssim);
 }
 
 void Trainer::run_view(const Camera& camera, const uint8_t* target, const float background[3], bool masked_target,
                        bool train, bool profile, bool retune, bool ssim) {
   stats_.sh_degree = int(sh_degree_at(stats_.step));
-  const bool ssim_grad = train && options_.lambda_dssim > 0.0f;
+  const bool ssim_grad = train && uses_ssim();
   ssim = ssim || ssim_grad;
   if (target != nullptr) std::memcpy(targets_[0].mapped(), target, size_t(width_) * height_ * 4);
   for (;;) {
@@ -788,7 +796,7 @@ void Trainer::run_batch(uint32_t count) {
   reserve_pairs(max_pairs_seen_);
   const size_t backward = backward_to_run();
   const bool buckets = needs_bucket_state(true, false);
-  const bool ssim = options_.lambda_dssim > 0.0f;
+  const bool ssim = uses_ssim();
   for (uint32_t s = 0; s < count; ++s) {
     size_t frame = 0;
     float bg[3];
