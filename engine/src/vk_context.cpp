@@ -532,7 +532,8 @@ void VkContext::queue_wait_idle() {
 
 ComputePipeline VkContext::create_compute_pipeline(std::span<const uint32_t> spirv,
                                                    uint32_t binding_count,
-                                                   uint32_t push_constant_size) {
+                                                   uint32_t push_constant_size,
+                                                   std::span<const uint32_t> specialization) {
   ComputePipeline p;
   p.device_ = device_;
   p.binding_count_ = binding_count;
@@ -565,6 +566,11 @@ ComputePipeline VkContext::create_compute_pipeline(std::span<const uint32_t> spi
   pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
   pipeline_info.stage.module = module;
   pipeline_info.stage.pName = "main";
+  std::vector<VkSpecializationMapEntry> entries(specialization.size());
+  for (uint32_t i = 0; i < entries.size(); ++i) entries[i] = {i, i * 4, 4};
+  VkSpecializationInfo spec_info{static_cast<uint32_t>(entries.size()), entries.data(),
+                                 specialization.size_bytes(), specialization.data()};
+  if (!specialization.empty()) pipeline_info.stage.pSpecializationInfo = &spec_info;
   pipeline_info.layout = p.layout_;
   VkResult result =
       vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &p.pipeline_);

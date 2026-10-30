@@ -1,0 +1,57 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Densification 1/2: decide per slot. Free and pruned slots go on the free
+// list (pruned ones are cleared); gaussians whose average positional gradient
+// passes the threshold are flagged for cloning (small) or splitting (large).
+layout(local_size_x = 128) in;
+
+#include "train_common.glsl"
+
+layout(std430, binding = 0) readonly buffer FrameBuf { FrameData frame; };
+layout(std430, binding = 1) buffer Params { vec4 params[]; };
+layout(std430, binding = 2) buffer Sh { float sh[]; };
+layout(std430, binding = 3) buffer MomentParams { vec4 m_params[]; };
+layout(std430, binding = 4) buffer VarianceParams { vec4 v_params[]; };
+layout(std430, binding = 5) buffer MomentSh { float m_sh[]; };
+layout(std430, binding = 6) buffer VarianceSh { float v_sh[]; };
+layout(std430, binding = 7) readonly buffer Stats { vec4 stats[]; };
+layout(std430, binding = 8) writeonly buffer Spawn { uint spawn[]; };  // 0 none, 1 clone, 2 split
+layout(std430, binding = 9) writeonly buffer FreeList { uint free_list[]; };
+layout(std430, binding = 10) buffer Counters { uint counters[]; };  // free, spawned, pruned
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= frame.model.x) return;
+  vec4 p0 = params[i * 4u], p1 = params[i * 4u + 1u];
+  uint action = 0u;
+  bool release = p1.w < 0.5;
+  if (!release) {
+    vec4 st = stats[i];
+    float max_scale = exp(max(p1.x, max(p1.y, p1.z)));
+    bool prune = sigmoid(p0.w) < frame.densify0.z;
+    if (frame.densify0.w > 0.0 && max_scale > frame.densify0.w) prune = true;
+    if (frame.densify1.x > 0.0 && st.z > frame.densify1.x) prune = true;
+    if (prune) {
+      release = true;
+      atomicAdd(counters[2], 1u);
+      params[i * 4u] = vec4(0.0, 0.0, 0.0, -20.0);
+      params[i * 4u + 1u] = vec4(0.0);
+      params[i * 4u + 2u] = vec4(1.0, 0.0, 0.0, 0.0);
+      params[i * 4u + 3u] = vec4(0.0);
+      for (uint k = 0u; k < 4u; ++k) {
+        m_params[i * 4u + k] = vec4(0.0);
+        v_params[i * 4u + k] = vec4(0.0);
+      }
+      uint base = i * frame.model.z;
+      for (uint k = 0u; k < frame.model.z; ++k) {
+        sh[base + k] = 0.0;
+        m_sh[base + k] = 0.0;
+        v_sh[base + k] = 0.0;
+      }
+    } else if (st.y > 0.0 && st.x / st.y >= frame.densify0.x) {
+      action = max_scale <= frame.densify0.y ? 1u : 2u;
+    }
+  }
+  if (release) free_list[atomicAdd(counters[0], 1u)] = i;
+  spawn[i] = action;
+}

@@ -1,0 +1,30 @@
+#version 450
+// Exclusive prefix sum, step 3/3: adds each workgroup's scanned block offset,
+// and writes the grand total to totals[total_index].
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer In { uint values[]; };
+layout(std430, binding = 1) buffer Out { uint prefix[]; };
+layout(std430, binding = 2) readonly buffer Blocks { uint block_offsets[]; };
+layout(std430, binding = 3) buffer Totals { uint totals[]; };
+
+layout(push_constant) uniform Params {
+  uint count;
+  uint total_index;
+} pc;
+
+const uint ITEMS = 4u;
+
+void main() {
+  uint block = gl_WorkGroupID.x;
+  uint base = block * 256u * ITEMS + gl_LocalInvocationID.x * ITEMS;
+  uint offset = block_offsets[block];
+  for (uint k = 0u; k < ITEMS; ++k) {
+    uint i = base + k;
+    if (i < pc.count) {
+      uint p = prefix[i] + offset;
+      prefix[i] = p;
+      if (i == pc.count - 1u) totals[pc.total_index] = p + values[i];
+    }
+  }
+}

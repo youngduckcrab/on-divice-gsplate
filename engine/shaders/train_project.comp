@@ -1,0 +1,89 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Training pass 1: project every gaussian (EWA 2D covariance, SH colour) and
+// count the 16x16 tiles its opacity-aware footprint touches.
+layout(local_size_x = 128) in;
+
+#include "train_common.glsl"
+
+layout(std430, binding = 0) readonly buffer FrameBuf { FrameData frame; };
+layout(std430, binding = 1) readonly buffer Params { vec4 params[]; };
+layout(std430, binding = 2) readonly buffer Sh { float sh[]; };
+layout(std430, binding = 3) writeonly buffer Projected { vec4 projected[]; };
+layout(std430, binding = 4) writeonly buffer Tiles { uint tiles_touched[]; };
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= frame.model.x) return;
+
+  vec4 p0 = params[i * 4u];
+  vec4 p1 = params[i * 4u + 1u];
+  uint tiles = 0u;
+  vec4 out0 = vec4(0.0), out1 = vec4(0.0), out2 = vec4(0.0);
+  uvec4 rect = uvec4(0u);
+
+  vec3 p = p0.xyz;
+  vec3 t = vec3(dot(frame.rot0.xyz, p) + frame.rot0.w, dot(frame.rot1.xyz, p) + frame.rot1.w,
+                dot(frame.rot2.xyz, p) + frame.rot2.w);
+  float opacity = sigmoid(p0.w);
+  if (p1.w > 0.5 && t.z > kNear && opacity >= kMinAlpha) {
+    float fx = frame.intrinsics.x, fy = frame.intrinsics.y;
+    float cx = frame.intrinsics.z, cy = frame.intrinsics.w;
+    float width = float(frame.image.x), height = float(frame.image.y);
+    float inv_z = 1.0 / t.z;
+    vec2 mean = vec2(fx * t.x * inv_z + cx, fy * t.y * inv_z + cy);
+
+    float lim_x = 1.3 * max(cx, width - cx) / fx;
+    float lim_y = 1.3 * max(cy, height - cy) / fy;
+    float tx = clamp(t.x * inv_z, -lim_x, lim_x);
+    float ty = clamp(t.y * inv_z, -lim_y, lim_y);
+    mat3 J = mat3(fx * inv_z, 0.0, 0.0, 0.0, fy * inv_z, 0.0, -fx * tx * inv_z, -fy * ty * inv_z, 0.0);
+    mat3 W = transpose(mat3(frame.rot0.xyz, frame.rot1.xyz, frame.rot2.xyz));
+    vec4 q = params[i * 4u + 2u];
+    mat3 R = quat_to_matrix(q / max(length(q), 1e-12));
+    vec3 s = exp(p1.xyz);
+    mat3 M = mat3(R[0] * s.x, R[1] * s.y, R[2] * s.z);
+    mat3 T = J * W;
+    mat3 cov = T * (M * transpose(M)) * transpose(T);
+
+    float a = cov[0][0] + kDilation, b = cov[0][1], c = cov[1][1] + kDilation;
+    float det = a * c - b * b;
+    if (det > 0.0) {
+      float mid = 0.5 * (a + c);
+      float lambda = mid + sqrt(max(0.1, mid * mid - det));
+      float sigma = sqrt(lambda);
+      // Pixels further out than this have alpha < 1/255 and are skipped anyway.
+      float radius = ceil(sqrt(2.0 * log(opacity * 255.0)) * sigma);
+      ivec2 lo = ivec2(floor((mean - radius) / float(kTile)));
+      ivec2 hi = ivec2(floor((mean + radius) / float(kTile))) + 1;
+      lo = clamp(lo, ivec2(0), ivec2(frame.image.zw));
+      hi = clamp(hi, ivec2(0), ivec2(frame.image.zw));
+      tiles = uint(max(hi.x - lo.x, 0) * max(hi.y - lo.y, 0));
+      if (tiles > 0u) {
+        rect = uvec4(lo, hi);
+        uint degree = frame.model.y;
+        uint base = i * frame.model.z;
+        float basis[16];
+        sh_basis(normalize(p - frame.cam_pos.xyz), degree, basis);
+        vec3 color = basis[0] * params[i * 4u + 3u].xyz;
+        int coeffs = sh_rest_coeffs(degree);
+        for (int k = 0; k < coeffs; ++k) {
+          uint o = base + uint(k) * 3u;
+          color += basis[k + 1] * vec3(sh[o], sh[o + 1u], sh[o + 2u]);
+        }
+        color += 0.5;
+        uint clamped = (color.r < 0.0 ? 1u : 0u) | (color.g < 0.0 ? 2u : 0u) | (color.b < 0.0 ? 4u : 0u);
+        color = max(color, vec3(0.0));
+        float inv_det = 1.0 / det;
+        out0 = vec4(mean, t.z, opacity);
+        out1 = vec4(c * inv_det, -b * inv_det, a * inv_det, ceil(3.0 * sigma));
+        out2 = vec4(color, uintBitsToFloat(clamped));
+      }
+    }
+  }
+  projected[i * 4u] = out0;
+  projected[i * 4u + 1u] = out1;
+  projected[i * 4u + 2u] = out2;
+  projected[i * 4u + 3u] = uintBitsToFloat(rect);
+  tiles_touched[i] = tiles;
+}

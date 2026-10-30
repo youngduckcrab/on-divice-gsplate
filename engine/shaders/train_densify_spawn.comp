@@ -1,0 +1,70 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Densification 2/2: each flagged gaussian takes a free slot (or a new one past
+// the slots in use) for its clone, or for the second half of its split. Split
+// halves are sampled from the gaussian and shrunk; new state starts at zero.
+layout(local_size_x = 128) in;
+
+#include "train_common.glsl"
+
+layout(std430, binding = 0) readonly buffer FrameBuf { FrameData frame; };
+layout(std430, binding = 1) buffer Params { vec4 params[]; };
+layout(std430, binding = 2) buffer Sh { float sh[]; };
+layout(std430, binding = 3) buffer MomentParams { vec4 m_params[]; };
+layout(std430, binding = 4) buffer VarianceParams { vec4 v_params[]; };
+layout(std430, binding = 5) buffer MomentSh { float m_sh[]; };
+layout(std430, binding = 6) buffer VarianceSh { float v_sh[]; };
+layout(std430, binding = 7) readonly buffer Stats { vec4 stats[]; };
+layout(std430, binding = 8) readonly buffer Spawn { uint spawn[]; };
+layout(std430, binding = 9) readonly buffer FreeList { uint free_list[]; };
+layout(std430, binding = 10) buffer Counters { uint counters[]; };
+
+layout(push_constant) uniform Push {
+  uint capacity;
+} pc;
+
+void clear_state(uint slot) {
+  for (uint k = 0u; k < 4u; ++k) {
+    m_params[slot * 4u + k] = vec4(0.0);
+    v_params[slot * 4u + k] = vec4(0.0);
+  }
+  uint base = slot * frame.model.z;
+  for (uint k = 0u; k < frame.model.z; ++k) {
+    m_sh[base + k] = 0.0;
+    v_sh[base + k] = 0.0;
+  }
+}
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= frame.model.x) return;
+  uint action = spawn[i];
+  if (action == 0u) return;
+  uint k = atomicAdd(counters[1], 1u);
+  uint free_count = counters[0];
+  uint target = k < free_count ? free_list[k] : frame.model.x + (k - free_count);
+  if (target >= pc.capacity) return;
+
+  vec4 p0 = params[i * 4u], p1 = params[i * 4u + 1u], q = params[i * 4u + 2u], p3 = params[i * 4u + 3u];
+  uint stride = frame.model.z;
+  for (uint c = 0u; c < stride; ++c) sh[target * stride + c] = sh[i * stride + c];
+  clear_state(target);
+  if (action == 1u) {
+    params[target * 4u] = p0;
+    params[target * 4u + 1u] = p1;
+  } else {
+    uint rng = pcg_hash(i ^ pcg_hash(floatBitsToUint(frame.densify1.y)));
+    vec3 s = exp(p1.xyz);
+    mat3 R = quat_to_matrix(q / max(length(q), 1e-12));
+    vec3 a = p0.xyz + R * (normal3(rng) * s);
+    vec3 b = p0.xyz + R * (normal3(rng) * s);
+    vec3 log_scale = p1.xyz - log(frame.densify1.z);
+    params[i * 4u] = vec4(a, p0.w);
+    params[i * 4u + 1u] = vec4(log_scale, 1.0);
+    params[target * 4u] = vec4(b, p0.w);
+    params[target * 4u + 1u] = vec4(log_scale, 1.0);
+    clear_state(i);
+  }
+  params[target * 4u + 2u] = q;
+  params[target * 4u + 3u] = p3;
+}

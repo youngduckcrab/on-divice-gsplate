@@ -65,6 +65,10 @@ SplatScene load_ply(const uint8_t* data, size_t size);
 SplatScene load_spz(const uint8_t* data, size_t size);  // SPZ v2/v3 (gzip)
 SplatScene load_splat_file(const uint8_t* data, size_t size);  // detects PLY or SPZ
 
+// Rewrites the scene in `target` axes (RDF <-> RUB is a half turn about x):
+// positions, rotations and SH coefficients.
+void convert_convention(SplatScene& scene, AxisConvention target);
+
 // Binary little-endian PLY with the standard 3DGS vertex properties.
 std::vector<uint8_t> save_ply(const SplatScene& scene);
 

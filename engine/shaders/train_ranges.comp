@@ -1,0 +1,27 @@
+#version 450
+// Training pass 3: the [start, end) range of every tile in the sorted pairs.
+// Tiles without pairs keep the (0, 0) the buffer was cleared to.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Keys { uint keys[]; };
+layout(std430, binding = 1) buffer Ranges { uvec2 ranges[]; };
+
+layout(push_constant) uniform Params {
+  uint count;
+} pc;
+
+void main() {
+  uint s = gl_GlobalInvocationID.x;
+  if (s >= pc.count) return;
+  uint tile = keys[s] >> 16u;
+  if (s == 0u) {
+    ranges[tile].x = 0u;
+  } else {
+    uint prev = keys[s - 1u] >> 16u;
+    if (prev != tile) {
+      ranges[prev].y = s;
+      ranges[tile].x = s;
+    }
+  }
+  if (s == pc.count - 1u) ranges[tile].y = pc.count;
+}

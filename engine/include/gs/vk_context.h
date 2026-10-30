@@ -149,8 +149,10 @@ class VkContext {
                             VkMemoryPropertyFlags preferred) const;
 
   VkShaderModule create_shader_module(std::span<const uint32_t> spirv) const;
+  // `specialization` sets uint constants with constant_id 0..n-1.
   ComputePipeline create_compute_pipeline(std::span<const uint32_t> spirv, uint32_t binding_count,
-                                          uint32_t push_constant_size);
+                                          uint32_t push_constant_size,
+                                          std::span<const uint32_t> specialization = {});
 
   // Descriptor pools for sets that outlive a single run() (e.g. per-scene bindings).
   VkDescriptorPool create_descriptor_pool(uint32_t max_sets, uint32_t max_storage_buffers) const;

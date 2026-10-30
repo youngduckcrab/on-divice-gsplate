@@ -1,0 +1,103 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Training pass 4: front-to-back alpha compositing of one 16x16 tile per
+// workgroup, plus the L1 loss gradient per pixel and the tile's loss sums.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+#include "train_common.glsl"
+
+layout(constant_id = 0) const uint MAX_SUBGROUPS = 32u;
+
+layout(std430, binding = 0) readonly buffer FrameBuf { FrameData frame; };
+layout(std430, binding = 1) readonly buffer Projected { vec4 projected[]; };
+layout(std430, binding = 2) readonly buffer Ranges { uvec2 ranges[]; };
+layout(std430, binding = 3) readonly buffer Values { uint values[]; };
+layout(std430, binding = 4) readonly buffer PairGaussian { uint pair_gaussian[]; };
+layout(std430, binding = 5) readonly buffer Target { uint target[]; };  // RGBA8 per pixel
+layout(std430, binding = 6) writeonly buffer PixelGrad { vec4 pixel_grad[]; };  // dL/dC rgb, final T
+layout(std430, binding = 7) writeonly buffer PixelCount { uint pixel_count[]; };  // pairs up to the last contributor
+layout(std430, binding = 8) writeonly buffer Image { uint image[]; };  // rendered RGBA8
+layout(std430, binding = 9) writeonly buffer TileLoss { vec4 tile_loss[]; };  // sum |e|, sum e^2
+
+const uint BATCH = 256u;
+shared vec4 s_g0[BATCH];  // centre xy, opacity, unused
+shared vec4 s_g1[BATCH];  // conic abc
+shared vec4 s_g2[BATCH];  // colour
+shared uint s_done;
+shared vec2 s_loss[MAX_SUBGROUPS];
+
+void main() {
+  uint lid = gl_LocalInvocationIndex;
+  uvec2 tile = gl_WorkGroupID.xy;
+  uvec2 pix = tile * kTile + gl_LocalInvocationID.xy;
+  uint width = frame.image.x, height = frame.image.y;
+  bool inside = pix.x < width && pix.y < height;
+  uint pix_id = pix.y * width + pix.x;
+  vec2 center = vec2(pix) + 0.5;
+
+  uvec2 range = ranges[tile.y * frame.image.z + tile.x];
+  if (lid == 0u) s_done = 0u;
+  barrier();
+
+  bool done = !inside;
+  float T = 1.0;
+  vec3 C = vec3(0.0);
+  uint contributor = 0u, last = 0u;
+  for (uint start = range.x; start < range.y; start += BATCH) {
+    if (done) atomicAdd(s_done, 1u);
+    barrier();
+    if (s_done == kTile * kTile) break;
+    uint k = start + lid;
+    if (k < range.y) {
+      uint g = pair_gaussian[values[k]];
+      vec4 q0 = projected[g * 4u];
+      s_g0[lid] = vec4(q0.xy, q0.w, 0.0);
+      s_g1[lid] = projected[g * 4u + 1u];
+      s_g2[lid] = projected[g * 4u + 2u];
+    }
+    if (lid == 0u) s_done = 0u;
+    barrier();
+    uint n = min(BATCH, range.y - start);
+    for (uint j = 0u; !done && j < n; ++j) {
+      ++contributor;
+      vec2 d = s_g0[j].xy - center;
+      vec3 con = s_g1[j].xyz;
+      float power = -0.5 * (con.x * d.x * d.x + con.z * d.y * d.y) - con.y * d.x * d.y;
+      if (power > 0.0) continue;
+      float alpha = min(kMaxAlpha, s_g0[j].z * exp(power));
+      if (alpha < kMinAlpha) continue;
+      float next_T = T * (1.0 - alpha);
+      if (next_T < kMinTransmittance) {
+        done = true;
+        break;
+      }
+      C += s_g2[j].rgb * alpha * T;
+      T = next_T;
+      last = contributor;
+    }
+    barrier();
+  }
+
+  vec2 loss = vec2(0.0);
+  if (inside) {
+    vec3 bg = frame.background.rgb;
+    vec3 out_color = C + T * bg;
+    vec4 t = unpackUnorm4x8(target[pix_id]);
+    vec3 target_color = (frame.model.w & kFlagMaskedTarget) != 0u ? mix(bg, t.rgb, t.a) : t.rgb;
+    vec3 e = out_color - target_color;
+    pixel_grad[pix_id] = vec4(sign(e) * frame.background.w, T);
+    pixel_count[pix_id] = last;
+    image[pix_id] = packUnorm4x8(vec4(clamp(out_color, 0.0, 1.0), 1.0 - T));
+    loss = vec2(abs(e.r) + abs(e.g) + abs(e.b), dot(e, e));
+  }
+  loss = subgroupAdd(loss);
+  if (subgroupElect() && gl_SubgroupID < MAX_SUBGROUPS) s_loss[gl_SubgroupID] = loss;
+  barrier();
+  if (lid == 0u) {
+    vec2 sum = vec2(0.0);
+    for (uint k = 0u; k < min(gl_NumSubgroups, MAX_SUBGROUPS); ++k) sum += s_loss[k];
+    tile_loss[tile.y * frame.image.z + tile.x] = vec4(sum, 0.0, 0.0);
+  }
+}

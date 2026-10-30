@@ -1,0 +1,23 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Caps every opacity (logit) and clears its Adam state, as in 3DGS.
+layout(local_size_x = 128) in;
+
+#include "train_common.glsl"
+
+layout(std430, binding = 0) readonly buffer FrameBuf { FrameData frame; };
+layout(std430, binding = 1) buffer Params { vec4 params[]; };
+layout(std430, binding = 2) buffer MomentParams { vec4 m_params[]; };
+layout(std430, binding = 3) buffer VarianceParams { vec4 v_params[]; };
+
+layout(push_constant) uniform Push {
+  float max_logit;
+} pc;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= frame.model.x || params[i * 4u + 1u].w < 0.5) return;
+  params[i * 4u].w = min(params[i * 4u].w, pc.max_logit);
+  m_params[i * 4u].w = 0.0;
+  v_params[i * 4u].w = 0.0;
+}

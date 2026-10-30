@@ -165,7 +165,10 @@ Dataset load_dataset(const std::string& directory, uint32_t target_width) {
   float max_dist = 0.0f;
   for (const DatasetFrame& f : ds.frames) {
     float d2 = 0.0f;
-    for (int k = 0; k < 3; ++k) d2 += (f.c2w[k * 4 + 3] - ds.camera_center[k]) * (f.c2w[k * 4 + 3] - ds.camera_center[k]);
+    for (int k = 0; k < 3; ++k) {
+      const float d = f.c2w[k * 4 + 3] - ds.camera_center[k];
+      d2 += d * d;
+    }
     max_dist = std::max(max_dist, std::sqrt(d2));
   }
   ds.camera_extent = std::max(1.1f * max_dist, 1e-3f);
@@ -281,7 +284,7 @@ SplatScene initialize_gaussians(const Dataset& ds, const InitOptions& options, I
     float voxel_lo = diag * 1e-5f, voxel_hi = diag;
     for (int it = 0; it < 16; ++it) {
       const float mid = std::sqrt(voxel_lo * voxel_hi);
-      if (occupied(mid) > options.max_gaussians) voxel_lo = mid; else voxel_hi = mid;
+      (occupied(mid) > options.max_gaussians ? voxel_lo : voxel_hi) = mid;
     }
     voxel = voxel_hi;
 
@@ -342,7 +345,8 @@ SplatScene initialize_gaussians(const Dataset& ds, const InitOptions& options, I
           for (uint32_t j : it->second) {
             if (j == i) continue;
             const float* q = &merged[j * 3];
-            const float d2 = (p[0] - q[0]) * (p[0] - q[0]) + (p[1] - q[1]) * (p[1] - q[1]) + (p[2] - q[2]) * (p[2] - q[2]);
+            const float dx = p[0] - q[0], dy = p[1] - q[1], dz = p[2] - q[2];
+            const float d2 = dx * dx + dy * dy + dz * dz;
             if (d2 < best[2]) {
               best[2] = d2;
               std::sort(best, best + 3);

@@ -1,0 +1,191 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Training pass 6, per gaussian: sum the gradients of its (contiguous) pairs,
+// back-propagate them through the projection to the 3D parameters, update
+// the densification statistics, and take an Adam step.
+layout(local_size_x = 128) in;
+
+#include "train_common.glsl"
+
+layout(std430, binding = 0) readonly buffer FrameBuf { FrameData frame; };
+layout(std430, binding = 1) buffer Params { vec4 params[]; };
+layout(std430, binding = 2) buffer Sh { float sh[]; };
+layout(std430, binding = 3) buffer MomentParams { vec4 m_params[]; };
+layout(std430, binding = 4) buffer VarianceParams { vec4 v_params[]; };
+layout(std430, binding = 5) buffer MomentSh { float m_sh[]; };
+layout(std430, binding = 6) buffer VarianceSh { float v_sh[]; };
+layout(std430, binding = 7) readonly buffer Tiles { uint tiles_touched[]; };
+layout(std430, binding = 8) readonly buffer Offsets { uint offsets[]; };
+layout(std430, binding = 9) readonly buffer PairGrads { vec4 pair_grads[]; };
+layout(std430, binding = 10) readonly buffer Projected { vec4 projected[]; };
+layout(std430, binding = 11) buffer Stats { vec4 stats[]; };  // grad norm sum, visible count, max radius, abs grad sum
+
+vec4 adam(vec4 p, vec4 g, uint index, vec4 lr) {
+  vec4 m = mix(g, m_params[index], frame.adam.x);
+  vec4 v = mix(g * g, v_params[index], frame.adam.y);
+  m_params[index] = m;
+  v_params[index] = v;
+  return p - lr * (m * frame.bias.x) / (sqrt(v * frame.bias.y) + frame.adam.z);
+}
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= frame.model.x) return;
+  vec4 p0 = params[i * 4u], p1 = params[i * 4u + 1u], q = params[i * 4u + 2u], p3 = params[i * 4u + 3u];
+  if (p1.w < 0.5) return;  // free slot
+
+  vec4 dp0 = vec4(0.0), dp1 = vec4(0.0), dq = vec4(0.0), dp3 = vec4(0.0);
+  uint degree = frame.model.y;
+  int coeffs = sh_rest_coeffs(degree);
+  vec3 dsh[15];
+  for (int k = 0; k < 15; ++k) dsh[k] = vec3(0.0);
+
+  uint pairs = tiles_touched[i];
+  if (pairs > 0u) {
+    vec4 a0 = vec4(0.0), a1 = vec4(0.0), a2 = vec4(0.0);
+    uint first = offsets[i];
+    for (uint k = 0u; k < pairs; ++k) {
+      uint o = (first + k) * 3u;
+      a0 += pair_grads[o];
+      a1 += pair_grads[o + 1u];
+      a2 += pair_grads[o + 2u];
+    }
+    vec2 dL_dmean = a0.xy;
+    vec3 dL_dconic = vec3(a0.zw, a1.x);
+    float dL_dopacity = a1.y;
+    vec3 dL_dcolor = vec3(a1.zw, a2.x);
+
+    // Densification statistics: the view-space positional gradient in NDC units.
+    float width = float(frame.image.x), height = float(frame.image.y);
+    vec2 ndc_scale = 0.5 * vec2(width, height);
+    vec4 st = stats[i];
+    st.x += length(dL_dmean * ndc_scale);
+    st.y += 1.0;
+    st.z = max(st.z, projected[i * 4u + 1u].w);
+    st.w += length(a2.yz * ndc_scale);
+    stats[i] = st;
+
+    // Recompute the projection.
+    vec3 p = p0.xyz;
+    mat3 W = transpose(mat3(frame.rot0.xyz, frame.rot1.xyz, frame.rot2.xyz));
+    vec3 t = W * p + vec3(frame.rot0.w, frame.rot1.w, frame.rot2.w);
+    float fx = frame.intrinsics.x, fy = frame.intrinsics.y;
+    float cx = frame.intrinsics.z, cy = frame.intrinsics.w;
+    float inv_z = 1.0 / t.z;
+    float lim_x = 1.3 * max(cx, width - cx) / fx;
+    float lim_y = 1.3 * max(cy, height - cy) / fy;
+    float rx = t.x * inv_z, ry = t.y * inv_z;
+    bool clamp_x = rx < -lim_x || rx > lim_x;
+    bool clamp_y = ry < -lim_y || ry > lim_y;
+    float tx = clamp(rx, -lim_x, lim_x), ty = clamp(ry, -lim_y, lim_y);
+    mat3 J = mat3(fx * inv_z, 0.0, 0.0, 0.0, fy * inv_z, 0.0, -fx * tx * inv_z, -fy * ty * inv_z, 0.0);
+    float qlen = max(length(q), 1e-12);
+    vec4 qn = q / qlen;
+    mat3 R = quat_to_matrix(qn);
+    vec3 s = exp(p1.xyz);
+    mat3 M = mat3(R[0] * s.x, R[1] * s.y, R[2] * s.z);
+    mat3 Sigma = M * transpose(M);
+    mat3 T = J * W;
+    mat3 cov = T * Sigma * transpose(T);
+    float A = cov[0][0] + kDilation, B = cov[0][1], C = cov[1][1] + kDilation;
+    float D = A * C - B * B;
+
+    // Colour -> SH coefficients and view direction.
+    vec3 dir_raw = p - frame.cam_pos.xyz;
+    float dir_len = max(length(dir_raw), 1e-12);
+    vec3 dir = dir_raw / dir_len;
+    uint clamped = floatBitsToUint(projected[i * 4u + 2u].w);
+    if ((clamped & 1u) != 0u) dL_dcolor.r = 0.0;
+    if ((clamped & 2u) != 0u) dL_dcolor.g = 0.0;
+    if ((clamped & 4u) != 0u) dL_dcolor.b = 0.0;
+    float basis[16];
+    sh_basis(dir, degree, basis);
+    dp3.xyz = basis[0] * dL_dcolor;
+    vec3 dL_ddir = vec3(0.0);
+    if (coeffs > 0) {
+      vec3 dbasis[16];
+      sh_basis_grad(dir, degree, dbasis);
+      uint base = i * frame.model.z;
+      for (int k = 0; k < coeffs; ++k) {
+        dsh[k] = basis[k + 1] * dL_dcolor;
+        uint o = base + uint(k) * 3u;
+        float w = dot(vec3(sh[o], sh[o + 1u], sh[o + 2u]), dL_dcolor);
+        dL_ddir += w * dbasis[k + 1];
+      }
+    }
+    vec3 dL_dp = (dL_ddir - dir * dot(dir, dL_ddir)) / dir_len;
+
+    // Opacity (sigmoid of the logit).
+    float opacity = sigmoid(p0.w);
+    dp0.w = dL_dopacity * opacity * (1.0 - opacity);
+
+    // Conic -> dilated 2D covariance [[A, B], [B, C]].
+    float ga = dL_dconic.x, gb = dL_dconic.y, gc = dL_dconic.z;
+    float inv_d2 = 1.0 / (D * D);
+    float gA = (-C * C * ga + B * C * gb - B * B * gc) * inv_d2;
+    float gB = (2.0 * B * C * ga - (D + 2.0 * B * B) * gb + 2.0 * A * B * gc) * inv_d2;
+    float gC = (-B * B * ga + A * B * gb - A * A * gc) * inv_d2;
+    mat3 G2 = mat3(gA, 0.5 * gB, 0.0, 0.5 * gB, gC, 0.0, 0.0, 0.0, 0.0);
+
+    // 2D covariance -> 3D covariance and the projection Jacobian.
+    mat3 dSigma = transpose(T) * G2 * T;
+    mat3 dT = 2.0 * G2 * T * Sigma;
+    mat3 dJ = dT * transpose(W);
+    vec3 dL_dt = vec3(0.0);
+    float inv_z2 = inv_z * inv_z;
+    dL_dt.z += -fx * inv_z2 * dJ[0][0] - fy * inv_z2 * dJ[1][1];
+    if (clamp_x) {
+      dL_dt.z += fx * tx * inv_z2 * dJ[2][0];
+    } else {
+      dL_dt.x += -fx * inv_z2 * dJ[2][0];
+      dL_dt.z += 2.0 * fx * t.x * inv_z2 * inv_z * dJ[2][0];
+    }
+    if (clamp_y) {
+      dL_dt.z += fy * ty * inv_z2 * dJ[2][1];
+    } else {
+      dL_dt.y += -fy * inv_z2 * dJ[2][1];
+      dL_dt.z += 2.0 * fy * t.y * inv_z2 * inv_z * dJ[2][1];
+    }
+    // Screen centre.
+    dL_dt.x += dL_dmean.x * fx * inv_z;
+    dL_dt.y += dL_dmean.y * fy * inv_z;
+    dL_dt.z += -(dL_dmean.x * fx * t.x + dL_dmean.y * fy * t.y) * inv_z2;
+    dL_dp += transpose(W) * dL_dt;
+    dp0.xyz = dL_dp;
+
+    // 3D covariance -> scale and rotation.
+    mat3 dM = 2.0 * dSigma * M;
+    dp1.xyz = vec3(dot(dM[0], R[0]), dot(dM[1], R[1]), dot(dM[2], R[2])) * s;  // d/d(log scale)
+    mat3 dR = mat3(dM[0] * s.x, dM[1] * s.y, dM[2] * s.z);
+    // g_rc = dL/dR[row r][col c]; GLSL indexes [col][row].
+    float g00 = dR[0][0], g01 = dR[1][0], g02 = dR[2][0];
+    float g10 = dR[0][1], g11 = dR[1][1], g12 = dR[2][1];
+    float g20 = dR[0][2], g21 = dR[1][2], g22 = dR[2][2];
+    float w = qn.x, x = qn.y, y = qn.z, z = qn.w;
+    vec4 dqn = 2.0 * vec4(-z * g01 + y * g02 + z * g10 - x * g12 - y * g20 + x * g21,
+                          y * g01 + z * g02 + y * g10 - 2.0 * x * g11 - w * g12 + z * g20 + w * g21 - 2.0 * x * g22,
+                          -2.0 * y * g00 + x * g01 + w * g02 + x * g10 + z * g12 - w * g20 + z * g21 - 2.0 * y * g22,
+                          -2.0 * z * g00 - w * g01 + x * g02 + w * g10 - 2.0 * z * g11 + y * g12 + x * g20 + y * g21);
+    dq = (dqn - qn * dot(qn, dqn)) / qlen;
+  }
+
+  vec4 lr0 = vec4(vec3(frame.lr0.x), frame.lr0.w);
+  vec4 lr1 = vec4(vec3(frame.lr0.y), 0.0);
+  params[i * 4u] = adam(p0, dp0, i * 4u, lr0);
+  params[i * 4u + 1u] = adam(p1, dp1, i * 4u + 1u, lr1);
+  params[i * 4u + 2u] = adam(q, dq, i * 4u + 2u, vec4(frame.lr0.z));
+  params[i * 4u + 3u] = adam(p3, dp3, i * 4u + 3u, vec4(vec3(frame.lr1.x), 0.0));
+
+  uint base = i * frame.model.z;
+  for (int k = 0; k < coeffs; ++k) {
+    for (uint c = 0u; c < 3u; ++c) {
+      uint o = base + uint(k) * 3u + c;
+      float g = dsh[k][c];
+      float m = mix(g, m_sh[o], frame.adam.x);
+      float v = mix(g * g, v_sh[o], frame.adam.y);
+      m_sh[o] = m;
+      v_sh[o] = v;
+      sh[o] -= frame.lr1.y * (m * frame.bias.x) / (sqrt(v * frame.bias.y) + frame.adam.z);
+    }
+  }
+}

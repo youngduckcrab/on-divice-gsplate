@@ -311,6 +311,28 @@ SplatScene load_ply(const uint8_t* data, size_t size) {
   return scene;
 }
 
+void convert_convention(SplatScene& scene, AxisConvention target) {
+  if (scene.convention == target) return;
+  // Half turn about x: (x, y, z) -> (x, -y, -z). SH basis functions change sign
+  // with the parity of their y and z factors.
+  static constexpr float kShSign[15] = {-1, -1, 1, -1, 1, 1, -1, 1, -1, 1, -1, -1, 1, -1, 1};
+  const int coeffs = sh_rest_coeffs(scene.sh_degree);
+  for (uint32_t i = 0; i < scene.count; ++i) {
+    scene.positions[i * 3 + 1] = -scene.positions[i * 3 + 1];
+    scene.positions[i * 3 + 2] = -scene.positions[i * 3 + 2];
+    float* q = &scene.rotations[i * 4];
+    const float w = q[0], x = q[1], y = q[2], z = q[3];
+    q[0] = -x;
+    q[1] = w;
+    q[2] = -z;
+    q[3] = y;
+    for (int j = 0; j < coeffs; ++j) {
+      for (int c = 0; c < 3; ++c) scene.sh_rest[(size_t(i) * coeffs + j) * 3 + c] *= kShSign[j];
+    }
+  }
+  scene.convention = target;
+}
+
 std::vector<uint8_t> save_ply(const SplatScene& scene) {
   const int coeffs = sh_rest_coeffs(scene.sh_degree);
   std::string header = "ply\nformat binary_little_endian 1.0\nelement vertex " + std::to_string(scene.count) +
