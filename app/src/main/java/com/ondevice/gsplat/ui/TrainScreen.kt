@@ -233,7 +233,8 @@ private fun ProgressCard(vm: TrainViewModel) {
             val remaining = if (step > 0) vm.elapsedSeconds / step * (total - step) else 0.0
             Text("$step / ${total}회 · 경과 ${duration(vm.elapsedSeconds)} · 남은 시간 약 ${duration(remaining)}")
             Text(
-                "가우시안 ${thousands(s.optLong("gaussians"))} · 쌍 ${thousands(s.optLong("pairs"))} · " +
+                "가우시안 ${thousands(s.optLong("gaussians"))} (+${s.optInt("spawned")} −${s.optInt("pruned")}) · " +
+                    "쌍 ${thousands(s.optLong("pairs"))} · " +
                     "SH ${s.optInt("sh_degree")} · ${"%.1f".format(Locale.US, s.optDouble("step_ms"))} ms/회",
                 style = MaterialTheme.typography.bodySmall,
             )

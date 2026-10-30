@@ -68,6 +68,8 @@ struct TrainStats {
   double step_ms = 0.0;    // exponential moving average of the wall-clock step time
   int sh_degree = 0;       // active
   uint32_t densify_events = 0;
+  uint32_t spawned = 0;  // gaussians added by densification, in total
+  uint32_t pruned = 0;   // and removed
 };
 
 struct EvalResult {

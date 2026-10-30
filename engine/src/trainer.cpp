@@ -444,6 +444,8 @@ void Trainer::densify() {
   const uint32_t placed = std::min(spawned, room);
   if (placed > free_slots) slots_ += placed - free_slots;
   alive_ = alive_ - pruned + placed;
+  stats_.spawned += placed;
+  stats_.pruned += pruned;
   stats_.slots = slots_;
   stats_.gaussians = alive_;
   ++stats_.densify_events;

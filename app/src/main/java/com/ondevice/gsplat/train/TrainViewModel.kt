@@ -298,7 +298,8 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
             if (s != null) {
                 appendLine(
                     "학습: ${s.optInt("step")}/${s.optInt("iterations")}회 · ${"%.1f".format(Locale.US, elapsedSeconds)} s · " +
-                        "최근 ${"%.1f".format(Locale.US, s.optDouble("step_ms"))} ms/회 · 가우시안 ${s.optInt("gaussians")} · " +
+                        "최근 ${"%.1f".format(Locale.US, s.optDouble("step_ms"))} ms/회 · 가우시안 ${s.optInt("gaussians")} " +
+                        "(+${s.optInt("spawned")} −${s.optInt("pruned")}) · " +
                         "쌍 ${s.optLong("pairs")} · 학습 뷰 PSNR ${"%.2f".format(Locale.US, s.optDouble("psnr"))}" +
                         if (r?.stopped == true) " · 중간에 중지" else "",
                 )

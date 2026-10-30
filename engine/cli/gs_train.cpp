@@ -3,7 +3,7 @@
 //
 // Usage:
 //   gs_train <dataset_dir> <out.ply> [--width 360] [--iters 3000] [--max-gaussians 300000]
-//            [--sh 3] [--no-masks] [--preview <dir>] [--eval-every 1000]
+//            [--sh 3] [--init-gaussians 150000] [--no-masks] [--preview <dir>] [--eval-every 1000]
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -25,7 +25,7 @@ int main(int argc, char** argv) {
                  argv[0]);
     return 2;
   }
-  uint32_t width = 360, eval_every = 1000;
+  uint32_t width = 360, eval_every = 1000, max_init = 150000;
   std::string preview;
   gs::TrainOptions options;
   uint32_t iterations = options.iterations;
@@ -44,6 +44,8 @@ int main(int argc, char** argv) {
         options.max_gaussians = std::atoi(next());
       } else if (arg == "--sh") {
         options.sh_degree = std::atoi(next());
+      } else if (arg == "--init-gaussians") {
+        max_init = std::atoi(next());
       } else if (arg == "--no-masks") {
         options.masked = false;
       } else if (arg == "--preview") {
@@ -70,6 +72,7 @@ int main(int argc, char** argv) {
     gs::InitStats init_stats;
     gs::InitOptions init;
     init.subject_only = options.masked;
+    init.max_gaussians = max_init;
     gs::SplatScene scene = gs::initialize_gaussians(ds, init, &init_stats);
     std::printf("init from %s: %zu points -> %u gaussians (voxel %.4f)\n", init_stats.source.c_str(),
                 init_stats.raw_points, scene.count, init_stats.voxel_size);
@@ -93,8 +96,9 @@ int main(int argc, char** argv) {
                     p.sort, p.rasterize, p.backward, p.optimize);
       }
       if (s.step % 100 == 0 || trainer.finished()) {
-        std::printf("step %5u  l1 %.4f  psnr %5.2f  gaussians %7u  pairs %8llu  sh %d  %.1f ms/step\n", s.step,
-                    s.l1, s.psnr, s.gaussians, (unsigned long long)s.pairs, s.sh_degree, s.step_ms);
+        std::printf("step %5u  l1 %.4f  psnr %5.2f  gaussians %7u (+%u -%u)  pairs %8llu  sh %d  %.1f ms/step\n",
+                    s.step, s.l1, s.psnr, s.gaussians, s.spawned, s.pruned, (unsigned long long)s.pairs, s.sh_degree,
+                    s.step_ms);
         std::fflush(stdout);
       }
       if (eval_every > 0 && (s.step % eval_every == 0 || trainer.finished())) {

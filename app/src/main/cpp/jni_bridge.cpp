@@ -301,6 +301,8 @@ void write_stats(gs::JsonWriter& w, const gs::Trainer& t) {
   w.field("step_ms", s.step_ms);
   w.field("sh_degree", s.sh_degree);
   w.field("densify_events", s.densify_events);
+  w.field("spawned", s.spawned);
+  w.field("pruned", s.pruned);
   w.field("finished", t.finished());
 }
 
