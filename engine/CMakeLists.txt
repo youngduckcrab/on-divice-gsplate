@@ -68,6 +68,8 @@ set(GS_SHADERS
   train_backward_serial.comp
   train_backward_cut.comp
   train_backward_cut2.comp
+  train_backward_sg1.comp
+  train_backward_sg4.comp
   probe_sg_vec4.comp
   probe_sg_add_id.comp
   probe_sg_add_elect.comp

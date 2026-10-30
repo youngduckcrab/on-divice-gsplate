@@ -20,6 +20,8 @@ struct TrainOptions {
     Auto,            // the first subgroup variant the driver accepts, else SerialCut2
     Subgroup,        // vec4 subgroup adds (fails if unavailable)
     SubgroupScalar,  // scalar subgroup adds (fails if unavailable)
+    SubgroupLane4,   // scalar adds without subgroup id/elect, 4 splats per round (fails if unavailable)
+    SubgroupLane1,   // the same, one splat per round
     SerialCut2,      // no subgroups: like SerialCut, two splats per round of barriers
     SerialCut,       // no subgroups: like Serial, stopping at the tile's last contributor
     Serial,          // no subgroups: one splat at a time, two-stage shared-memory sum

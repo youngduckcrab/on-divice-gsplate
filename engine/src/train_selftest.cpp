@@ -489,6 +489,8 @@ ReductionChoice choose_reduction(VkContext& ctx) {
   };
   const Candidate candidates[] = {{Reduction::Subgroup, "subgroup", false},
                                   {Reduction::SubgroupScalar, "subgroup_scalar", false},
+                                  {Reduction::SubgroupLane4, "subgroup_lane4", false},
+                                  {Reduction::SubgroupLane1, "subgroup_lane1", false},
                                   {Reduction::SerialCut, "serial_cut", false},
                                   {Reduction::SerialCut2, "serial_cut2", false},
                                   {Reduction::Serial, "serial", true},
@@ -605,6 +607,8 @@ std::string trainer_self_test_json(VkContext& ctx) {
   using Reduction = TrainOptions::Reduction;
   const Case cases[] = {{Reduction::Subgroup, true},
                         {Reduction::SubgroupScalar, true},
+                        {Reduction::SubgroupLane4, true},
+                        {Reduction::SubgroupLane1, true},
                         {Reduction::SerialCut2, false},
                         {Reduction::SerialCut2, true},
                         {Reduction::SerialCut, true},
@@ -614,6 +618,8 @@ std::string trainer_self_test_json(VkContext& ctx) {
     w.begin_object();
     w.field("requested", c.reduction == Reduction::Subgroup         ? "subgroup"
                          : c.reduction == Reduction::SubgroupScalar ? "subgroup_scalar"
+                         : c.reduction == Reduction::SubgroupLane4  ? "subgroup_lane4"
+                         : c.reduction == Reduction::SubgroupLane1  ? "subgroup_lane1"
                          : c.reduction == Reduction::SerialCut2     ? "serial_cut2"
                          : c.reduction == Reduction::SerialCut      ? "serial_cut"
                          : c.reduction == Reduction::Serial         ? "serial"

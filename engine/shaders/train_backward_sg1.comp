@@ -1,0 +1,5 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Backward pass, scalar subgroup adds, 1 splat(s) per round (see train_backward_sg.glsl).
+#define GS_BATCH 1
+#include "train_backward_sg.glsl"

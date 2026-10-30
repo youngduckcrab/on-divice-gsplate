@@ -57,6 +57,8 @@ int main(int argc, char** argv) {
         using R = gs::TrainOptions::Reduction;
         options.reduction = r == "subgroup"          ? R::Subgroup
                             : r == "subgroup_scalar" ? R::SubgroupScalar
+                            : r == "subgroup_lane4"  ? R::SubgroupLane4
+                            : r == "subgroup_lane1"  ? R::SubgroupLane1
                             : r == "serial_cut2"     ? R::SerialCut2
                             : r == "serial_cut"      ? R::SerialCut
                             : r == "serial"          ? R::Serial

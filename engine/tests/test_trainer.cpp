@@ -56,12 +56,14 @@ void test_cutoff_matches_serial(gs::VkContext& ctx) {
   for (float& v : scene.opacity_logits) v += 4.0f;
   for (float& v : scene.log_scales) v += 0.7f;
   const float bg[3] = {0.1f, 0.2f, 0.3f};
-  std::vector<float> grads[3];
+  constexpr int kVariants = 5;
+  std::vector<float> grads[kVariants];
   float min_t = 1.0f;
-  const gs::TrainOptions::Reduction variants[3] = {gs::TrainOptions::Reduction::Serial,
-                                                   gs::TrainOptions::Reduction::SerialCut,
-                                                   gs::TrainOptions::Reduction::SerialCut2};
-  for (int v = 0; v < 3; ++v) {
+  const gs::TrainOptions::Reduction variants[kVariants] = {
+      gs::TrainOptions::Reduction::Serial, gs::TrainOptions::Reduction::SerialCut,
+      gs::TrainOptions::Reduction::SerialCut2, gs::TrainOptions::Reduction::SubgroupLane4,
+      gs::TrainOptions::Reduction::SubgroupLane1};
+  for (int v = 0; v < kVariants; ++v) {
     gs::TrainOptions o = gs::frozen_train_options(1, false);
     o.reduction = variants[v];
     gs::Trainer trainer(ctx, ds, scene, o);
@@ -72,7 +74,9 @@ void test_cutoff_matches_serial(gs::VkContext& ctx) {
   }
   double max_diff = 0.0, max_abs = 0.0;
   for (size_t i = 0; i < grads[0].size(); ++i) {
-    for (int v = 1; v < 3; ++v) max_diff = std::max(max_diff, double(std::fabs(grads[0][i] - grads[v][i])));
+    for (int v = 1; v < kVariants; ++v) {
+      max_diff = std::max(max_diff, double(std::fabs(grads[0][i] - grads[v][i])));
+    }
     max_abs = std::max(max_abs, double(std::fabs(grads[0][i])));
   }
   std::printf("  cutoff: min transmittance %.2g, max |grad| %.3g, max diff %.3g\n", min_t, max_abs, max_diff);
@@ -243,6 +247,9 @@ int main() {
     test_gradients(ctx, true);
     test_gradients(ctx, true, gs::TrainOptions::Reduction::Shared);
     test_gradients(ctx, true, gs::TrainOptions::Reduction::SubgroupScalar);
+    test_gradients(ctx, false, gs::TrainOptions::Reduction::SubgroupLane4);
+    test_gradients(ctx, true, gs::TrainOptions::Reduction::SubgroupLane4);
+    test_gradients(ctx, true, gs::TrainOptions::Reduction::SubgroupLane1);
     test_gradients(ctx, false, gs::TrainOptions::Reduction::SerialCut2);
     test_gradients(ctx, true, gs::TrainOptions::Reduction::SerialCut2);
     test_gradients(ctx, false, gs::TrainOptions::Reduction::SerialCut);

@@ -16,6 +16,8 @@
 #include "shaders/train_backward_cut2.h"
 #include "shaders/train_backward_scalar.h"
 #include "shaders/train_backward_serial.h"
+#include "shaders/train_backward_sg1.h"
+#include "shaders/train_backward_sg4.h"
 #include "shaders/train_backward_shared.h"
 #include "shaders/train_densify_mark.h"
 #include "shaders/train_densify_spawn.h"
@@ -159,7 +161,9 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
     std::span<const uint32_t> spirv;
   };
   const Variant variants[] = {{Reduction::Subgroup, "subgroup", shaders::train_backward},
-                              {Reduction::SubgroupScalar, "subgroup_scalar", shaders::train_backward_scalar}};
+                              {Reduction::SubgroupScalar, "subgroup_scalar", shaders::train_backward_scalar},
+                              {Reduction::SubgroupLane4, "subgroup_lane4", shaders::train_backward_sg4},
+                              {Reduction::SubgroupLane1, "subgroup_lane1", shaders::train_backward_sg1}};
   for (const Variant& v : variants) {
     if (!reduction_.empty()) break;
     if (options_.reduction != Reduction::Auto && options_.reduction != v.reduction) continue;
@@ -177,7 +181,8 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
     }
   }
   if (reduction_.empty()) {
-    if (options_.reduction == Reduction::Subgroup || options_.reduction == Reduction::SubgroupScalar) {
+    if (options_.reduction == Reduction::Subgroup || options_.reduction == Reduction::SubgroupScalar ||
+        options_.reduction == Reduction::SubgroupLane4 || options_.reduction == Reduction::SubgroupLane1) {
       throw std::runtime_error("subgroup 역전파를 쓸 수 없음 (" + reduction_note_ + ")");
     }
     backward_push_[0] = 32;
