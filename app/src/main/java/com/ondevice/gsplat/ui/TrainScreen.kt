@@ -244,7 +244,8 @@ private fun ProgressCard(vm: TrainViewModel) {
             )
             Text(
                 "${prep.optString("name")} ${prep.optInt("width")}×${prep.optInt("height")} · " +
-                    "초기화 ${prep.optString("init_source")} → ${thousands(prep.optLong("init_gaussians"))}개",
+                    "초기화 ${prep.optString("init_source")} → ${thousands(prep.optLong("init_gaussians"))}개 · " +
+                    "역전파 ${prep.optString("reduction")}",
                 style = MaterialTheme.typography.bodySmall,
             )
             vm.profile?.let { p ->

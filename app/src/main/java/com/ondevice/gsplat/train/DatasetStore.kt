@@ -7,6 +7,7 @@ import java.io.File
 import java.io.FilterInputStream
 import java.io.IOException
 import java.io.InputStream
+import java.util.zip.ZipException
 import java.util.zip.ZipInputStream
 import org.json.JSONObject
 
@@ -77,13 +78,19 @@ object DatasetStore {
         staging.mkdirs()
         try {
             val input = resolver.openInputStream(uri) ?: throw IOException("파일을 열 수 없음")
+            var current = ""
             CountingStream(input).use { counting ->
                 ZipInputStream(counting).use { zip ->
                     val buffer = ByteArray(1 shl 16)
                     var lastReport = 0L
                     while (true) {
-                        val entry = zip.nextEntry ?: break
+                        val entry = try {
+                            zip.nextEntry
+                        } catch (e: ZipException) {
+                            throw damaged(current, e)
+                        } ?: break
                         val name = entry.name.replace('\\', '/')
+                        current = name
                         if (name.startsWith("/") || name.split('/').any { it == ".." }) {
                             throw IOException("잘못된 zip 항목: $name")
                         }
@@ -92,7 +99,11 @@ object DatasetStore {
                         out.parentFile?.mkdirs()
                         out.outputStream().use { stream ->
                             while (true) {
-                                val n = zip.read(buffer)
+                                val n = try {
+                                    zip.read(buffer)
+                                } catch (e: ZipException) {
+                                    throw damaged(name, e)
+                                }
                                 if (n < 0) break
                                 stream.write(buffer, 0, n)
                                 if (total > 0 && counting.count - lastReport > (1 shl 20)) {
@@ -118,6 +129,10 @@ object DatasetStore {
             staging.deleteRecursively()
         }
     }
+
+    /** A CRC or format error means the downloaded file is damaged (e.g. an interrupted download). */
+    private fun damaged(entry: String, e: ZipException) =
+        IOException("zip 파일이 손상됨 (${entry.ifEmpty { "시작 부분" }}: ${e.message}). 파일을 지우고 다시 받아 주세요")
 
     private class CountingStream(input: InputStream) : FilterInputStream(input) {
         var count = 0L

@@ -294,6 +294,8 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                         "${prep.optInt("init_gaussians")}개 · 불러오기 ${sec(prep.optDouble("load_ms"))} · " +
                         "초기화 ${sec(prep.optDouble("init_ms"))} · GPU 준비 ${sec(prep.optDouble("setup_ms"))}",
                 )
+                val note = prep.optString("reduction_note").takeIf { it.isNotEmpty() }?.let { " ($it)" } ?: ""
+                appendLine("역전파 합산: ${prep.optString("reduction")}$note")
             }
             if (s != null) {
                 appendLine(

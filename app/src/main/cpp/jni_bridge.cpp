@@ -364,6 +364,8 @@ Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, js
     w.field("load_ms", load_ms);
     w.field("init_ms", init_ms);
     w.field("setup_ms", setup_ms);
+    w.field("reduction", session->trainer->reduction());
+    w.field("reduction_note", session->trainer->reduction_note());
     write_stats(w, *session->trainer);
     w.end_object();
     g_train = std::move(session);

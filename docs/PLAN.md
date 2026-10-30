@@ -235,6 +235,7 @@ on-divice-gsplate/
 4. **Loss** — L1. 마스크가 있으면 정답을 무작위 배경색 위에 합성하고 렌더도 같은 배경색 위에 그려, 대상 밖은 투명해지도록 학습한다. (M4: (1−λ)·L1 + λ·D-SSIM)
 5. **Backward 래스터** (`train_backward`) — back-to-front로 다시 순회. **(c) atomic-free 방식 채택**: 가우시안 B개씩 묶어 픽셀별 그래디언트를 subgroupAdd → 공유 메모리에서 subgroup끼리 합산 → (타일, 가우시안) 쌍별 그래디언트를 정렬 전 인덱스 위치에 기록. 가장 작은 subgroup 크기에 맞춰 공유 메모리 크기를 specialization constant로 정한다 (Adreno 64 → B=32, lavapipe 8 → B=8).
    - (a)는 Fold6에서 불가(float atomic 없음), (b)·(d)는 (c)가 느릴 때 비교 후보로 남긴다.
+   - **v0.3.0 Fold6 결과**: 학습 파이프라인 생성이 `VK_ERROR_UNKNOWN`으로 실패. 공유 메모리 배열 크기에 specialization constant 식(`OpSpecConstantOp`)을 쓴 셰이더가 원인으로 추정 → v0.3.1에서 고정 크기 + push constant로 바꾸고, subgroup 없이 공유 메모리 트리로 합산하는 대체 셰이더를 두어 subgroup 버전이 거부되면 자동 전환. 실패 시 셰이더 이름을 모두 보고.
 6. **Backward 전처리 + Adam** (`train_step`, 가우시안당 1스레드) — 정렬 전 순서에서 연속인 자기 쌍들을 합산 → 투영 · SH(시점 방향 포함) · 공분산 · quaternion 정규화를 거쳐 3D 파라미터 그래디언트 → fused Adam. 위치 학습률은 카메라 범위 기준 지수 감쇠. densify 통계(NDC 위치 그래디언트 크기, 보인 횟수, 최대 반경)도 여기서 누적.
 7. **Densify / Prune** (`train_densify_mark`, `train_densify_spawn`) — 3DGS 기본 방식: 평균 위치 그래디언트가 임계값 이상이면 작은 것은 복제, 큰 것은 분할(1.6배 축소, 가우시안 분포에서 표본), opacity < 0.005나 너무 큰 것은 제거. 제거된 슬롯은 free list로 재사용하고 슬롯 상한(가우시안 예산)을 넘지 않는다. 정수 atomic만 쓴다. opacity 리셋도 GPU에서.
    - 3DGS-MCMC 재배치, Taming식 점수 기반 방식은 M4에서 비교.

@@ -5,12 +5,14 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 #include "gs/log.h"
 #include "shaders/radix_scan.h"
 #include "shaders/scan_add.h"
 #include "shaders/scan_local.h"
 #include "shaders/train_backward.h"
+#include "shaders/train_backward_shared.h"
 #include "shaders/train_densify_mark.h"
 #include "shaders/train_densify_spawn.h"
 #include "shaders/train_emit.h"
@@ -82,12 +84,6 @@ TrainOptions scaled_options(uint32_t iterations) {
 Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initial, const TrainOptions& options)
     : ctx_(ctx), dataset_(dataset), options_(options), rng_(options.seed) {
   const DeviceInfo& info = ctx.info();
-  const VkSubgroupFeatureFlags needed =
-      VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT;
-  if ((info.subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) == 0 ||
-      (info.subgroup.supportedOperations & needed) != needed) {
-    throw std::runtime_error("이 GPU는 학습에 필요한 subgroup 연산(compute arithmetic/vote)을 지원하지 않음");
-  }
   if (dataset.frames.empty() || dataset.width == 0) throw std::runtime_error("데이터셋이 비어 있음");
   options_.sh_degree = std::clamp(options_.sh_degree, 0, 3);
   options_.masked = options_.masked && dataset.has_masks;
@@ -112,31 +108,71 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
     for (size_t i = 0; i < dataset.frames.size(); ++i) train_frames_.push_back(i);
   }
 
-  // Reductions in the backward pass are sized for the smallest subgroup the device may use.
+  // Pipelines. Each failure is collected so one run names every shader the
+  // driver rejects.
+  std::vector<std::string> failures;
+  auto make = [&](const char* name, std::span<const uint32_t> spirv, uint32_t bindings, uint32_t push) {
+    try {
+      return ctx.create_compute_pipeline(spirv, bindings, push);
+    } catch (const VulkanError& e) {
+      failures.push_back(std::string(name) + " (" + vk_result_name(e.result) + ")");
+      log_error("trainer: cannot create %s: %s", name, e.what());
+      return ComputePipeline{};
+    }
+  };
+  project_ = make("train_project", shaders::train_project, 5, 0);
+  scan_local_ = make("scan_local", shaders::scan_local, 4, sizeof(ScanPush));
+  scan_blocks_ = make("radix_scan", shaders::radix_scan, 1, sizeof(uint32_t));
+  scan_add_ = make("scan_add", shaders::scan_add, 4, sizeof(ScanPush));
+  emit_ = make("train_emit", shaders::train_emit, 7, 0);
+  ranges_ = make("train_ranges", shaders::train_ranges, 2, sizeof(uint32_t));
+  forward_ = make("train_forward", shaders::train_forward, 10, 0);
+  step_ = make("train_step", shaders::train_step, 12, 0);
+  densify_mark_ = make("train_densify_mark", shaders::train_densify_mark, 11, 0);
+  densify_spawn_ = make("train_densify_spawn", shaders::train_densify_spawn, 11, sizeof(uint32_t));
+  reset_opacity_ = make("train_reset_opacity", shaders::train_reset_opacity, 4, sizeof(float));
+
+  // Backward pass: subgroup reduction when the device has it and the driver
+  // compiles it, else the shared-memory variant.
+  const VkSubgroupFeatureFlags needed =
+      VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT;
+  const bool has_subgroups = (info.subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
+                             (info.subgroup.supportedOperations & needed) == needed;
   uint32_t min_subgroup = info.subgroup.subgroupSize;
   if (info.has_subgroup_size_control && info.subgroup_size_control.minSubgroupSize > 0) {
     min_subgroup = std::min(min_subgroup, info.subgroup_size_control.minSubgroupSize);
   }
+  // The reduction slots (512 vec4) hold batch * 3 per subgroup.
   const uint32_t max_subgroups = std::max(1u, 256u / std::max(min_subgroup, 1u));
   uint32_t batch = 32;
-  while (batch > 1 && max_subgroups * batch * 48 + batch * 52 > 16384) batch /= 2;
-  const uint32_t forward_spec[] = {max_subgroups};
-  const uint32_t backward_spec[] = {max_subgroups, batch};
-  log_info("trainer: %ux%u, %u tiles, capacity %u, sh %d, subgroup %u..%u -> backward batch %u", width_, height_,
-           tiles_x_ * tiles_y_, capacity_, options_.sh_degree, min_subgroup, info.subgroup.subgroupSize, batch);
-
-  project_ = ctx.create_compute_pipeline(shaders::train_project, 5, 0);
-  scan_local_ = ctx.create_compute_pipeline(shaders::scan_local, 4, sizeof(ScanPush));
-  scan_blocks_ = ctx.create_compute_pipeline(shaders::radix_scan, 1, sizeof(uint32_t));
-  scan_add_ = ctx.create_compute_pipeline(shaders::scan_add, 4, sizeof(ScanPush));
-  emit_ = ctx.create_compute_pipeline(shaders::train_emit, 7, 0);
-  ranges_ = ctx.create_compute_pipeline(shaders::train_ranges, 2, sizeof(uint32_t));
-  forward_ = ctx.create_compute_pipeline(shaders::train_forward, 10, 0, forward_spec);
-  backward_ = ctx.create_compute_pipeline(shaders::train_backward, 8, 0, backward_spec);
-  step_ = ctx.create_compute_pipeline(shaders::train_step, 12, 0);
-  densify_mark_ = ctx.create_compute_pipeline(shaders::train_densify_mark, 11, 0);
-  densify_spawn_ = ctx.create_compute_pipeline(shaders::train_densify_spawn, 11, sizeof(uint32_t));
-  reset_opacity_ = ctx.create_compute_pipeline(shaders::train_reset_opacity, 4, sizeof(float));
+  while (batch > 1 && max_subgroups * batch * 3 > 512) batch /= 2;
+  backward_push_[0] = batch;
+  backward_push_[1] = max_subgroups;
+  if (has_subgroups && min_subgroup >= 4 && options_.reduction != TrainOptions::Reduction::Shared) {
+    try {
+      backward_ = ctx.create_compute_pipeline(shaders::train_backward, 8, sizeof(backward_push_));
+      reduction_ = "subgroup";
+    } catch (const VulkanError& e) {
+      log_error("trainer: subgroup backward rejected (%s), using shared-memory reduction", e.what());
+      reduction_note_ = std::string("subgroup 버전 실패: ") + vk_result_name(e.result);
+    }
+  }
+  if (reduction_.empty()) {
+    if (options_.reduction == TrainOptions::Reduction::Subgroup) {
+      throw std::runtime_error("subgroup 역전파를 쓸 수 없음");
+    }
+    backward_push_[0] = 32;
+    backward_ = make("train_backward_shared", shaders::train_backward_shared, 8, sizeof(backward_push_));
+    reduction_ = "shared";
+  }
+  if (!failures.empty()) {
+    std::string message = "학습 셰이더를 만들 수 없음:";
+    for (const std::string& f : failures) message += " " + f;
+    throw std::runtime_error(message);
+  }
+  log_info("trainer: %ux%u, %u tiles, capacity %u, sh %d, subgroup %u..%u, backward %s batch %u", width_, height_,
+           tiles_x_ * tiles_y_, capacity_, options_.sh_degree, min_subgroup, info.subgroup.subgroupSize,
+           reduction_.c_str(), backward_push_[0]);
   sort_ = std::make_unique<RadixSort>(ctx);
 
   const uint64_t cap = capacity_;
@@ -333,10 +369,10 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
     vkCmdCopyBuffer(cmd, tile_loss_.handle(), readback_loss_.handle(), 1, &loss);
   };
   auto backward = [&](VkCommandBuffer cmd) {
-    dispatch_kernel(
-        ctx_, cmd, backward_,
-        {&frame_, &projected_, &ranges_buf_, &values_, &pair_gaussian_, &pixel_grad_, &pixel_count_, &pair_grads_},
-        tiles_x_, tiles_y_);
+    ctx_.dispatch(cmd, backward_,
+                  {&frame_, &projected_, &ranges_buf_, &values_, &pair_gaussian_, &pixel_grad_, &pixel_count_,
+                   &pair_grads_},
+                  backward_push_, tiles_x_, tiles_y_);
     VkContext::barrier(cmd);
   };
   auto optimize = [&](VkCommandBuffer cmd) {

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "gs/camera.h"
@@ -14,6 +15,13 @@
 namespace gs {
 
 struct TrainOptions {
+  // How the backward pass sums gradients over a tile's pixels.
+  enum class Reduction {
+    Auto,      // subgroup adds when available and accepted by the driver, else Shared
+    Subgroup,  // subgroup adds (fails if unavailable)
+    Shared,    // shared-memory tree, no subgroup operations (slower)
+  };
+
   uint32_t iterations = 3000;
   uint32_t max_gaussians = 300000;  // slot capacity
   int sh_degree = 3;
@@ -41,6 +49,7 @@ struct TrainOptions {
   float percent_dense = 0.01f;  // clone below, split above this fraction of the extent
   float prune_opacity = 0.005f;
 
+  Reduction reduction = Reduction::Auto;
   uint32_t seed = 1;
 };
 
@@ -117,6 +126,9 @@ class Trainer {
   };
   Gradients first_step_gradients();
   uint32_t sh_stride() const { return sh_stride_; }
+  // "subgroup" or "shared", and why the subgroup variant was not used, if it was not.
+  const std::string& reduction() const { return reduction_; }
+  const std::string& reduction_note() const { return reduction_note_; }
 
   static constexpr uint32_t kTileSize = 16;
 
@@ -140,6 +152,9 @@ class Trainer {
   PassTimes profile_;
   uint32_t width_ = 0, height_ = 0, tiles_x_ = 0, tiles_y_ = 0;
   uint32_t capacity_ = 0;
+  uint32_t backward_push_[2] = {32, 4};  // batch, max subgroups
+  std::string reduction_;
+  std::string reduction_note_;
   uint32_t sh_stride_ = 0;  // floats per slot
   uint32_t slots_ = 0;
   uint32_t alive_ = 0;

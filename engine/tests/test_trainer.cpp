@@ -277,12 +277,15 @@ gs::TrainOptions frozen_options(int degree, bool masked) {
   return o;
 }
 
-void test_gradients(gs::VkContext& ctx, bool masked) {
+void test_gradients(gs::VkContext& ctx, bool masked,
+                    gs::TrainOptions::Reduction reduction = gs::TrainOptions::Reduction::Auto) {
   const int degree = 2;
   const uint32_t n = 10;
   gs::Dataset ds = make_dataset(kWidth, kHeight, 1, masked, 3);
   gs::SplatScene scene = random_scene(n, degree, 11);
-  gs::Trainer trainer(ctx, ds, scene, frozen_options(degree, masked));
+  gs::TrainOptions options = frozen_options(degree, masked);
+  options.reduction = reduction;
+  gs::Trainer trainer(ctx, ds, scene, options);
   const float bg[3] = {0.2f, 0.5f, 0.7f};
   const gs::Camera cam = gs::dataset_camera(ds, ds.frames[0]);
 
@@ -354,8 +357,8 @@ void test_gradients(gs::VkContext& ctx, bool masked) {
         }
       }
     }
-    std::printf("  %-9s %s: max |fd| %.3g, max err %.3g, %d/%d off\n", group.name, masked ? "masked" : "plain",
-                max_ref, max_err, bad, checked);
+    std::printf("  %-9s %s %-8s: max |fd| %.3g, max err %.3g, %d/%d off\n", group.name,
+                masked ? "masked" : "plain ", trainer.reduction().c_str(), max_ref, max_err, bad, checked);
     EXPECT(bad <= checked / 20, "%s gradients: %d of %d off (masked %d)", group.name, bad, checked, int(masked));
   }
 }
@@ -522,6 +525,7 @@ int main() {
     gs::VkContext ctx;
     test_gradients(ctx, false);
     test_gradients(ctx, true);
+    test_gradients(ctx, true, gs::TrainOptions::Reduction::Shared);
     test_scan_and_densify(ctx);
     test_training_converges(ctx);
   } catch (const std::exception& e) {

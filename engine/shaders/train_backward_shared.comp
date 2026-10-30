@@ -1,0 +1,5 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Backward pass without subgroup operations (see train_backward.glsl).
+#define GS_SHARED_REDUCTION
+#include "train_backward.glsl"
