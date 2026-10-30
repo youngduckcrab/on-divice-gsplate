@@ -4,6 +4,7 @@
 
 - 개발 계획서: [docs/PLAN.md](docs/PLAN.md)
 - 릴리즈 노트: [docs/releases/](docs/releases/)
+- 예제 데이터셋 (가상 촬영): [docs/datasets.md](docs/datasets.md)
 - 현재 단계: **M1 — 스플랫 뷰어** (`v0.2.0`). M0 결과: [docs/experiments/m0-fold6.md](docs/experiments/m0-fold6.md)
 
 ## 구조
@@ -14,7 +15,9 @@
 | `engine/` | C++20 / Vulkan 엔진. Android와 Linux에서 같은 코드로 빌드됨 |
 | `engine/shaders/` | GLSL 셰이더 — compute, vertex, fragment (빌드 시 SPIR-V로 컴파일되어 바이너리에 포함) |
 | `engine/tests/` | GPU 커널 정합성 · 파일 입출력 · 렌더링 테스트 (CI에서는 Mesa lavapipe 소프트웨어 Vulkan 사용) |
+| `tools/datasets/` | 가상 촬영 데이터셋 생성기 (폰으로 피사체를 한 바퀴 도는 촬영을 렌더링으로 흉내, [설명](docs/datasets.md)) |
 | `.github/workflows/build.yml` | 엔진 테스트 + APK 빌드 + 새 버전이면 GitHub Release 생성 |
+| `.github/workflows/datasets.yml` | 가상 촬영 데이터셋을 렌더링해 `datasets-v1` 릴리즈에 첨부 |
 
 ## 빌드
 

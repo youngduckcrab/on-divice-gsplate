@@ -8,3 +8,5 @@ local.properties
 .DS_Store
 captures/
 dist/
+__pycache__/
+*.pyc

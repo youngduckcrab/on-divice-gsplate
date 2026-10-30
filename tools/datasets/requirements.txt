@@ -1,0 +1,4 @@
+moderngl==5.13.0
+numpy==2.5.4
+pillow==13.0.0
+trimesh==5.2.0
