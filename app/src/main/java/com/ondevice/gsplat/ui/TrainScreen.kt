@@ -200,7 +200,6 @@ private fun DatasetCard(
     }
 }
 
-@Composable
 private enum class ExportKind { ZIP, ZIP_WITH_VIDEO, VIDEO }
 
 @Composable
