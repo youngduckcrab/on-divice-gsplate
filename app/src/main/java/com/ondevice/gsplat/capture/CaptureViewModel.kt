@@ -206,11 +206,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                     f.depth?.let { put("depth_file_path", it) }
                     f.confidence?.let { put("depth_confidence_path", it) }
                     // Column-major 4x4 (ARCore) -> rows; OpenGL camera axes, as nerfstudio expects.
-                    val m = f.pose
-                    put(
-                        "transform_matrix",
-                        JSONArray((0 until 4).map { r -> JSONArray((0 until 4).map { col -> m[col * 4 + r].toDouble() }) }),
-                    )
+                    put("transform_matrix", JSONArray(CaptureMath.rows(f.pose).map { JSONArray(it) }))
                     put("timestamp", f.timestampNs)
                 },
             )

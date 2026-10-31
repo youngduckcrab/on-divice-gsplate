@@ -21,11 +21,6 @@ import com.google.ar.core.TrackingState
 import java.nio.ByteOrder
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
-import kotlin.math.abs
-import kotlin.math.acos
-import kotlin.math.atan2
-import kotlin.math.min
-import kotlin.math.sqrt
 
 /** Snapshot of the capture for the UI, published about ten times a second. */
 data class CaptureStatus(
@@ -138,7 +133,7 @@ class CaptureController(
             manager.getCameraCharacteristics(s.cameraConfig.cameraId).get(CameraCharacteristics.SENSOR_ORIENTATION)
         }.getOrNull() ?: 90
         displayRotation = rotation
-        uprightDegrees = (sensorOrientation - rotationDegrees(rotation) + 360) % 360
+        uprightDegrees = CaptureMath.uprightDegrees(sensorOrientation, rotationDegrees(rotation))
         session = s
     }
 
@@ -221,8 +216,8 @@ class CaptureController(
             previousPosition?.let { prev ->
                 val dt = (now - previousTimeNs) / 1e9f
                 if (dt > 0f) {
-                    linearSpeed = 0.8f * linearSpeed + 0.2f * (distance(position, prev) / dt)
-                    angularSpeed = 0.8f * angularSpeed + 0.2f * (angleDegrees(rotation, previousRotation!!) / dt)
+                    linearSpeed = 0.8f * linearSpeed + 0.2f * (CaptureMath.distance(position, prev) / dt)
+                    angularSpeed = 0.8f * angularSpeed + 0.2f * (CaptureMath.angleDegrees(rotation, previousRotation!!) / dt)
                 }
             }
             previousPosition = position
@@ -260,13 +255,13 @@ class CaptureController(
 
     private fun considerKeyframe(frame: Frame, position: FloatArray, rotation: FloatArray, now: Long) {
         val a = anchor ?: return
-        val toSubject = horizontal(position, a)
+        val toSubject = CaptureMath.horizontal(position, a)
         val dist = maxOf(toSubject, 0.3f)
         val lastP = lastKeyPosition
         if (lastP != null) {
             if (now - lastKeyTimeNs < 200_000_000L) return
-            val moved = distance(position, lastP)
-            val turned = angleDegrees(rotation, lastKeyRotation!!)
+            val moved = CaptureMath.distance(position, lastP)
+            val turned = CaptureMath.angleDegrees(rotation, lastKeyRotation!!)
             if (moved < maxOf(0.03f, 0.05f * dist) && turned < 5f) return
         }
         counters.candidates++
@@ -301,7 +296,7 @@ class CaptureController(
         lastKeyPosition = position
         lastKeyRotation = rotation
         lastKeyTimeNs = now
-        val bin = azimuthBin(position, a)
+        val bin = CaptureMath.azimuthBin(position, a)
         if (bin >= 0) coverage[bin] = true
     }
 
@@ -373,8 +368,8 @@ class CaptureController(
         var dist = 0f
         if (a != null && camera.trackingState == TrackingState.TRACKING) {
             val p = camera.pose.translation
-            bin = azimuthBin(p, a)
-            dist = horizontal(p, a)
+            bin = CaptureMath.azimuthBin(p, a)
+            dist = CaptureMath.horizontal(p, a)
         }
         return CaptureStatus(
             tracking = camera.trackingState,
@@ -392,7 +387,7 @@ class CaptureController(
     }
 
     companion object {
-        const val BINS = 36  // 10 degrees each
+        const val BINS = CaptureMath.BINS
 
         fun rotationDegrees(rotation: Int) = when (rotation) {
             Surface.ROTATION_90 -> 90
@@ -406,35 +401,6 @@ class CaptureController(
             val c = i.principalPoint
             val d = i.imageDimensions
             return floatArrayOf(f[0], f[1], c[0], c[1], d[0].toFloat(), d[1].toFloat())
-        }
-
-        fun distance(a: FloatArray, b: FloatArray): Float {
-            val dx = a[0] - b[0]
-            val dy = a[1] - b[1]
-            val dz = a[2] - b[2]
-            return sqrt(dx * dx + dy * dy + dz * dz)
-        }
-
-        /** Distance in the horizontal (gravity-free) plane. */
-        fun horizontal(a: FloatArray, b: FloatArray): Float {
-            val dx = a[0] - b[0]
-            val dz = a[2] - b[2]
-            return sqrt(dx * dx + dz * dz)
-        }
-
-        /** Which tenth-of-a-turn around the subject the camera is in. */
-        fun azimuthBin(camera: FloatArray, subject: FloatArray): Int {
-            val dx = camera[0] - subject[0]
-            val dz = camera[2] - subject[2]
-            if (dx * dx + dz * dz < 1e-6f) return -1
-            val degrees = (Math.toDegrees(atan2(dx, dz).toDouble()) + 360.0) % 360.0
-            return min(BINS - 1, (degrees / (360.0 / BINS)).toInt())
-        }
-
-        /** Angle between two unit quaternions (x, y, z, w), degrees. */
-        fun angleDegrees(a: FloatArray, b: FloatArray): Float {
-            val dot = abs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]).coerceAtMost(1f)
-            return Math.toDegrees(2.0 * acos(dot.toDouble())).toFloat()
         }
 
         /** Variance of a Laplacian over every 4th pixel of the Y plane: higher is sharper. */

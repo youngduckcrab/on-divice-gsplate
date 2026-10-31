@@ -88,4 +88,5 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.arcore)
     implementation(libs.mlkit.segmentation.selfie)
+    testImplementation(libs.junit)
 }

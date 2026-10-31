@@ -115,7 +115,7 @@ class KeyframeWriter(private val dir: File, private val uprightDegrees: Int) {
         val start = System.nanoTime()
         val name = "frame_%05d".format(f.index)
         val jpeg = ByteArrayOutputStream().use { out ->
-            YuvImage(nv21(f), ImageFormat.NV21, f.width, f.height, null)
+            YuvImage(CaptureMath.nv21(f.width, f.height, f.y, f.yRowStride, f.u, f.v, f.uvRowStride, f.uvPixelStride), ImageFormat.NV21, f.width, f.height, null)
                 .compressToJpeg(Rect(0, 0, f.width, f.height), 92, out)
             out.toByteArray()
         }
@@ -151,24 +151,6 @@ class KeyframeWriter(private val dir: File, private val uprightDegrees: Int) {
         return WrittenFrame(f.index, "images/$name.jpg", maskPath, depthPath, confidencePath, f.pose, f.timestampNs, coverage)
     }
 
-    /** NV21 (Y, then interleaved V/U) from the copied YUV_420_888 planes. */
-    private fun nv21(f: CapturedFrame): ByteArray {
-        val w = f.width
-        val h = f.height
-        val out = ByteArray(w * h + 2 * (w / 2) * (h / 2))
-        for (row in 0 until h) System.arraycopy(f.y, row * f.yRowStride, out, row * w, w)
-        var o = w * h
-        for (row in 0 until h / 2) {
-            val base = row * f.uvRowStride
-            for (col in 0 until w / 2) {
-                val i = base + col * f.uvPixelStride
-                out[o++] = f.v[i]
-                out[o++] = f.u[i]
-            }
-        }
-        return out
-    }
-
     /**
      * Person mask (0..255) in the image's (sensor) orientation at half
      * resolution: the segmenter expects an upright person.
@@ -189,22 +171,7 @@ class KeyframeWriter(private val dir: File, private val uprightDegrees: Int) {
         if (upright !== half) upright.recycle()
         half.recycle()
         // Back to the sensor orientation: rotate the rest of the way round.
-        val (back, bw, bh) = rotate(values, w, h, (360 - uprightDegrees) % 360)
+        val (back, bw, bh) = CaptureMath.rotate(values, w, h, (360 - uprightDegrees) % 360)
         return Triple(back, bw, bh)
-    }
-
-    companion object {
-        /** Rotates a w x h single-channel image clockwise by 0, 90, 180 or 270 degrees. */
-        fun rotate(src: ByteArray, w: Int, h: Int, degrees: Int): Triple<ByteArray, Int, Int> {
-            if (degrees == 0) return Triple(src, w, h)
-            val dst = ByteArray(src.size)
-            when (degrees) {
-                90 -> for (y in 0 until h) for (x in 0 until w) dst[x * h + (h - 1 - y)] = src[y * w + x]
-                180 -> for (y in 0 until h) for (x in 0 until w) dst[(h - 1 - y) * w + (w - 1 - x)] = src[y * w + x]
-                270 -> for (y in 0 until h) for (x in 0 until w) dst[(w - 1 - x) * h + y] = src[y * w + x]
-                else -> throw IllegalArgumentException("rotation $degrees")
-            }
-            return if (degrees == 180) Triple(dst, w, h) else Triple(dst, h, w)
-        }
     }
 }
