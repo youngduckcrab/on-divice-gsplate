@@ -185,7 +185,10 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
             phase = Phase.IDLE
             imported.onSuccess { result ->
                 val d = result.dataset
-                status = if (result.damaged.isEmpty()) {
+                val images = File(d.dir, "images").list()?.size ?: 0
+                status = if (result.truncated) {
+                    "불러옴: ${d.name} · zip이 중간에서 끊겨 있어서 받은 부분까지만 (사진 $images/${d.frames}장)"
+                } else if (result.damaged.isEmpty()) {
                     "불러옴: ${d.name} (${d.frames}장)"
                 } else {
                     "불러옴: ${d.name} (${d.frames}장) · 손상된 파일 ${result.damaged.size}개는 빼고 학습함 " +
@@ -205,8 +208,19 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         importMessage = "파일이 선택되지 않았어요. 선택 창에서 zip 파일을 눌러 주세요"
     }
 
-    /** Writes [info] as a zip to [uri] (DatasetStore.exportZip). */
-    fun exportDataset(info: DatasetInfo, uri: Uri) {
+    /** Writes [info] as a zip to [uri] (DatasetStore.exportZip), with its video when [withVideo]. */
+    fun exportDataset(info: DatasetInfo, uri: Uri, withVideo: Boolean) {
+        export(info, "${info.name}.zip") { onProgress ->
+            DatasetStore.exportZip(getApplication(), info, uri, withVideo, onProgress)
+        }
+    }
+
+    /** Writes [info]'s capture video to [uri]. */
+    fun exportVideo(info: DatasetInfo, uri: Uri) {
+        export(info, "${info.name}.mp4") { onProgress -> DatasetStore.exportVideo(getApplication(), info, uri, onProgress) }
+    }
+
+    private fun export(info: DatasetInfo, file: String, write: ((Float) -> Unit) -> Long) {
         if (running || phase == Phase.IMPORTING || exporting) return
         if (!File(info.dir, "transforms.json").exists()) {
             status = "아직 파일을 저장하는 중이라 내보낼 수 없어요. 잠시 뒤에 다시 눌러 주세요"
@@ -215,19 +229,18 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         }
         exporting = true
         viewModelScope.launch {
-            status = "데이터셋 내보내는 중… (${info.name})"
-            importMessage = status
+            importMessage = "내보내는 중… ($file) · 끝나기 전에 보내면 파일이 잘려요"
+            status = importMessage
             val written = withContext(Dispatchers.IO) {
                 runCatching {
-                    DatasetStore.exportZip(getApplication(), info, uri) { p ->
-                        status = "데이터셋 내보내는 중… ${(p * 100).toInt()}% (${info.name})"
-                        importMessage = status
+                    write { p ->
+                        importMessage = "내보내는 중… ${(p * 100).toInt()}% ($file) · 끝나기 전에 보내면 파일이 잘려요"
                     }
                 }
             }
             exporting = false
             status = written.fold(
-                { "내보냄: ${info.name}.zip (${"%.0f".format(Locale.US, it / 1e6)} MB)" },
+                { "내보냄: $file (${"%.0f".format(Locale.US, it / 1e6)} MB) · 이제 보내도 돼요" },
                 { "내보내기 실패: ${it.message ?: it}" },
             )
             importMessage = status

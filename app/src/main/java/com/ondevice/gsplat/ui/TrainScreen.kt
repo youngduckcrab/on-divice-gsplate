@@ -10,6 +10,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
@@ -21,6 +22,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -66,11 +69,16 @@ fun TrainScreen(onOpenModel: (File) -> Unit, vm: TrainViewModel = viewModel()) {
         ActivityResultContracts.CreateDocument("application/octet-stream"),
     ) { uri -> if (uri != null) vm.exportTo(uri) }
     var exportTarget by remember { mutableStateOf<DatasetInfo?>(null) }
+    var exportWithVideo by remember { mutableStateOf(false) }
     val exportDataset = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/zip"),
     ) { uri ->
         val d = exportTarget
-        if (uri != null && d != null) vm.exportDataset(d, uri)
+        if (uri != null && d != null) vm.exportDataset(d, uri, exportWithVideo)
+    }
+    val exportVideo = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("video/mp4")) { uri ->
+        val d = exportTarget
+        if (uri != null && d != null) vm.exportVideo(d, uri)
     }
 
     Column(
@@ -84,9 +92,15 @@ fun TrainScreen(onOpenModel: (File) -> Unit, vm: TrainViewModel = viewModel()) {
             vm = vm,
             onImport = { importZip.launch(arrayOf("application/zip", "application/x-zip-compressed", "*/*")) },
             onOpenDownloads = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(DATASETS_URL))) },
-            onExport = { d ->
+            onExport = { d, what ->
                 exportTarget = d
-                exportDataset.launch("${d.name}.zip")
+                when (what) {
+                    ExportKind.VIDEO -> exportVideo.launch("${d.name}.mp4")
+                    else -> {
+                        exportWithVideo = what == ExportKind.ZIP_WITH_VIDEO
+                        exportDataset.launch("${d.name}.zip")
+                    }
+                }
             },
         )
         SettingsCard(vm)
@@ -160,7 +174,7 @@ private fun DatasetCard(
     vm: TrainViewModel,
     onImport: () -> Unit,
     onOpenDownloads: () -> Unit,
-    onExport: (DatasetInfo) -> Unit,
+    onExport: (DatasetInfo, ExportKind) -> Unit,
 ) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -187,7 +201,11 @@ private fun DatasetCard(
 }
 
 @Composable
-private fun DatasetRow(d: DatasetInfo, selected: Boolean, vm: TrainViewModel, onExport: (DatasetInfo) -> Unit) {
+private enum class ExportKind { ZIP, ZIP_WITH_VIDEO, VIDEO }
+
+@Composable
+private fun DatasetRow(d: DatasetInfo, selected: Boolean, vm: TrainViewModel, onExport: (DatasetInfo, ExportKind) -> Unit) {
+    var menu by remember { mutableStateOf(false) }
     Row(
         Modifier
             .fillMaxWidth()
@@ -207,7 +225,34 @@ private fun DatasetRow(d: DatasetInfo, selected: Boolean, vm: TrainViewModel, on
                 style = MaterialTheme.typography.bodySmall,
             )
         }
-        TextButton(enabled = !vm.running && !vm.exporting, onClick = { onExport(d) }) { Text("내보내기") }
+        Box {
+            TextButton(enabled = !vm.running && !vm.exporting, onClick = { menu = true }) { Text("내보내기") }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                DropdownMenuItem(
+                    text = { Text("데이터셋 zip (사진·누끼·깊이·위치)") },
+                    onClick = {
+                        menu = false
+                        onExport(d, ExportKind.ZIP)
+                    },
+                )
+                if (d.video) {
+                    DropdownMenuItem(
+                        text = { Text("데이터셋 zip + 촬영 영상 (큼)") },
+                        onClick = {
+                            menu = false
+                            onExport(d, ExportKind.ZIP_WITH_VIDEO)
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("촬영 영상만 (mp4)") },
+                        onClick = {
+                            menu = false
+                            onExport(d, ExportKind.VIDEO)
+                        },
+                    )
+                }
+            }
+        }
         TextButton(enabled = !vm.running, onClick = { vm.delete(d) }) { Text("삭제") }
     }
 }

@@ -9,6 +9,7 @@ import android.os.Build
 import android.provider.OpenableColumns
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
+import java.io.EOFException
 import java.io.File
 import java.io.FilterInputStream
 import java.io.IOException
@@ -32,6 +33,7 @@ data class DatasetInfo(
     val points: Boolean,
     val bytes: Long,
     val capture: String? = null,  // what tracked the camera ("arcore" for scans from this app)
+    val video: Boolean = false,    // the capture's recording.mp4 is kept with it
 ) {
     /** Poses from a phone's tracking, not exact: worth correcting while training. */
     val trackedPoses: Boolean get() = capture == "arcore"
@@ -39,11 +41,17 @@ data class DatasetInfo(
     val name: String get() = dir.name
 }
 
-/** An imported dataset, and the zip entries skipped because their data was damaged. */
-data class ImportResult(val dataset: DatasetInfo, val damaged: List<String>)
+/**
+ * An imported dataset, the zip entries skipped because their data was damaged,
+ * and whether the zip ended early (cut off: the frames read so far are kept).
+ */
+data class ImportResult(val dataset: DatasetInfo, val damaged: List<String>, val truncated: Boolean = false)
 
 /** Imports capture zips into app storage and lists them. */
 object DatasetStore {
+    /** The capture's video, kept in its folder (CaptureViewModel.VIDEO_FILE). */
+    const val VIDEO = "recording.mp4"
+
     /** Large files the trainer does not read. */
     private val skipped = listOf(".mp4", "depth_gt/", "cutout/")
 
@@ -70,6 +78,7 @@ object DatasetStore {
             points = json.has("ply_file_path"),
             bytes = dir.walkTopDown().filter { it.isFile }.sumOf { it.length() },
             capture = json.optJSONObject("gsplat_lab")?.optString("capture")?.takeIf { it.isNotEmpty() },
+            video = File(dir, VIDEO).isFile,
         )
     }.getOrNull()
 
@@ -99,6 +108,7 @@ object DatasetStore {
             val input = resolver.openInputStream(uri) ?: throw IOException("파일을 열 수 없음")
             var current = ""
             val damaged = mutableListOf<String>()
+            var truncated = false
             CountingStream(input).use { counting ->
                 ZipInputStream(counting).use { zip ->
                     val buffer = ByteArray(1 shl 16)
@@ -113,6 +123,9 @@ object DatasetStore {
                     while (true) {
                         val entry = try {
                             zip.nextEntry
+                        } catch (e: EOFException) {
+                            truncated = true
+                            null
                         } catch (e: ZipException) {
                             throw damagedZip(current, e)
                         } ?: break
@@ -127,12 +140,16 @@ object DatasetStore {
                             while (true) {
                                 val n = try {
                                     zip.read(buffer)
+                                } catch (e: EOFException) {
+                                    truncated = true
+                                    -1
                                 } catch (e: ZipException) {
                                     -1
                                 }
                                 if (n < 0) break
                                 report()
                             }
+                            if (truncated) break
                             continue
                         }
                         val out = File(staging, name)
@@ -142,6 +159,12 @@ object DatasetStore {
                             while (true) {
                                 val n = try {
                                     zip.read(buffer)
+                                } catch (e: EOFException) {
+                                    // The file ends inside this entry: it was cut off (sent before
+                                    // it was fully written, or a transfer stopped). Keep what came before.
+                                    truncated = true
+                                    intact = false
+                                    -1
                                 } catch (e: ZipException) {
                                     intact = false
                                     -1
@@ -153,13 +176,20 @@ object DatasetStore {
                         }
                         if (!intact) {
                             out.delete()
-                            damaged.add(name.substringAfter('/'))
+                            if (!truncated) damaged.add(name.substringAfter('/'))
                         }
+                        if (truncated) break
                     }
                 }
             }
             val transforms = staging.walkTopDown().maxDepth(3).firstOrNull { it.name == "transforms.json" }
-                ?: throw IOException("zip 안에 transforms.json이 없음")
+                ?: throw IOException(
+                    if (truncated) {
+                        "zip 파일이 중간에서 끊겨 있어요. 내보내기가 끝난 뒤의 파일을 끝까지 받았는지 확인해 주세요"
+                    } else {
+                        "zip 안에 transforms.json이 없음"
+                    },
+                )
             val source = transforms.parentFile!!
             val base = (if (source == staging) displayName.removeSuffix(".zip") else source.name)
                 .replace(Regex("[^A-Za-z0-9._-]"), "_").ifEmpty { "dataset" }
@@ -168,7 +198,7 @@ object DatasetStore {
             while (target.exists()) target = File(root(context), "$base-${suffix++}")
             if (!source.renameTo(target)) throw IOException("데이터셋을 옮길 수 없음")
             val info = read(target) ?: throw IOException("transforms.json을 읽을 수 없음")
-            return ImportResult(info, damaged)
+            return ImportResult(info, damaged, truncated)
         } finally {
             staging.deleteRecursively()
         }
@@ -177,11 +207,16 @@ object DatasetStore {
     /**
      * Writes a dataset as a zip (everything in one folder named after it, as
      * [importZip] reads it back), plus `cutout/`: each image with its person
-     * mask as the alpha channel, upright, as WebP. [onProgress] gets the
-     * fraction done. Returns the bytes written.
+     * mask as the alpha channel, upright, as WebP. transforms.json goes first
+     * and the video (only [withVideo]) last, so a zip cut off on the way
+     * (sent before it was finished) still holds the frames before the cut.
+     * [onProgress] gets the fraction done. Returns the bytes written.
      */
-    fun exportZip(context: Context, info: DatasetInfo, uri: Uri, onProgress: (Float) -> Unit): Long {
-        val files = info.dir.walkTopDown().filter { it.isFile }.sortedBy { it.path }.toList()
+    fun exportZip(context: Context, info: DatasetInfo, uri: Uri, withVideo: Boolean, onProgress: (Float) -> Unit): Long {
+        val all = info.dir.walkTopDown().filter { it.isFile }.toList()
+        val first = all.filter { it.name == "transforms.json" }
+        val video = all.filter { it.name == VIDEO && it.parentFile == info.dir }
+        val files = first + (all - first.toSet() - video.toSet()).sortedBy { it.path }
         val json = runCatching { JSONObject(File(info.dir, "transforms.json").readText()) }.getOrNull()
         val upright = json?.optJSONObject("gsplat_lab")?.optInt("upright_degrees", 0) ?: 0
         val frames = json?.optJSONArray("frames")
@@ -191,19 +226,20 @@ object DatasetStore {
             val mask = f.optString("mask_path")
             if (image.isEmpty() || mask.isEmpty()) null else image to mask
         }
-        val total = (files.size + cutouts.size).coerceAtLeast(1)
+        val last = if (withVideo) video else emptyList()
+        val total = (files.size + cutouts.size + last.size).coerceAtLeast(1)
         var done = 0
-        val output = context.contentResolver.openOutputStream(uri) ?: throw IOException("저장할 파일을 열 수 없음")
-        val counting = CountingOutput(output)
+        val counting = CountingOutput(openForWrite(context, uri))
         ZipOutputStream(BufferedOutputStream(counting, 1 shl 16)).use { zip ->
             zip.setLevel(Deflater.BEST_SPEED)  // images and video are compressed already
-            for (file in files) {
+            fun add(file: File) {
                 zip.putNextEntry(ZipEntry("${info.name}/${file.relativeTo(info.dir).invariantSeparatorsPath}"))
                 file.inputStream().use { it.copyTo(zip, 1 shl 16) }
                 zip.closeEntry()
                 done++
                 onProgress(done.toFloat() / total)
             }
+            files.forEach(::add)
             for ((image, mask) in cutouts) {
                 cutout(File(info.dir, image), File(info.dir, mask), upright)?.let { bytes ->
                     val name = image.substringAfterLast('/').substringBeforeLast('.') + ".webp"
@@ -214,8 +250,38 @@ object DatasetStore {
                 done++
                 onProgress(done.toFloat() / total)
             }
+            last.forEach(::add)
         }
         return counting.count
+    }
+
+    /** Opens [uri] for writing from the start, truncating what was there ("w" alone may not). */
+    private fun openForWrite(context: Context, uri: Uri): java.io.OutputStream {
+        val resolver = context.contentResolver
+        return runCatching { resolver.openOutputStream(uri, "wt") }.getOrNull()
+            ?: resolver.openOutputStream(uri)
+            ?: throw IOException("저장할 파일을 열 수 없음")
+    }
+
+    /** Copies the capture's video to [uri]. Returns the bytes written. */
+    fun exportVideo(context: Context, info: DatasetInfo, uri: Uri, onProgress: (Float) -> Unit): Long {
+        val video = File(info.dir, VIDEO)
+        if (!video.isFile) throw IOException("이 스캔에는 촬영 영상이 없음")
+        val total = video.length().coerceAtLeast(1)
+        var written = 0L
+        openForWrite(context, uri).use { out ->
+            video.inputStream().use { input ->
+                val buffer = ByteArray(1 shl 16)
+                while (true) {
+                    val n = input.read(buffer)
+                    if (n < 0) break
+                    out.write(buffer, 0, n)
+                    written += n
+                    onProgress(written.toFloat() / total)
+                }
+            }
+        }
+        return written
     }
 
     /** The image with its mask as alpha, turned upright, as lossy WebP (keeps alpha). */
