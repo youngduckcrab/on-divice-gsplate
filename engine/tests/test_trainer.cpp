@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "gs/dataset.h"
+#include "gs/png_write.h"
 #include "gs/train_selftest.h"
 #include "gs/trainer.h"
 #include "gs/vk_context.h"
@@ -400,7 +401,7 @@ void test_dataset_loader() {
   }
   write_file(dir / "transforms.json", "{\"w\": 8, \"h\": 4, \"fl_x\": 10.0, \"cx\": 4, \"cy\": 2, \"frames\": [" +
                                           frames + "]}");
-  gs::Dataset ds = gs::load_dataset(dir.string(), 4);
+  gs::Dataset ds = gs::load_dataset(dir.string(), 2);
   EXPECT(ds.width == 4 && ds.height == 2, "dataset size %ux%u", ds.width, ds.height);
   EXPECT(std::fabs(ds.fx - 5.0f) < 1e-5f && std::fabs(ds.cx - 2.0f) < 1e-5f, "intrinsics not rescaled");
   EXPECT(ds.frames.size() == 9 && ds.holdout_count() == 2, "frames %zu, holdout %zu", ds.frames.size(),
@@ -422,7 +423,7 @@ void test_dataset_loader() {
 
   // A damaged image drops its frame instead of failing the dataset.
   write_file(dir / "images/f4.png", "not a png");
-  gs::Dataset partial = gs::load_dataset(dir.string(), 4);
+  gs::Dataset partial = gs::load_dataset(dir.string(), 2);
   EXPECT(partial.frames.size() == 8 && partial.skipped.size() == 1, "damaged frame: %zu frames, %zu skipped",
          partial.frames.size(), partial.skipped.size());
   EXPECT(partial.frames[4].name == "images/f5.png", "wrong frame dropped: %s", partial.frames[4].name.c_str());
@@ -433,11 +434,59 @@ void test_dataset_loader() {
   }
   bool threw = false;
   try {
-    gs::load_dataset(dir.string(), 4);
+    gs::load_dataset(dir.string(), 2);
   } catch (const std::runtime_error&) {
     threw = true;
   }
   EXPECT(threw, "a dataset with most frames unreadable should be rejected");
+  std::filesystem::remove_all(dir);
+
+  // A capture: landscape frames with masks, and depth + confidence (written
+  // with the PNG encoder the app uses) for some frames only.
+  std::filesystem::create_directories(dir / "images");
+  std::filesystem::create_directories(dir / "depth");
+  frames.clear();
+  for (int i = 0; i < 6; ++i) {
+    char name[32], mask[32], depth[32], conf[32];
+    std::snprintf(name, sizeof(name), "images/f%d.png", i);
+    std::snprintf(mask, sizeof(mask), "depth/m%d.png", i);
+    std::snprintf(depth, sizeof(depth), "depth/d%d.png", i);
+    std::snprintf(conf, sizeof(conf), "depth/c%d.png", i);
+    write_file(dir / name, png(8, 4, uint8_t(10 * i)));
+    std::vector<uint8_t> m(8 * 4, 255);
+    gs::write_file((dir / mask).string(), gs::encode_png_gray8(m.data(), 8, 4));
+    std::string entry = "{\"file_path\": \"" + std::string(name) + "\", \"mask_path\": \"" + mask + "\"";
+    if (i % 2 == 0) {
+      std::vector<uint16_t> d(4 * 2, uint16_t(1500 + i));  // millimetres, half resolution
+      std::vector<uint8_t> c(4 * 2, 200);
+      gs::write_file((dir / depth).string(), gs::encode_png_gray16(d.data(), 4, 2));
+      gs::write_file((dir / conf).string(), gs::encode_png_gray8(c.data(), 4, 2));
+      entry += ", \"depth_file_path\": \"" + std::string(depth) + "\", \"depth_confidence_path\": \"" + conf + "\"";
+    }
+    frames += std::string(i ? "," : "") + entry + ", \"transform_matrix\": [[1,0,0," + std::to_string(0.1 * i) +
+              "],[0,1,0,0],[0,0,1,2],[0,0,0,1]]}";
+  }
+  write_file(dir / "transforms.json", "{\"w\": 8, \"h\": 4, \"fl_x\": 10.0, \"cx\": 4, \"cy\": 2, "
+                                      "\"depth_unit_scale_factor\": 0.001, \"frames\": [" + frames + "]}");
+  gs::Dataset captured = gs::load_dataset(dir.string(), 2);
+  size_t with_depth = 0;
+  bool depth_ok = true;
+  for (const gs::DatasetFrame& f : captured.frames) {
+    if (f.depth.empty()) continue;
+    ++with_depth;
+    depth_ok = depth_ok && f.depth_width == 4 && f.depth_height == 2 && f.depth_confidence.size() == 8 &&
+               f.depth_confidence[0] == 200 && std::fabs(f.depth[0] - 1.5f) < 0.01f;
+  }
+  EXPECT(captured.width == 4 && captured.height == 2, "landscape capture size %ux%u (short side 2)", captured.width,
+         captured.height);
+  EXPECT(captured.has_depth && captured.has_masks && with_depth == 3 && depth_ok,
+         "capture: depth %d, masks %d, %zu frames with depth, values ok %d", int(captured.has_depth),
+         int(captured.has_masks), with_depth, int(depth_ok));
+  gs::InitOptions capture_init;
+  capture_init.max_gaussians = 1000;
+  gs::InitStats capture_stats;
+  gs::initialize_gaussians(captured, capture_init, &capture_stats);
+  EXPECT(capture_stats.source == "depth", "capture init from %s", capture_stats.source.c_str());
   std::filesystem::remove_all(dir);
 }
 

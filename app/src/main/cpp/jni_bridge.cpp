@@ -21,6 +21,7 @@
 #include "gs/dataset.h"
 #include "gs/device_probe.h"
 #include "gs/json.h"
+#include "gs/png_write.h"
 #include "gs/splat_renderer.h"
 #include "gs/splat_scene.h"
 #include "gs/train_selftest.h"
@@ -153,6 +154,34 @@ std::string load_scene(F&& make_scene) {
 }  // namespace
 
 // --- NativeBridge (diagnostics) --------------------------------------------------
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_ondevice_gsplat_NativeBridge_writePng16(JNIEnv* env, jobject /*this*/, jstring jpath, jshortArray jpixels,
+                                                 jint width, jint height) {
+  if (width <= 0 || height <= 0 || env->GetArrayLength(jpixels) < width * height) return JNI_FALSE;
+  try {
+    std::vector<uint16_t> pixels(size_t(width) * height);
+    env->GetShortArrayRegion(jpixels, 0, width * height, reinterpret_cast<jshort*>(pixels.data()));
+    gs::write_file(from_jstring(env, jpath), gs::encode_png_gray16(pixels.data(), uint32_t(width), uint32_t(height)));
+    return JNI_TRUE;
+  } catch (const std::exception&) {
+    return JNI_FALSE;
+  }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_ondevice_gsplat_NativeBridge_writePng8(JNIEnv* env, jobject /*this*/, jstring jpath, jbyteArray jpixels,
+                                                jint width, jint height) {
+  if (width <= 0 || height <= 0 || env->GetArrayLength(jpixels) < width * height) return JNI_FALSE;
+  try {
+    std::vector<uint8_t> pixels(size_t(width) * height);
+    env->GetByteArrayRegion(jpixels, 0, width * height, reinterpret_cast<jbyte*>(pixels.data()));
+    gs::write_file(from_jstring(env, jpath), gs::encode_png_gray8(pixels.data(), uint32_t(width), uint32_t(height)));
+    return JNI_TRUE;
+  } catch (const std::exception&) {
+    return JNI_FALSE;
+  }
+}
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_ondevice_gsplat_NativeBridge_probeDevice(JNIEnv* env, jobject /*this*/) {

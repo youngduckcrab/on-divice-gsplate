@@ -119,6 +119,7 @@ add_library(gsengine STATIC
   src/dataset.cpp
   src/device_probe.cpp
   src/image_io.cpp
+  src/png_write.cpp
   src/json_parse.cpp
   src/log.cpp
   src/offscreen.cpp

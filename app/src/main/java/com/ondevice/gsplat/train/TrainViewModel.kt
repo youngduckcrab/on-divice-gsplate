@@ -121,6 +121,10 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         if (selected == null || list.none { it.dir == selected?.dir }) select(list.firstOrNull())
     }
 
+    fun selectByName(name: String) {
+        datasets.firstOrNull { it.name == name }?.let { select(it) }
+    }
+
     fun select(info: DatasetInfo?) {
         if (running) return
         selected = info

@@ -40,8 +40,8 @@ struct Dataset {
   size_t holdout_count() const;
 };
 
-// Loads `directory`/transforms.json. Images are resized to `target_width`
-// (aspect kept); every 8th frame is held out. Frames with unreadable files are
+// Loads `directory`/transforms.json. Images are resized so their short side
+// is `target_width` (aspect kept, never enlarged); every 8th frame is held out. Frames with unreadable files are
 // skipped (listed in `skipped`); throws std::runtime_error if too few remain.
 Dataset load_dataset(const std::string& directory, uint32_t target_width);
 

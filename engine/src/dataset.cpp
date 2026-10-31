@@ -89,9 +89,11 @@ Dataset load_dataset(const std::string& directory, uint32_t target_width) {
   }
   const size_t slash = directory.find_last_of('/');
   ds.name = slash == std::string::npos ? directory : directory.substr(slash + 1);
-  ds.width = std::min<uint32_t>(target_width, static_cast<uint32_t>(src_w));
-  ds.height = static_cast<uint32_t>(std::lround(src_h * ds.width / src_w));
-  const double s = double(ds.width) / src_w;
+  // The target is the short side, so portrait datasets and captures kept in
+  // the camera sensor's landscape orientation get the same number of pixels.
+  const double s = std::min(1.0, double(target_width) / std::min(src_w, src_h));
+  ds.width = static_cast<uint32_t>(std::lround(src_w * s));
+  ds.height = static_cast<uint32_t>(std::lround(src_h * s));
   ds.fx = static_cast<float>(fl_x * s);
   ds.fy = static_cast<float>(fl_y * s);
   ds.cx = static_cast<float>(root.number_or("cx", src_w / 2) * s);
@@ -118,7 +120,8 @@ Dataset load_dataset(const std::string& directory, uint32_t target_width) {
     frame.holdout = (i % 8) == 0;
   }
   ds.has_masks = std::all_of(mask_paths.begin(), mask_paths.end(), [](const std::string& p) { return !p.empty(); });
-  ds.has_depth = std::all_of(depth_paths.begin(), depth_paths.end(), [](const std::string& p) { return !p.empty(); });
+  // A capture may lack depth for some frames (not yet computed); those just add no points.
+  ds.has_depth = std::any_of(depth_paths.begin(), depth_paths.end(), [](const std::string& p) { return !p.empty(); });
 
   // A frame whose files are missing or unreadable (e.g. a damaged download) is
   // dropped rather than failing the whole dataset; depth is optional per frame.
@@ -143,7 +146,7 @@ Dataset load_dataset(const std::string& directory, uint32_t target_width) {
       frame.rgba.clear();
       return;
     }
-    if (ds.has_depth) {
+    if (!depth_paths[i].empty()) {
       try {
         Image16 depth = decode_image16(read_file(join(directory, depth_paths[i])));
         frame.depth.resize(depth.data.size());

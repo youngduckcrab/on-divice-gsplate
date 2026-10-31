@@ -5,6 +5,7 @@ composeBom = "2025.05.00"
 activityCompose = "1.10.1"
 lifecycle = "2.8.7"
 arcore = "1.47.0"
+mlkitSegmentation = "16.0.0-beta6"
 
 [libraries]
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activityCompose" }
@@ -14,6 +15,7 @@ androidx-compose-ui = { module = "androidx.compose.ui:ui" }
 androidx-lifecycle-runtime-compose = { module = "androidx.lifecycle:lifecycle-runtime-compose", version.ref = "lifecycle" }
 androidx-lifecycle-viewmodel-compose = { module = "androidx.lifecycle:lifecycle-viewmodel-compose", version.ref = "lifecycle" }
 arcore = { module = "com.google.ar:core", version.ref = "arcore" }
+mlkit-segmentation-selfie = { module = "com.google.mlkit:segmentation-selfie", version.ref = "mlkitSegmentation" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

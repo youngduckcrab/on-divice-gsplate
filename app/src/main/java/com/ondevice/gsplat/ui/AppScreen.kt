@@ -22,7 +22,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ondevice.gsplat.train.TrainViewModel
 import java.io.File
 
-private val tabs = listOf("학습", "뷰어", "진단")
+private val tabs = listOf("촬영", "학습", "뷰어", "진단")
 
 @Composable
 fun AppScreen() {
@@ -47,11 +47,16 @@ fun AppScreen() {
     ) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
             when (selected) {
-                0 -> TrainScreen(onOpenModel = { file ->
-                    pendingModel = file
+                0 -> CaptureScreen(onTrain = { name ->
+                    trainVm.refreshDatasets()
+                    trainVm.selectByName(name)
                     selected = 1
                 })
-                1 -> ViewerScreen(pendingModel = pendingModel, onModelOpened = { pendingModel = null })
+                1 -> TrainScreen(onOpenModel = { file ->
+                    pendingModel = file
+                    selected = 2
+                })
+                2 -> ViewerScreen(pendingModel = pendingModel, onModelOpened = { pendingModel = null })
                 else -> DiagnosticsScreen()
             }
         }
