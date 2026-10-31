@@ -2,13 +2,11 @@ name: datasets
 
 # Renders the virtual-capture example datasets (tools/datasets) and attaches
 # them to the "datasets-v1" release. Deterministic: the camera paths are seeded
-# and the source models are pinned in fetch_assets.sh.
+# and the source models are pinned in fetch_assets.sh. Run by hand only: an
+# edit to the tools must not republish anything. The body dataset (Mixamo
+# "Michelle") is for internal testing and is not published; render it
+# locally with make_dataset.py.
 on:
-  push:
-    branches: ['**']
-    paths:
-      - 'tools/datasets/**'
-      - '.github/workflows/datasets.yml'
   workflow_dispatch:
 
 permissions:
@@ -44,10 +42,9 @@ jobs:
         run: |
           out=../../out
           python make_dataset.py head --assets ../../assets --out $out/gsplat-capture-head --zip
-          python make_dataset.py body --assets ../../assets --out $out/gsplat-capture-body --zip
           python make_dataset.py lizard --spz ../../assets/hornedlizard.spz \
             --gs-render ../../build/engine/gs_render --out $out/gsplat-capture-lizard --zip
-          for s in head body lizard; do cp $out/gsplat-capture-$s/preview.mp4 $out/gsplat-capture-$s.mp4; done
+          for s in head lizard; do cp $out/gsplat-capture-$s/preview.mp4 $out/gsplat-capture-$s.mp4; done
           ls -l $out
       - name: Publish to the datasets release
         env:
