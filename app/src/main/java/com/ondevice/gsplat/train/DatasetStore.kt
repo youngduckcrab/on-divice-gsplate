@@ -14,11 +14,15 @@ import java.io.File
 import java.io.FilterInputStream
 import java.io.IOException
 import java.io.InputStream
+import java.io.OutputStream
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
 import java.util.zip.Deflater
 import java.util.zip.ZipEntry
 import java.util.zip.ZipException
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+import kotlin.math.min
 import org.json.JSONObject
 
 /** A dataset folder (nerfstudio transforms.json layout) in app storage. */
@@ -205,14 +209,13 @@ object DatasetStore {
     }
 
     /**
-     * Writes a dataset as a zip (everything in one folder named after it, as
-     * [importZip] reads it back), plus `cutout/`: each image with its person
-     * mask as the alpha channel, upright, as WebP. transforms.json goes first
-     * and the video (only [withVideo]) last, so a zip cut off on the way
-     * (sent before it was finished) still holds the frames before the cut.
+     * Writes a dataset as a zip to [out] (everything in one folder named after
+     * it, as [importZip] reads it back), plus `cutout/`: each image with its
+     * person mask as the alpha channel, upright, as WebP (made four at a time).
+     * transforms.json goes first and the video (only [withVideo]) last.
      * [onProgress] gets the fraction done. Returns the bytes written.
      */
-    fun exportZip(context: Context, info: DatasetInfo, uri: Uri, withVideo: Boolean, onProgress: (Float) -> Unit): Long {
+    fun exportZip(info: DatasetInfo, out: OutputStream, withVideo: Boolean, onProgress: (Float) -> Unit): Long {
         val all = info.dir.walkTopDown().filter { it.isFile }.toList()
         val first = all.filter { it.name == "transforms.json" }
         val video = all.filter { it.name == VIDEO && it.parentFile == info.dir }
@@ -229,48 +232,54 @@ object DatasetStore {
         val last = if (withVideo) video else emptyList()
         val total = (files.size + cutouts.size + last.size).coerceAtLeast(1)
         var done = 0
-        val counting = CountingOutput(openForWrite(context, uri))
-        ZipOutputStream(BufferedOutputStream(counting, 1 shl 16)).use { zip ->
-            zip.setLevel(Deflater.BEST_SPEED)  // images and video are compressed already
-            fun add(file: File) {
-                zip.putNextEntry(ZipEntry("${info.name}/${file.relativeTo(info.dir).invariantSeparatorsPath}"))
-                file.inputStream().use { it.copyTo(zip, 1 shl 16) }
-                zip.closeEntry()
-                done++
-                onProgress(done.toFloat() / total)
-            }
-            files.forEach(::add)
-            for ((image, mask) in cutouts) {
-                cutout(File(info.dir, image), File(info.dir, mask), upright)?.let { bytes ->
-                    val name = image.substringAfterLast('/').substringBeforeLast('.') + ".webp"
-                    zip.putNextEntry(ZipEntry("${info.name}/cutout/$name"))
-                    zip.write(bytes)
+        val counting = CountingOutput(out)
+        val pool = Executors.newFixedThreadPool(min(4, Runtime.getRuntime().availableProcessors()))
+        try {
+            ZipOutputStream(BufferedOutputStream(counting, 1 shl 16)).use { zip ->
+                zip.setLevel(Deflater.BEST_SPEED)  // images and video are compressed already
+                fun add(file: File) {
+                    zip.putNextEntry(ZipEntry("${info.name}/${file.relativeTo(info.dir).invariantSeparatorsPath}"))
+                    file.inputStream().use { it.copyTo(zip, 1 shl 16) }
                     zip.closeEntry()
+                    done++
+                    onProgress(done.toFloat() / total)
                 }
-                done++
-                onProgress(done.toFloat() / total)
+                files.forEach(::add)
+                val made = cutouts.map { (image, mask) ->
+                    pool.submit(Callable { cutout(File(info.dir, image), File(info.dir, mask), upright) })
+                }
+                for ((i, future) in made.withIndex()) {
+                    future.get()?.let { bytes ->
+                        val name = cutouts[i].first.substringAfterLast('/').substringBeforeLast('.') + ".webp"
+                        zip.putNextEntry(ZipEntry("${info.name}/cutout/$name"))
+                        zip.write(bytes)
+                        zip.closeEntry()
+                    }
+                    done++
+                    onProgress(done.toFloat() / total)
+                }
+                last.forEach(::add)
             }
-            last.forEach(::add)
+        } finally {
+            pool.shutdownNow()
         }
         return counting.count
     }
 
-    /** Opens [uri] for writing from the start, truncating what was there ("w" alone may not). */
-    private fun openForWrite(context: Context, uri: Uri): java.io.OutputStream {
-        val resolver = context.contentResolver
-        return runCatching { resolver.openOutputStream(uri, "wt") }.getOrNull()
-            ?: resolver.openOutputStream(uri)
-            ?: throw IOException("저장할 파일을 열 수 없음")
+    /** A fresh file for an export in the app's cache (earlier exports are removed). */
+    fun exportFile(context: Context, name: String): File {
+        val dir = File(context.cacheDir, "exports")
+        dir.deleteRecursively()
+        dir.mkdirs()
+        return File(dir, name)
     }
 
-    /** Copies the capture's video to [uri]. Returns the bytes written. */
-    fun exportVideo(context: Context, info: DatasetInfo, uri: Uri, onProgress: (Float) -> Unit): Long {
-        val video = File(info.dir, VIDEO)
-        if (!video.isFile) throw IOException("이 스캔에는 촬영 영상이 없음")
-        val total = video.length().coerceAtLeast(1)
+    /** Copies a finished export to [uri]. */
+    fun copyTo(context: Context, file: File, uri: Uri, onProgress: (Float) -> Unit) {
+        val total = file.length().coerceAtLeast(1)
         var written = 0L
         openForWrite(context, uri).use { out ->
-            video.inputStream().use { input ->
+            file.inputStream().use { input ->
                 val buffer = ByteArray(1 shl 16)
                 while (true) {
                     val n = input.read(buffer)
@@ -281,7 +290,14 @@ object DatasetStore {
                 }
             }
         }
-        return written
+    }
+
+    /** Opens [uri] for writing from the start, truncating what was there ("w" alone may not). */
+    private fun openForWrite(context: Context, uri: Uri): OutputStream {
+        val resolver = context.contentResolver
+        return runCatching { resolver.openOutputStream(uri, "wt") }.getOrNull()
+            ?: resolver.openOutputStream(uri)
+            ?: throw IOException("저장할 파일을 열 수 없음")
     }
 
     /** The image with its mask as alpha, turned upright, as lossy WebP (keeps alpha). */
@@ -312,7 +328,7 @@ object DatasetStore {
         return bytes.toByteArray()
     }
 
-    private class CountingOutput(private val out: java.io.OutputStream) : java.io.OutputStream() {
+    private class CountingOutput(private val out: OutputStream) : OutputStream() {
         var count = 0L
             private set
 

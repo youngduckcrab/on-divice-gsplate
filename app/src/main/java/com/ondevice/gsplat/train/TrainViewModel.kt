@@ -208,43 +208,97 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         importMessage = "파일이 선택되지 않았어요. 선택 창에서 zip 파일을 눌러 주세요"
     }
 
-    /** Writes [info] as a zip to [uri] (DatasetStore.exportZip), with its video when [withVideo]. */
-    fun exportDataset(info: DatasetInfo, uri: Uri, withVideo: Boolean) {
-        export(info, "${info.name}.zip") { onProgress ->
-            DatasetStore.exportZip(getApplication(), info, uri, withVideo, onProgress)
+    /**
+     * Writes [info] as a zip (DatasetStore.exportZip), with its video when
+     * [withVideo]: first into the app's cache, so no half-written file is ever
+     * where it could be sent; then copied to [uri], or without one handed to
+     * the share sheet ([shareFile]).
+     */
+    fun exportDataset(info: DatasetInfo, uri: Uri?, withVideo: Boolean) {
+        if (!canExport(info)) return
+        val name = "${info.name}.zip"
+        exporting = true
+        viewModelScope.launch {
+            importMessage = "보낼 파일 만드는 중… ($name)"
+            status = importMessage
+            val made = withContext(Dispatchers.IO) {
+                runCatching {
+                    val file = DatasetStore.exportFile(getApplication(), name)
+                    file.outputStream().use { out ->
+                        DatasetStore.exportZip(info, out, withVideo) { p ->
+                            importMessage = "보낼 파일 만드는 중… ${(p * 100).toInt()}% ($name)"
+                        }
+                    }
+                    if (uri != null) {
+                        DatasetStore.copyTo(getApplication(), file, uri) { p ->
+                            importMessage = "저장하는 중… ${(p * 100).toInt()}% ($name)"
+                        }
+                    }
+                    file
+                }
+            }
+            exporting = false
+            made.onSuccess { file ->
+                val size = "%.0f MB".format(Locale.US, file.length() / 1e6)
+                if (uri != null) {
+                    status = "저장함: $name ($size) · 이제 보내도 돼요"
+                    file.delete()
+                } else {
+                    status = "다 만들었어요: $name ($size) · 보낼 앱을 고르세요"
+                    shareFile = file
+                }
+            }.onFailure {
+                status = "내보내기 실패: ${it.message ?: it}"
+            }
+            importMessage = status
         }
     }
 
-    /** Writes [info]'s capture video to [uri]. */
-    fun exportVideo(info: DatasetInfo, uri: Uri) {
-        export(info, "${info.name}.mp4") { onProgress -> DatasetStore.exportVideo(getApplication(), info, uri, onProgress) }
-    }
-
-    private fun export(info: DatasetInfo, file: String, write: ((Float) -> Unit) -> Long) {
-        if (running || phase == Phase.IMPORTING || exporting) return
-        if (!File(info.dir, "transforms.json").exists()) {
-            status = "아직 파일을 저장하는 중이라 내보낼 수 없어요. 잠시 뒤에 다시 눌러 주세요"
-            importMessage = status
+    /** Copies [info]'s capture video to [uri], or without one hands it to the share sheet. */
+    fun exportVideo(info: DatasetInfo, uri: Uri?) {
+        if (!canExport(info)) return
+        val video = File(info.dir, DatasetStore.VIDEO)
+        if (uri == null) {
+            shareFile = video
             return
         }
         exporting = true
         viewModelScope.launch {
-            importMessage = "내보내는 중… ($file) · 끝나기 전에 보내면 파일이 잘려요"
-            status = importMessage
+            val name = "${info.name}.mp4"
+            importMessage = "영상 저장하는 중… ($name)"
             val written = withContext(Dispatchers.IO) {
                 runCatching {
-                    write { p ->
-                        importMessage = "내보내는 중… ${(p * 100).toInt()}% ($file) · 끝나기 전에 보내면 파일이 잘려요"
+                    DatasetStore.copyTo(getApplication(), video, uri) { p ->
+                        importMessage = "영상 저장하는 중… ${(p * 100).toInt()}% ($name)"
                     }
+                    video.length()
                 }
             }
             exporting = false
             status = written.fold(
-                { "내보냄: $file (${"%.0f".format(Locale.US, it / 1e6)} MB) · 이제 보내도 돼요" },
+                { "저장함: $name (${"%.0f".format(Locale.US, it / 1e6)} MB) · 이제 보내도 돼요" },
                 { "내보내기 실패: ${it.message ?: it}" },
             )
             importMessage = status
         }
+    }
+
+    /** A finished export for the share sheet; TrainScreen opens it and calls [shareHandled]. */
+    var shareFile by mutableStateOf<File?>(null)
+        private set
+
+    fun shareHandled() {
+        shareFile = null
+    }
+
+    private fun canExport(info: DatasetInfo): Boolean {
+        if (running || phase == Phase.IMPORTING || exporting) return false
+        if (!File(info.dir, "transforms.json").exists()) {
+            status = "아직 파일을 저장하는 중이라 내보낼 수 없어요. 잠시 뒤에 다시 눌러 주세요"
+            importMessage = status
+            return false
+        }
+        return true
     }
 
     fun start() {

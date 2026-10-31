@@ -17,6 +17,17 @@
             android:name="com.google.ar.core"
             android:value="optional" />
 
+        <!-- Finished exports, shared to other apps (cache/exports). -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.exports"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/export_paths" />
+        </provider>
+
         <!-- Handle fold/unfold ourselves so running work is not restarted. Portrait only,
              like most scanning apps; the viewer still handles surface pre-rotation. -->
         <activity

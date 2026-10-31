@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Finished dataset zips (DatasetStore.exportFile) and the scans' own videos. -->
+    <cache-path name="exports" path="exports/" />
+    <files-path name="datasets" path="datasets/" />
+</paths>

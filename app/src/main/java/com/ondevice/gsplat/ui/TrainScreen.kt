@@ -33,6 +33,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -45,6 +46,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ondevice.gsplat.train.DatasetInfo
 import com.ondevice.gsplat.train.Phase
@@ -80,6 +82,20 @@ fun TrainScreen(onOpenModel: (File) -> Unit, vm: TrainViewModel = viewModel()) {
         val d = exportTarget
         if (uri != null && d != null) vm.exportVideo(d, uri)
     }
+    // A finished export goes to the share sheet (KakaoTalk, Quick Share, Drive, ...).
+    LaunchedEffect(vm.shareFile) {
+        val file = vm.shareFile ?: return@LaunchedEffect
+        vm.shareHandled()
+        runCatching {
+            val uri = FileProvider.getUriForFile(context, "${context.packageName}.exports", file)
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = if (file.name.endsWith(".mp4")) "video/mp4" else "application/zip"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(Intent.createChooser(send, "보내기"))
+        }
+    }
 
     Column(
         Modifier
@@ -95,8 +111,10 @@ fun TrainScreen(onOpenModel: (File) -> Unit, vm: TrainViewModel = viewModel()) {
             onExport = { d, what ->
                 exportTarget = d
                 when (what) {
+                    ExportKind.SEND_ZIP -> vm.exportDataset(d, null, false)
+                    ExportKind.SEND_VIDEO -> vm.exportVideo(d, null)
                     ExportKind.VIDEO -> exportVideo.launch("${d.name}.mp4")
-                    else -> {
+                    ExportKind.ZIP, ExportKind.ZIP_WITH_VIDEO -> {
                         exportWithVideo = what == ExportKind.ZIP_WITH_VIDEO
                         exportDataset.launch("${d.name}.zip")
                     }
@@ -200,7 +218,7 @@ private fun DatasetCard(
     }
 }
 
-private enum class ExportKind { ZIP, ZIP_WITH_VIDEO, VIDEO }
+private enum class ExportKind { SEND_ZIP, ZIP, ZIP_WITH_VIDEO, SEND_VIDEO, VIDEO }
 
 @Composable
 private fun DatasetRow(d: DatasetInfo, selected: Boolean, vm: TrainViewModel, onExport: (DatasetInfo, ExportKind) -> Unit) {
@@ -227,26 +245,21 @@ private fun DatasetRow(d: DatasetInfo, selected: Boolean, vm: TrainViewModel, on
         Box {
             TextButton(enabled = !vm.running && !vm.exporting, onClick = { menu = true }) { Text("내보내기") }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                DropdownMenuItem(
-                    text = { Text("데이터셋 zip (사진·누끼·깊이·위치)") },
-                    onClick = {
-                        menu = false
-                        onExport(d, ExportKind.ZIP)
-                    },
-                )
-                if (d.video) {
+                val items = buildList {
+                    add(ExportKind.SEND_ZIP to "데이터셋 zip 바로 보내기 (카톡·Quick Share·드라이브)")
+                    add(ExportKind.ZIP to "데이터셋 zip 저장 (사진·누끼·깊이·위치)")
+                    if (d.video) {
+                        add(ExportKind.SEND_VIDEO to "촬영 영상 바로 보내기")
+                        add(ExportKind.VIDEO to "촬영 영상 저장 (mp4)")
+                        add(ExportKind.ZIP_WITH_VIDEO to "데이터셋 zip + 촬영 영상 저장 (큼)")
+                    }
+                }
+                for ((kind, label) in items) {
                     DropdownMenuItem(
-                        text = { Text("데이터셋 zip + 촬영 영상 (큼)") },
+                        text = { Text(label) },
                         onClick = {
                             menu = false
-                            onExport(d, ExportKind.ZIP_WITH_VIDEO)
-                        },
-                    )
-                    DropdownMenuItem(
-                        text = { Text("촬영 영상만 (mp4)") },
-                        onClick = {
-                            menu = false
-                            onExport(d, ExportKind.VIDEO)
+                            onExport(d, kind)
                         },
                     )
                 }
