@@ -61,6 +61,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
     var preset by mutableStateOf(Preset.STANDARD)
     var useMasks by mutableStateOf(true)
     var refinePoses by mutableStateOf(false)
+    var refineMotion by mutableStateOf(false)
     var phase by mutableStateOf(Phase.IDLE)
         private set
     var importProgress by mutableStateOf(0f)
@@ -154,6 +155,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         selected = info
         useMasks = info?.masks == true
         refinePoses = info?.trackedPoses == true
+        refineMotion = info?.trackedPoses == true && info?.masks == true
     }
 
     fun delete(info: DatasetInfo) {
@@ -307,6 +309,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         val settings = preset
         val masked = useMasks && dataset.masks
         val poses = refinePoses
+        val motion = refineMotion && masked
         stopRequested = false
         prepared = null
         stats = null
@@ -333,6 +336,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
             val prep = nativeCall {
                 NativeTrainer.prepare(
                     dataset.dir.path, settings.width, settings.iterations, settings.maxGaussians, 3, masked, poses,
+                    motion,
                 )
             }
             if (!prep.optBoolean("ok")) return@launch fail("준비 실패: ${prep.optString("error")}")
@@ -538,6 +542,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                     "설정: ${preset.label} · ${prep.optInt("iterations")}회 · 최대 ${preset.maxGaussians / 1000}k · " +
                         "SH 3 · 배경 제거 ${ox(prep.optBoolean("masked"))} · " +
                         "카메라 위치 보정 ${ox(prep.optBoolean("refine_poses"))} · " +
+                        "움직임 보정 ${ox(prep.optBoolean("refine_motion"))} · " +
                         "손실 L1+D-SSIM (λ ${f1(prep.optDouble("lambda_start"))} → ${f1(prep.optDouble("lambda_end"))}) · " +
                         if (prep.optBoolean("head_found")) {
                             "머리 가중치 ${f1(prep.optDouble("head_weight"))}배 (반지름 " +
@@ -577,6 +582,13 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                     "카메라 위치 보정: ${s.optInt("pose_updates")}회 · 이동 평균 ${cm(s.optDouble("pose_shift_mean"))} " +
                         "(최대 ${cm(s.optDouble("pose_shift_max"))}) · 회전 평균 ${deg(s.optDouble("pose_turn_mean"))} " +
                         "(최대 ${deg(s.optDouble("pose_turn_max"))})",
+                )
+            }
+            if (s != null && s.optBoolean("refine_motion") && s.optInt("motion_updates") > 0) {
+                appendLine(
+                    "움직임 보정: 제어점 ${s.optInt("motion_nodes")}개 · ${s.optInt("motion_updates")}회 · " +
+                        "이동 평균 ${cm(s.optDouble("motion_shift_mean"))} (최대 ${cm(s.optDouble("motion_shift_max"))}) · " +
+                        "회전 평균 ${deg(s.optDouble("motion_turn_mean"))} (최대 ${deg(s.optDouble("motion_turn_max"))})",
                 )
             }
             s?.optJSONObject("timing")?.let { t ->

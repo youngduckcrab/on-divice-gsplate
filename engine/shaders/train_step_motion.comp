@@ -1,0 +1,5 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Training pass 6b with the subject motion's gradient (see train_step.glsl).
+#define GS_MOTION_GRAD
+#include "train_step.glsl"

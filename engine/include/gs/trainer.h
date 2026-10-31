@@ -79,6 +79,42 @@ struct TrainOptions {
   uint32_t eval_pose_steps = 20;
   float eval_pose_step = 0.005f;  // the alignment's first step, times the camera extent
 
+  // Subject motion. A person cannot stand still for a whole lap: the head
+  // turns, the arms sway, the body leans, and views that disagree about where
+  // those parts are blur them. As in SC-GS (sparse-controlled gaussian
+  // splatting), `motion_nodes` control nodes are spread over the initial
+  // gaussians (k-means). In each training view every node has a small rigid
+  // motion (a turn about itself and a shift), and each gaussian follows its 4
+  // nearest nodes, blended by distance. The motions are trained from the same
+  // backward pass as the gaussians, from step `motion_from`, and kept small
+  // (`motion_decay`), alike between neighbouring nodes (`motion_rigidity`, as
+  // rigid as possible) and between views next to each other in the capture
+  // (`motion_smoothness`); a view's first motion starts from its neighbours'.
+  // The gaussians stay at rest: renders, exports and the viewer show the
+  // subject without the motion. Held-out views take the motion of the
+  // training views next to them.
+  bool refine_motion = false;
+  uint32_t motion_nodes = 64;  // at most 128
+  uint32_t motion_from = 300;
+  float lr_motion_shift = 2e-3f;  // per update, times the camera extent
+  float lr_motion_turn = 3e-3f;   // radians per update
+  float lr_motion_final = 0.1f;   // the rates decay exponentially to this fraction by the last step
+  // Penalties, in units of the node spacing s (the median node radius): decay
+  // sum |shift|^2 / s^2 + |turn|^2, rigidity sum over each node's 6 nearest
+  // nodes of |where the neighbour moved - where the node's motion takes it|^2
+  // / s^2, smoothness sum |difference to the views before and after|^2 (shift
+  // over s). Their gradients add to the image loss's. Centring pulls each
+  // node's mean motion over the views to zero (as decay does each view's),
+  // so that the model at rest is the subject's average pose, not whatever
+  // pose the first steps settled on.
+  // Tuned on a virtual capture of a fidgeting person (90 views, 1500 steps;
+  // docs/experiments/m3-fold6.md): ten times the rigidity or twice the rates
+  // did worse, 128 nodes no better than 64.
+  float motion_decay = 1e-4f;
+  float motion_rigidity = 1e-3f;
+  float motion_smoothness = 1e-2f;
+  float motion_center = 1e-2f;
+
   // Adaptive density control.
   uint32_t densify_from = 300;
   uint32_t densify_until = 2000;
@@ -152,6 +188,11 @@ struct TrainStats {
   double pose_shift_mean = 0.0, pose_shift_max = 0.0;  // dataset units (metres for captures)
   double pose_turn_mean = 0.0, pose_turn_max = 0.0;    // degrees
   uint32_t pose_updates = 0;
+  // Subject motion: the nodes' motions in the training views so far.
+  uint32_t motion_nodes = 0;
+  double motion_shift_mean = 0.0, motion_shift_max = 0.0;  // dataset units
+  double motion_turn_mean = 0.0, motion_turn_max = 0.0;    // degrees
+  uint32_t motion_updates = 0;  // view updates
   // Moving averages per training step: wall clock around the submit + wait,
   // GPU time from timestamps, and steps per submission.
   struct Timing {
@@ -210,8 +251,16 @@ class Trainer {
   // The current model from `camera` (must be the dataset's resolution) over
   // `background`: RGBA8, alpha = coverage.
   std::vector<uint8_t> render(const Camera& camera, const float background[3]);
-  // Held-out views over a black background.
+  // Held-out views over a black background (with the subject's motion
+  // interpolated from the views next to them, when refining motion).
   EvalResult evaluate();
+  // Held-out views of `other` over a black background, the model at rest:
+  // how a model trained on a moving subject compares with the subject
+  // standing still (a twin dataset, same cameras and resolution).
+  EvalResult evaluate_at_rest(const Dataset& other);
+  // View `frame` as its camera saw it: with its pose correction and, when
+  // refining motion, the subject's motion then (RGBA8 over `background`).
+  std::vector<uint8_t> render_view(size_t frame, const float background[3]);
   // A view's camera with its pose correction (the dataset's pose without refinement).
   Camera camera_for(size_t frame) const;
   // The alive gaussians, in the dataset's world (Y-up, RUB).
@@ -249,10 +298,37 @@ class Trainer {
   // Testing: the pose gradient of the latest pose update: dL/dd xyz, dL/dw xyz.
   const double* last_pose_gradient() const { return last_pose_grad_; }
 
+  // Subject motion: the control nodes at rest (empty without refine_motion).
+  struct MotionNode {
+    float position[3];
+    float radius;  // gaussians weigh it by exp(-d^2 / (2 radius^2))
+  };
+  const std::vector<MotionNode>& motion_nodes() const { return nodes_; }
+  // A node's motion in view `frame`: turn (axis-angle, radians) and shift.
+  void node_motion(size_t frame, uint32_t node, float turn[3], float shift[3]) const;
+  // Testing: sets it.
+  void set_node_motion(size_t frame, uint32_t node, const float turn[3], const float shift[3]);
+  // Testing: the motion gradient of the latest motion update (image loss
+  // only), 6 per node: dL/dshift xyz, dL/dturn xyz (world axes).
+  const std::vector<double>& last_motion_gradient() const { return last_motion_grad_; }
+  // Testing: each slot's 4 nodes and weights.
+  struct MotionBinding {
+    std::vector<uint32_t> nodes;
+    std::vector<float> weights;
+  };
+  MotionBinding motion_binding();
+
   static constexpr uint32_t kTileSize = 16;
 
  private:
   struct FrameData;
+  struct NodeMotion {
+    float turn[3] = {0, 0, 0};   // axis-angle, radians
+    float shift[3] = {0, 0, 0};
+    double m[6] = {0, 0, 0, 0, 0, 0};  // Adam: shift xyz, turn xyz
+    double v[2] = {0, 0};              // per vector: shift, turn
+  };
+  using ViewMotion = std::vector<NodeMotion>;
   struct Backward {
     std::string name;
     ComputePipeline pipeline;
@@ -264,8 +340,11 @@ class Trainer {
   size_t backward_to_run() const;
   // Per-step inputs live in slot `slot` of frames_/targets_; `step` (0-based)
   // sets the learning-rate schedule, SH degree and seed.
+  // `flags`: kFlagPoseGrad, kFlagPoseOnly, kFlagMotionGrad; with `motion`, the
+  // gaussians follow it (kFlagMotion).
   void write_frame(uint32_t slot, const Camera& camera, const float background[3], bool masked_target,
-                   uint32_t step, bool bucket_state, bool ssim, uint32_t pose_flags = 0);
+                   uint32_t step, bool bucket_state, bool ssim, uint32_t flags = 0,
+                   const ViewMotion* motion = nullptr);
   uint32_t sh_degree_at(uint32_t step) const;
   float lambda_at(uint32_t step) const;  // the D-SSIM weight of a step
   bool uses_ssim() const;                // any step has a D-SSIM part
@@ -273,7 +352,9 @@ class Trainer {
   // With `retune`, every backward variant is timed on this step (implies profiling).
   // With `ssim`, also measures SSIM (training does whenever lambda_dssim > 0).
   void run_view(const Camera& camera, const uint8_t* target, const float background[3], bool masked_target,
-                bool train, bool profile = false, bool retune = false, bool ssim = false, uint32_t pose_flags = 0);
+                bool train, bool profile = false, bool retune = false, bool ssim = false, uint32_t flags = 0,
+                const ViewMotion* motion = nullptr);
+  std::vector<uint8_t> render_with(const Camera& camera, const float background[3], const ViewMotion* motion);
   bool refines_pose_at(uint32_t step) const;
   // Adam step on `frame`'s pose correction from the gradient slot `slot` left.
   void update_pose(uint32_t slot, size_t frame, float lr_scale);
@@ -281,6 +362,22 @@ class Trainer {
   void pose_gradient(uint32_t slot, double grad[6]) const;  // dL/dd, dL/dw summed over workgroups
   static void apply_pose_step(PoseFix& fix, const double step[6]);
   void update_pose_stats();
+  static Camera with_fix(Camera camera, const PoseFix& fix);  // [R | t] -> [E R | E t + d]
+  // The best correction of `camera` for held-out `frame` (moving only the camera).
+  PoseFix align_camera(const Camera& camera, const DatasetFrame& frame, const ViewMotion* motion);
+  // Held-out views of `ds`: this trainer's own (poses and motions as trained) or another's (at rest).
+  EvalResult evaluate_views(const Dataset& ds, bool own);
+  // Subject motion.
+  void place_nodes(const SplatScene& initial);
+  void bind_motion();  // train_motion_bind over the slots in use
+  bool refines_motion_at(uint32_t step) const;
+  bool uses_motion() const;  // any view's motion trained yet
+  // A view's motion: its own once trained, else interpolated from the
+  // trained training views before and after it in the capture.
+  ViewMotion view_motion(size_t frame) const;
+  void start_motion(size_t frame);  // before a training view's first motion update
+  void update_motion(uint32_t slot, size_t frame);  // Adam step from slot `slot`'s gradient
+  void update_motion_stats();
   void run_batch(uint32_t count);
   void next_view(size_t& frame, float background[3]);
   bool housekeeping_after(uint32_t step) const;  // densification or opacity reset after this step
@@ -370,6 +467,20 @@ class Trainer {
   };
   std::vector<PoseFix> pose_fix_;  // per dataset frame
   double last_pose_grad_[6] = {0, 0, 0, 0, 0, 0};
+
+  // Subject motion (refine_motion).
+  std::vector<MotionNode> nodes_;
+  std::vector<std::vector<uint32_t>> node_neighbors_;  // up to 6 nearest, per node
+  float node_spacing_ = 1.0f;                          // median node radius
+  std::vector<ViewMotion> motion_;                     // per dataset frame (empty without nodes)
+  std::vector<uint32_t> motion_updates_;               // per dataset frame
+  std::vector<size_t> train_before_, train_after_;     // nearest training views in capture order (npos: none)
+  std::vector<double> last_motion_grad_;
+  uint32_t bound_at_ = 0;  // step of the last binding
+  bool motion_grad_slot_[kBatch] = {};
+  ComputePipeline motion_bind_, motion_sum_, step_motion_;  // step_motion_: train_step summing the motion gradient
+  Buffer motion_nodes_buf_, motion_bind_buf_, motion_partials_;
+  std::vector<Buffer> motion_slots_, motion_grads_;  // per batch slot: the view's nodes; their summed gradient
   Buffer readback_image_;
 };
 

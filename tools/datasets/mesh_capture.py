@@ -257,6 +257,7 @@ class MeshRenderer:
         self.ctx.enable(moderngl.DEPTH_TEST)
         self.program = self.ctx.program(vertex_shader=VERTEX_SHADER, fragment_shader=FRAGMENT_SHADER)
         self.items = []
+        self.buffers = []
         for part in parts:
             data = np.hstack([part.positions, part.normals, part.uvs]).astype("f4")
             vbo = self.ctx.buffer(data.tobytes())
@@ -270,6 +271,7 @@ class MeshRenderer:
             tex.repeat_x = tex.repeat_y = True
             tex.anisotropy = 8.0
             self.items.append((vao, tex, part))
+            self.buffers.append(vbo)
         w, h = intrinsics.width * sample_scale, intrinsics.height * sample_scale
         self.color = self.ctx.texture((w, h), 4)
         self.depth = self.ctx.texture((w, h), 1, dtype="f4")
@@ -277,6 +279,12 @@ class MeshRenderer:
         self.zbuffer = self.ctx.depth_renderbuffer((w, h))
         self.fbo = self.ctx.framebuffer([self.color, self.depth, self.mask], self.zbuffer)
         self.projection = projection_from_intrinsics(intrinsics, 0.05, 50.0, sample_scale)
+
+    def update_part(self, index: int, positions: np.ndarray, normals: np.ndarray) -> None:
+        """Replaces a part's vertex positions and normals (same count), e.g. a deformed subject."""
+        part = self.items[index][2]
+        data = np.hstack([positions, normals, part.uvs]).astype("f4")
+        self.buffers[index].write(data.tobytes())
 
     def render(self, c2w_gl: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Returns (rgb uint8 HxWx3, depth float32 HxW in metres, mask float32 HxW in [0,1])."""

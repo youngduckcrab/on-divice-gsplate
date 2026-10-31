@@ -15,6 +15,12 @@ Output layout (nerfstudio-compatible transforms.json, OpenGL camera-to-world):
   points3d.ply               sparse coloured points, like SfM output (lizard only)
   transforms.json, preview.mp4, README.txt
 
+--motion S (body only) makes the person fidget while the camera goes round:
+the head turns and nods, the arms sway and the upper body leans, smoothly and
+about the rest pose (S = 1: head up to ~8 deg, arms ~5 deg, torso ~2 deg). With
+the same --frames, a run without --motion renders the rest pose from the same
+cameras, for judging a model trained on the moving one.
+
 Example:
   python make_dataset.py head --assets assets/ --out out/head
   python make_dataset.py lizard --spz hornedlizard.spz --gs-render build/engine/gs_render --out out/lizard
@@ -78,6 +84,82 @@ def arcore_like_depth(depth: np.ndarray, rng: np.random.Generator) -> tuple[np.n
     return (np.clip(noisy * 1000, 0, 65535).astype(np.uint16), confidence.astype(np.uint8))
 
 
+def rotation(axis_angle: np.ndarray) -> np.ndarray:
+    """Rodrigues: rotation matrix of an axis-angle vector (radians)."""
+    th = float(np.linalg.norm(axis_angle))
+    if th < 1e-12:
+        return np.eye(3)
+    k = axis_angle / th
+    K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+    return np.eye(3) + np.sin(th) * K + (1 - np.cos(th)) * K @ K
+
+
+def smoothstep(e0: float, e1: float, x: np.ndarray) -> np.ndarray:
+    t = np.clip((x - e0) / (e1 - e0), 0.0, 1.0)
+    return t * t * (3 - 2 * t)
+
+
+# Joints of the body subject (Michelle in a T-pose, 1.65 m, facing +z, feet on y = 0).
+NECK = np.array([0.0, 1.33, -0.01])
+SHOULDERS = (np.array([0.24, 1.26, -0.01]), np.array([-0.24, 1.26, -0.01]))
+WAIST = np.array([0.0, 0.95, 0.0])
+
+
+def body_motion(frames: int, scale: float, seed: int) -> np.ndarray:
+    """Per frame, axis-angle rotations (radians) of head, right arm, left arm and torso: (frames, 4, 3).
+
+    Each angle is a sum of two sines with random phases and periods between a
+    sixth and two thirds of the capture, minus its mean, so the rest pose is
+    the average pose.
+    """
+    rng = np.random.default_rng(seed)
+    t = np.arange(frames, dtype=np.float64)
+    # Amplitudes in degrees per joint, axes x (nod / lean forward), y (turn), z (tilt / raise).
+    amplitude = np.array([[4.0, 8.0, 3.0],    # head: nod, turn, tilt
+                          [0.0, 4.0, 5.0],    # right arm: swing forward/back, raise/lower
+                          [0.0, 4.0, 5.0],    # left arm
+                          [2.0, 3.0, 1.5]])   # torso: lean, twist, side lean
+    out = np.zeros((frames, 4, 3))
+    for j in range(4):
+        for a in range(3):
+            if amplitude[j, a] == 0:
+                continue
+            wave = np.zeros(frames)
+            for weight in (0.65, 0.35):
+                period = rng.uniform(frames / 6, frames * 2 / 3)
+                wave += weight * np.sin(2 * np.pi * t / period + rng.uniform(0, 2 * np.pi))
+            wave -= wave.mean()
+            wave /= max(np.abs(wave).max(), 1e-9)
+            out[:, j, a] = np.radians(amplitude[j, a] * scale) * wave
+    return out
+
+
+def deform_body(positions: np.ndarray, normals: np.ndarray, angles: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Poses the T-pose body: head about the neck, arms about the shoulders, then
+    everything above the waist about the waist, each blended in over a few cm
+    (linear blend skinning with smooth weights)."""
+    p, n = positions.astype(np.float64), normals.astype(np.float64)
+    x, y = p[:, 0], p[:, 1]
+
+    def blend(p, n, weight, pivot, rot):
+        moved = (p - pivot) @ rot.T + pivot
+        turned = n @ rot.T
+        w = weight[:, None]
+        return p + w * (moved - p), n + w * (turned - n)
+
+    head = smoothstep(1.30, 1.38, y)
+    p, n = blend(p, n, head, NECK, rotation(angles[0]))
+    arm_band = smoothstep(1.05, 1.15, y) * (1 - smoothstep(1.30, 1.36, y))
+    for side, (shoulder, sign) in enumerate(zip(SHOULDERS, (1.0, -1.0))):
+        weight = smoothstep(0.24, 0.34, sign * x) * arm_band
+        a = angles[1 + side].copy()
+        a[2] *= sign  # the same raise on both sides
+        p, n = blend(p, n, weight, shoulder, rotation(a))
+    p, n = blend(p, n, smoothstep(0.85, 1.05, y), WAIST, rotation(angles[3]))
+    n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-9)
+    return p.astype(np.float32), n.astype(np.float32)
+
+
 def save_png16(path: str, data: np.ndarray) -> None:
     Image.fromarray(data.astype(np.uint16)).save(path)
 
@@ -109,7 +191,8 @@ def subject_setup(name: str, assets: str):
 
 
 def render_mesh_subject(name: str, assets: str, k: Intrinsics, frames: int, out: str,
-                        radius: float | None = None, heights: tuple[float, float] | None = None):
+                        radius: float | None = None, heights: tuple[float, float] | None = None,
+                        motion: float = 0.0, motion_seed: int = 5):
     import mesh_capture as mc
 
     parts, spec = subject_setup(name, assets)
@@ -121,8 +204,14 @@ def render_mesh_subject(name: str, assets: str, k: Intrinsics, frames: int, out:
     poses, timestamps = handheld_orbit(spec)
     renderer = mc.MeshRenderer(parts, k)
     rng = np.random.default_rng(spec.seed + 100)
+    moving = [i for i, p in enumerate(parts) if p.subject] if motion > 0 else []
+    if moving and name != "body":
+        raise ValueError("--motion needs the body subject")
+    angles = body_motion(frames, motion, motion_seed) if moving else None
     records = []
     for i, (c2w, ts) in enumerate(zip(poses, timestamps)):
+        for m in moving:
+            renderer.update_part(m, *deform_body(parts[m].positions, parts[m].normals, angles[i]))
         rgb, depth, mask = renderer.render(c2w)
         stem = f"frame_{i:05d}"
         Image.fromarray(rgb).save(os.path.join(out, "images", stem + ".jpg"), quality=92)
@@ -140,6 +229,7 @@ def render_mesh_subject(name: str, assets: str, k: Intrinsics, frames: int, out:
             "depth_gt_path": f"depth_gt/{stem}.png",
             "transform_matrix": c2w.tolist(),
             "timestamp": ts,
+            **({"subject_motion_deg": np.degrees(angles[i]).round(3).tolist()} if moving else {}),
         })
         print(f"\r{name}: {i + 1}/{frames}", end="", flush=True)
     print()
@@ -251,6 +341,8 @@ def main() -> None:
     parser.add_argument("--zip", action="store_true", help="also write <out>.zip")
     parser.add_argument("--radius", type=float, help="orbit radius in metres (mesh subjects; default per subject)")
     parser.add_argument("--heights", type=float, nargs=2, help="camera heights of the two laps (mesh subjects)")
+    parser.add_argument("--motion", type=float, default=0.0, help="body only: how much the person fidgets (0 = still)")
+    parser.add_argument("--motion-seed", type=int, default=5)
     args = parser.parse_args()
 
     k = Intrinsics.portrait_phone(args.width, args.height)
@@ -265,7 +357,8 @@ def main() -> None:
             os.rmdir(os.path.join(args.out, sub))
     else:
         records, spec = render_mesh_subject(args.subject, args.assets, k, args.frames, args.out, args.radius,
-                                            tuple(args.heights) if args.heights else None)
+                                            tuple(args.heights) if args.heights else None, args.motion,
+                                            args.motion_seed)
 
     transforms = {
         "camera_model": "OPENCV",
@@ -281,6 +374,7 @@ def main() -> None:
             "world_up": [0.0, 1.0, 0.0],
             "orbit_target": list(spec.target),
             "orbit_radius": spec.radius,
+            **({"subject_motion": args.motion, "subject_motion_seed": args.motion_seed} if args.motion > 0 else {}),
             "source": ATTRIBUTION[args.subject],
         },
     }

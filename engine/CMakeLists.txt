@@ -89,6 +89,9 @@ set(GS_SHADERS
   train_densify_mark.comp
   train_densify_spawn.comp
   train_reset_opacity.comp
+  train_motion_bind.comp
+  train_motion_sum.comp
+  train_step_motion.comp
 )
 file(GLOB GS_SHADER_INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.glsl")
 set(GS_SHADER_OUT "${CMAKE_CURRENT_BINARY_DIR}/generated")

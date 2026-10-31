@@ -318,6 +318,26 @@ private fun SettingsCard(vm: TrainViewModel) {
                     onCheckedChange = { vm.refinePoses = it },
                 )
             }
+            val motionPossible = vm.useMasks && hasMasks
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("움직임 보정")
+                    Text(
+                        if (motionPossible) {
+                            "찍는 동안 사람이 조금씩 움직인 것(고개, 팔, 몸 흔들림)을 사진마다 맞춰서 학습. " +
+                                "결과는 움직이기 전 자세 하나. 직접 찍은 스캔은 기본으로 켜짐"
+                        } else {
+                            "배경 제거(마스크)가 켜져 있어야 쓸 수 있음"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Switch(
+                    checked = vm.refineMotion && motionPossible,
+                    enabled = motionPossible && !vm.running,
+                    onCheckedChange = { vm.refineMotion = it },
+                )
+            }
         }
     }
 }

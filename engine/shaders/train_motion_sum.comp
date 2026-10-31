@@ -1,0 +1,20 @@
+#version 450
+// Subject motion: adds up train_step's per-workgroup motion gradients, one
+// thread per node and vector (dL/dshift, dL/dturn).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Partial { vec4 partial[]; };  // per workgroup, node: 2
+layout(std430, binding = 1) writeonly buffer Total { vec4 total[]; };     // per node: 2
+layout(push_constant) uniform Push {
+  uint groups;
+  uint node_count;
+} push;
+
+void main() {
+  uint v = gl_GlobalInvocationID.x;
+  uint width = push.node_count * 2u;
+  if (v >= width) return;
+  vec4 sum = vec4(0.0);
+  for (uint g = 0u; g < push.groups; ++g) sum += partial[g * width + v];
+  total[v] = sum;
+}

@@ -27,7 +27,7 @@ struct FrameData {
   vec4 bias;        // 1 / (1 - beta1^t), 1 / (1 - beta2^t), unused, unused
   vec4 densify0;    // grad threshold, clone max scale, prune min opacity, prune max world scale
   vec4 densify1;    // prune max screen radius, random seed (uint bits), split scale divisor, unused
-  uvec4 limits;     // pair capacity (more pairs: the step is skipped), unused
+  uvec4 limits;     // pair capacity (more pairs: the step is skipped), motion nodes (train_motion.glsl), unused
   vec4 loss;        // D-SSIM weight lambda (loss = (1 - lambda) L1 + lambda (1 - SSIM)), C1, C2, unused
   vec4 head;        // head region in this view: centre x, y and radius (px; 0: none), loss weight
 };
@@ -48,6 +48,8 @@ const uint kFlagBucketState = 2u;   // the forward pass saves state for train_ba
 const uint kFlagSsim = 4u;          // the forward pass saves render and target colours for train_ssim
 const uint kFlagPoseGrad = 8u;      // train_step sums the gradient of the camera pose, per workgroup
 const uint kFlagPoseOnly = 16u;     // only that gradient: no parameter, moment or statistics updates
+const uint kFlagMotion = 32u;       // gaussians follow the subject's motion in this view (train_motion.glsl)
+const uint kFlagMotionGrad = 64u;   // train_step sums the gradient of that motion per node, per workgroup
 
 // SSIM window: 11x11 Gaussian, sigma 1.5, separable (as in 3D Gaussian Splatting).
 const int kSsimRadius = 5;

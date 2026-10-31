@@ -1,0 +1,69 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Subject motion: binds every gaussian to its 4 nearest control nodes (at its
+// rest position), weights exp(-d^2 / (2 r^2)) with r the node's radius,
+// normalised. Free slots get no nodes. Run at the start, after densification
+// and every so often as the gaussians move.
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer Params { vec4 params[]; };
+layout(std430, binding = 1) readonly buffer Nodes { vec4 nodes[]; };  // rest position, 1 / (2 r^2)
+layout(std430, binding = 2) writeonly buffer Bind { uvec4 bind[]; };  // 2 per slot: nodes, weights (float bits)
+layout(push_constant) uniform Push {
+  uint slots;
+  uint node_count;
+} push;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= push.slots) return;
+  uvec4 best = uvec4(0u);
+  vec4 dist = vec4(1e30);
+  if (params[i * 4u + 1u].w > 0.5) {
+    vec3 p = params[i * 4u].xyz;
+    for (uint k = 0u; k < push.node_count; ++k) {
+      vec3 d = p - nodes[k].xyz;
+      float d2 = dot(d, d);
+      // Keep the 4 nearest, sorted.
+      if (d2 < dist.w) {
+        if (d2 < dist.z) {
+          dist.w = dist.z;
+          best.w = best.z;
+          if (d2 < dist.y) {
+            dist.z = dist.y;
+            best.z = best.y;
+            if (d2 < dist.x) {
+              dist.y = dist.x;
+              best.y = best.x;
+              dist.x = d2;
+              best.x = k;
+            } else {
+              dist.y = d2;
+              best.y = k;
+            }
+          } else {
+            dist.z = d2;
+            best.z = k;
+          }
+        } else {
+          dist.w = d2;
+          best.w = k;
+        }
+      }
+    }
+  }
+  vec4 w = vec4(0.0);
+  float sum = 0.0;
+  for (int j = 0; j < 4; ++j) {
+    if (dist[j] >= 1e30) continue;
+    w[j] = exp(-dist[j] * nodes[best[j]].w);
+    sum += w[j];
+  }
+  if (sum > 1e-20) {
+    w /= sum;
+  } else if (dist.x < 1e30) {
+    w = vec4(1.0, 0.0, 0.0, 0.0);  // far from every node: the nearest
+  }
+  bind[i * 2u] = best;
+  bind[i * 2u + 1u] = floatBitsToUint(w);
+}

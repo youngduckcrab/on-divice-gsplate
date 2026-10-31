@@ -8,6 +8,9 @@
 //            [--alternatives serial_cut2,subgroup_lane4,...] (timed on real steps; the fastest is kept)
 //            [--no-masks] [--preview <dir>] [--eval-every 1000] [--dssim 0.2 (0 = L1 only)] [--dssim-end L (ramp to L)] [--head-weight 3]
 //            [--refine-poses] [--pose-lr shift,turn] [--pose-from N] [--eval-pose-steps N] [--pose-out poses.json]
+//            [--refine-motion] [--motion-nodes 64] [--motion-lr shift,turn] [--motion-lr-final F] [--motion-from N]
+//            [--motion-reg decay,rigidity,smoothness,center] [--eval-rest <dataset_dir>] (held-out views of a twin
+//            dataset with the subject standing still: the model at rest against it) [--motion-out motion.json]
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -51,8 +54,8 @@ int main(int argc, char** argv) {
   uint32_t width = 360, eval_every = 1000, max_init = 150000;
   int reset_override = -1;
   float grad_threshold = -1.0f;
-  std::string preview, pose_out;
-  int pose_from = -1;
+  std::string preview, pose_out, eval_rest, motion_out;
+  int pose_from = -1, motion_from = -1;
   gs::TrainOptions options;
   uint32_t iterations = options.iterations;
   for (int i = 3; i < argc; ++i) {
@@ -109,6 +112,27 @@ int main(int argc, char** argv) {
         options.eval_pose_steps = std::atoi(next());
       } else if (arg == "--pose-out") {
         pose_out = next();
+      } else if (arg == "--refine-motion") {
+        options.refine_motion = true;
+      } else if (arg == "--motion-nodes") {
+        options.motion_nodes = std::atoi(next());
+      } else if (arg == "--motion-lr") {
+        if (std::sscanf(next(), "%f,%f", &options.lr_motion_shift, &options.lr_motion_turn) != 2) {
+          throw std::runtime_error("--motion-lr needs shift,turn");
+        }
+      } else if (arg == "--motion-lr-final") {
+        options.lr_motion_final = std::atof(next());
+      } else if (arg == "--motion-from") {
+        motion_from = std::atoi(next());
+      } else if (arg == "--motion-reg") {
+        if (std::sscanf(next(), "%f,%f,%f,%f", &options.motion_decay, &options.motion_rigidity,
+                        &options.motion_smoothness, &options.motion_center) != 4) {
+          throw std::runtime_error("--motion-reg needs decay,rigidity,smoothness,center");
+        }
+      } else if (arg == "--eval-rest") {
+        eval_rest = next();
+      } else if (arg == "--motion-out") {
+        motion_out = next();
       } else {
         std::fprintf(stderr, "unknown option %s\n", arg.c_str());
         return 2;
@@ -148,6 +172,9 @@ int main(int argc, char** argv) {
     options.opacity_reset_interval = defaults.opacity_reset_interval;
     options.sh_degree_interval = defaults.sh_degree_interval;
     options.pose_from = pose_from >= 0 ? uint32_t(pose_from) : defaults.pose_from;
+    options.motion_from = motion_from >= 0 ? uint32_t(motion_from) : defaults.motion_from;
+    gs::Dataset rest;
+    if (!eval_rest.empty()) rest = gs::load_dataset(eval_rest, width);
     if (reset_override >= 0) options.opacity_reset_interval = uint32_t(reset_override);
     if (grad_threshold >= 0.0f) options.densify_grad_threshold = grad_threshold;
     gs::VkContext ctx;
@@ -185,6 +212,18 @@ int main(int argc, char** argv) {
           std::printf("  poses: %u updates, shift mean %.2f max %.2f cm, turn mean %.3f max %.3f deg\n", s.pose_updates,
                       100.0 * s.pose_shift_mean, 100.0 * s.pose_shift_max, s.pose_turn_mean, s.pose_turn_max);
         }
+        if (options.refine_motion) {
+          std::printf("  motion: %u nodes, %u view updates, shift mean %.2f max %.2f cm, turn mean %.2f max %.2f deg\n",
+                      s.motion_nodes, s.motion_updates, 100.0 * s.motion_shift_mean, 100.0 * s.motion_shift_max,
+                      s.motion_turn_mean, s.motion_turn_max);
+        }
+        if (!rest.frames.empty()) {
+          const gs::EvalResult r = trainer.evaluate_at_rest(rest);
+          std::printf("  at rest (%s): held-out PSNR %.2f dB, SSIM %.4f over %u views; head PSNR %.2f dB over %u",
+                      rest.name.c_str(), r.psnr, r.ssim, r.views, r.head_psnr, r.head_views);
+          if (r.aligned) std::printf(" (poses aligned; %.2f dB at the given poses)", r.psnr_unaligned);
+          std::printf("\n");
+        }
         if (!preview.empty()) {
           for (size_t f = 0; f < ds.frames.size(); f += ds.frames.size() / 4) {
             const float black[3] = {0, 0, 0};
@@ -220,6 +259,33 @@ int main(int argc, char** argv) {
         poses << ",[0,0,0,1]]}";
       }
       poses << "\n]}\n";
+    }
+    if (!motion_out.empty()) {
+      // The nodes at rest (x, y, z, radius) and every view's motion of each: turn (axis-angle) and shift.
+      std::ofstream m(motion_out);
+      m.precision(7);
+      m << "{\"nodes\": [";
+      const auto& nodes = trainer.motion_nodes();
+      for (size_t k = 0; k < nodes.size(); ++k) {
+        m << (k ? "," : "") << "[" << nodes[k].position[0] << "," << nodes[k].position[1] << ","
+          << nodes[k].position[2] << "," << nodes[k].radius << "]";
+      }
+      m << "],\n\"frames\": [";
+      for (size_t f = 0; f < trainer.dataset().frames.size(); ++f) {
+        m << (f ? "," : "") << "\n{\"holdout\": " << (trainer.dataset().frames[f].holdout ? "true" : "false")
+          << ", \"turn\": [";
+        std::string shifts;
+        for (size_t k = 0; k < nodes.size(); ++k) {
+          float turn[3], shift[3];
+          trainer.node_motion(f, uint32_t(k), turn, shift);
+          m << (k ? "," : "") << "[" << turn[0] << "," << turn[1] << "," << turn[2] << "]";
+          char buf[96];
+          std::snprintf(buf, sizeof(buf), "%s[%.7g,%.7g,%.7g]", k ? "," : "", shift[0], shift[1], shift[2]);
+          shifts += buf;
+        }
+        m << "], \"shift\": [" << shifts << "]}";
+      }
+      m << "\n]}\n";
     }
     gs::SplatScene out = trainer.export_scene();
     gs::convert_convention(out, gs::AxisConvention::RDF);  // what .ply readers expect

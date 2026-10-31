@@ -1,6 +1,7 @@
 #include "gs/trainer.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -27,6 +28,8 @@
 #include "shaders/train_dispatch_args.h"
 #include "shaders/train_emit.h"
 #include "shaders/train_forward.h"
+#include "shaders/train_motion_bind.h"
+#include "shaders/train_motion_sum.h"
 #include "shaders/train_project.h"
 #include "shaders/train_ranges.h"
 #include "shaders/train_reset_opacity.h"
@@ -34,6 +37,7 @@
 #include "shaders/train_ssim.h"
 #include "shaders/train_ssim_grad.h"
 #include "shaders/train_step.h"
+#include "shaders/train_step_motion.h"
 #include "shaders/train_step_sh.h"
 
 namespace gs {
@@ -67,6 +71,11 @@ constexpr uint32_t kFlagBucketState = 2;
 constexpr uint32_t kFlagSsim = 4;
 constexpr uint32_t kFlagPoseGrad = 8;
 constexpr uint32_t kFlagPoseOnly = 16;
+constexpr uint32_t kFlagMotion = 32;
+constexpr uint32_t kFlagMotionGrad = 64;
+constexpr uint32_t kMaxMotionNodes = 128;  // train_step: one thread per node
+constexpr uint32_t kMotionNodeBytes = 80;  // train_motion.glsl: 5 vec4 per node
+constexpr size_t kNone = ~size_t(0);
 constexpr uint32_t kBucketLanes = 32;   // splats per bucket (train_backward_bucket.comp)
 constexpr uint32_t kBucketGroups = 8;   // buckets per workgroup
 constexpr uint32_t kScanBlock = 1024;
@@ -86,6 +95,19 @@ uint32_t bits_for(uint32_t n) {
 
 float logit(float p) { return std::log(p / (1.0f - p)); }
 
+// exp([w]x): rotation by |w| radians about w, row-major.
+void rotation_from(const double w[3], double out[9]) {
+  const double theta = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+  const double K[9] = {0, -w[2], w[1], w[2], 0, -w[0], -w[1], w[0], 0};
+  double K2[9];
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) K2[r * 3 + c] = K[r * 3] * K[c] + K[r * 3 + 1] * K[3 + c] + K[r * 3 + 2] * K[6 + c];
+  }
+  const double a = theta > 1e-9 ? std::sin(theta) / theta : 1.0;
+  const double b = theta > 1e-9 ? (1.0 - std::cos(theta)) / (theta * theta) : 0.5;
+  for (int i = 0; i < 9; ++i) out[i] = (i % 4 == 0 ? 1.0 : 0.0) + a * K[i] + b * K2[i];
+}
+
 // Dispatch of a kernel without push constants.
 void dispatch_kernel(VkContext& ctx, VkCommandBuffer cmd, const ComputePipeline& pipeline,
                      std::initializer_list<const Buffer*> buffers, uint32_t groups_x, uint32_t groups_y = 1) {
@@ -103,6 +125,7 @@ TrainOptions scaled_options(uint32_t iterations) {
   o.opacity_reset_interval = uint32_t(o.opacity_reset_interval * scale);
   o.sh_degree_interval = std::max(1u, uint32_t(o.sh_degree_interval * scale));
   o.pose_from = uint32_t(o.pose_from * scale);
+  o.motion_from = uint32_t(o.motion_from * scale);
   return o;
 }
 
@@ -145,7 +168,7 @@ Trainer::Trainer(VkContext& ctx, Dataset dataset, const SplatScene& initial, con
       return ComputePipeline{};
     }
   };
-  project_ = make("train_project", shaders::train_project, 5, 0);
+  project_ = make("train_project", shaders::train_project, 7, 0);
   scan_local_ = make("scan_local", shaders::scan_local, 4, sizeof(ScanPush));
   scan_blocks_ = make("scan_blocks", shaders::scan_blocks, 1, sizeof(uint32_t));
   scan_add_ = make("scan_add", shaders::scan_add, 4, sizeof(ScanPush));
@@ -156,11 +179,16 @@ Trainer::Trainer(VkContext& ctx, Dataset dataset, const SplatScene& initial, con
   ssim_ = make("train_ssim", shaders::train_ssim, 4, 0);
   ssim_grad_ = make("train_ssim_grad", shaders::train_ssim_grad, 5, 0);
   pair_sum_ = make("train_pair_sum", shaders::train_pair_sum, 6, 0);
-  step_ = make("train_step", shaders::train_step, 12, 0);
+  step_ = make("train_step", shaders::train_step, 15, 0);
   step_sh_ = make("train_step_sh", shaders::train_step_sh, 7, 0);
   densify_mark_ = make("train_densify_mark", shaders::train_densify_mark, 11, 0);
   densify_spawn_ = make("train_densify_spawn", shaders::train_densify_spawn, 11, sizeof(uint32_t));
   reset_opacity_ = make("train_reset_opacity", shaders::train_reset_opacity, 4, sizeof(float));
+  if (options_.refine_motion) {
+    motion_bind_ = make("train_motion_bind", shaders::train_motion_bind, 3, 2 * sizeof(uint32_t));
+    motion_sum_ = make("train_motion_sum", shaders::train_motion_sum, 2, 2 * sizeof(uint32_t));
+    step_motion_ = make("train_step_motion", shaders::train_step_motion, 15, 0);
+  }
 
   // Backward pass: the requested variant (Auto: the first subgroup variant the
   // driver accepts, else serial_cut2), then the alternatives that compile.
@@ -268,6 +296,25 @@ Trainer::Trainer(VkContext& ctx, Dataset dataset, const SplatScene& initial, con
     pose_grads_.push_back(ctx.create_buffer(std::max<uint64_t>(div_up(cap, 128), 1) * 32, MemoryKind::Readback));
   }
   pose_fix_.resize(dataset_.frames.size());
+  if (options_.refine_motion) place_nodes(initial);
+  const uint64_t node_count = nodes_.size();
+  for (uint32_t i = 0; i < kBatch; ++i) {
+    motion_slots_.push_back(ctx.create_buffer(std::max<uint64_t>(node_count, 1) * kMotionNodeBytes, MemoryKind::Upload));
+    motion_grads_.push_back(ctx.create_buffer(std::max<uint64_t>(node_count, 1) * 32, MemoryKind::Readback));
+  }
+  // Without nodes the shaders never read these; they only need binding.
+  motion_nodes_buf_ = ctx.create_buffer(std::max<uint64_t>(node_count, 1) * 16, MemoryKind::Upload);
+  motion_bind_buf_ = ctx.create_buffer(node_count > 0 ? cap * 32 : 32, MemoryKind::Device);
+  motion_partials_ =
+      ctx.create_buffer(node_count > 0 ? std::max<uint64_t>(div_up(cap, 128), 1) * node_count * 32 : 32,
+                        MemoryKind::Device);
+  if (node_count > 0) {
+    float* n = static_cast<float*>(motion_nodes_buf_.mapped());
+    for (size_t k = 0; k < nodes_.size(); ++k) {
+      for (int c = 0; c < 3; ++c) n[k * 4 + c] = nodes_[k].position[c];
+      n[k * 4 + 3] = 1.0f / (2.0f * nodes_[k].radius * nodes_[k].radius);
+    }
+  }
   // Persistent descriptor sets: per batch slot about 16 pipelines (and one
   // per backward variant), up to 14 buffers each.
   set_pool_ = ctx.create_descriptor_pool(64 + kBatch * 32, 512 + kBatch * 384);
@@ -333,6 +380,7 @@ Trainer::Trainer(VkContext& ctx, Dataset dataset, const SplatScene& initial, con
   if (!s.empty()) ctx.upload(sh_, s.data(), s.size() * 4);
   stats_.slots = slots_;
   stats_.gaussians = alive_;
+  if (!nodes_.empty()) bind_motion();
 }
 
 Trainer::~Trainer() {
@@ -353,8 +401,37 @@ uint32_t Trainer::sh_degree_at(uint32_t step) const {
 }
 
 void Trainer::write_frame(uint32_t slot, const Camera& camera, const float background[3], bool masked_target,
-                          uint32_t step, bool bucket_state, bool ssim, uint32_t pose_flags) {
+                          uint32_t step, bool bucket_state, bool ssim, uint32_t flags, const ViewMotion* motion) {
   FrameData f{};
+  if (motion == nullptr || nodes_.empty()) {
+    flags &= ~kFlagMotionGrad;
+  } else {
+    // Each node's [R | b] (x' = R x + b, b = n + shift - R n), turn and where it moved to.
+    flags |= kFlagMotion;
+    f.limits[1] = uint32_t(nodes_.size());
+    float* out = static_cast<float*>(motion_slots_[slot].mapped());
+    for (size_t k = 0; k < nodes_.size(); ++k) {
+      const NodeMotion& m = (*motion)[k];
+      const double w[3] = {m.turn[0], m.turn[1], m.turn[2]};
+      double R[9];
+      rotation_from(w, R);
+      const float* n = nodes_[k].position;
+      float* o = out + k * 20;
+      for (int r = 0; r < 3; ++r) {
+        const double moved = n[r] + m.shift[r];
+        double b = moved;
+        for (int c = 0; c < 3; ++c) {
+          o[r * 4 + c] = float(R[r * 3 + c]);
+          b -= R[r * 3 + c] * n[c];
+        }
+        o[r * 4 + 3] = float(b);
+        o[12 + r] = m.turn[r];
+        o[16 + r] = float(moved);
+      }
+      o[15] = o[19] = 0.0f;
+    }
+  }
+  motion_grad_slot_[slot] = (flags & kFlagMotionGrad) != 0;
   for (int r = 0; r < 3; ++r) {
     for (int c = 0; c < 3; ++c) f.rot[r][c] = camera.rotation[r * 3 + c];
     f.rot[r][3] = camera.translation[r];
@@ -372,7 +449,7 @@ void Trainer::write_frame(uint32_t slot, const Camera& camera, const float backg
   f.model[1] = sh_degree_at(step);
   f.model[2] = sh_stride_;
   f.model[3] = (masked_target ? kFlagMaskedTarget : 0) | (bucket_state ? kFlagBucketState : 0) |
-               (ssim ? kFlagSsim : 0) | pose_flags;
+               (ssim ? kFlagSsim : 0) | flags;
   for (int c = 0; c < 3; ++c) f.background[c] = background[c];
   f.background[3] = 1.0f / (3.0f * float(width_) * float(height_));
 
@@ -531,7 +608,9 @@ bool Trainer::needs_bucket_state(bool train, bool retune) const {
 
 void Trainer::record_project(VkCommandBuffer cmd, uint32_t slot) {
   if (slots_ > 0) {
-    kernel(cmd, project_, {&frames_[slot], &params_, &sh_, &projected_, &tiles_}, div_up(slots_, 128));
+    kernel(cmd, project_,
+           {&frames_[slot], &params_, &sh_, &projected_, &tiles_, &motion_slots_[slot], &motion_bind_buf_},
+           div_up(slots_, 128));
     VkContext::barrier(cmd);
     record_scan(cmd, tiles_, offsets_, slots_, 0);
   } else {
@@ -611,11 +690,16 @@ void Trainer::record_optimize(VkCommandBuffer cmd, uint32_t slot, int part) {
     VkContext::barrier(cmd);
   }
   if (part == 0 || part == 2) {
-    kernel(cmd, step_,
+    kernel(cmd, motion_grad_slot_[slot] ? step_motion_ : step_,
            {&frames_[slot], &params_, &sh_, &m_params_, &v_params_, &tiles_, &grad_sum_, &projected_, &stats_buf_,
-            &totals_, &sh_input_, &pose_grads_[slot]},
+            &totals_, &sh_input_, &pose_grads_[slot], &motion_slots_[slot], &motion_bind_buf_, &motion_partials_},
            div_up(slots_, 128));
     VkContext::barrier(cmd);
+    if (motion_grad_slot_[slot]) {
+      const uint32_t push[2] = {div_up(slots_, 128u), uint32_t(nodes_.size())};
+      kernel(cmd, motion_sum_, {&motion_partials_, &motion_grads_[slot]}, 1, 1, push, sizeof(push));
+      VkContext::barrier(cmd);
+    }
   }
   if ((part == 0 || part == 3) && sh_stride_ > 0) {
     kernel(cmd, step_sh_, {&frames_[slot], &params_, &sh_, &m_sh_, &v_sh_, &sh_input_, &totals_},
@@ -651,7 +735,7 @@ void Trainer::set_view_stats() {
 }
 
 void Trainer::run_view(const Camera& camera, const uint8_t* target, const float background[3], bool masked_target,
-                       bool train, bool profile, bool retune, bool ssim, uint32_t pose_flags) {
+                       bool train, bool profile, bool retune, bool ssim, uint32_t flags, const ViewMotion* motion) {
   stats_.sh_degree = int(sh_degree_at(stats_.step));
   const bool ssim_grad = train && uses_ssim();
   ssim = ssim || ssim_grad;
@@ -662,7 +746,7 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
                   : options_.initial_pair_guess ? options_.initial_pair_guess
                                                 : uint64_t(slots_) * 4);
     write_frame(0, camera, background, masked_target, stats_.step, needs_bucket_state(train, retune), ssim,
-                train ? pose_flags : 0);
+                train ? flags : 0, motion);
 
     if (!profile && !retune) {
       // Everything in one submission; the passes read the pair count on the GPU.
@@ -783,21 +867,34 @@ bool Trainer::housekeeping_after(uint32_t t) const {
 
 void Trainer::after_step() {
   const uint32_t t = stats_.step;
+  bool densified = false;
   if (t < options_.densify_until) {
-    if (t > options_.densify_from && options_.densify_interval > 0 && t % options_.densify_interval == 0) densify();
+    if (t > options_.densify_from && options_.densify_interval > 0 && t % options_.densify_interval == 0) {
+      densify();
+      densified = true;
+    }
     if (options_.opacity_reset_interval > 0 && t % options_.opacity_reset_interval == 0) reset_opacity();
   }
+  // New gaussians need nodes, and the others drift away from theirs.
+  if (!nodes_.empty() && (densified || t >= bound_at_ + 100)) bind_motion();
 }
 
 void Trainer::step_on(size_t frame_index, const float background[3], bool profile) {
   const auto start = std::chrono::steady_clock::now();
   const DatasetFrame& frame = dataset_.frames.at(frame_index);
   const bool pose = refines_pose_at(stats_.step);
+  const bool motion = refines_motion_at(stats_.step);
+  if (motion) start_motion(frame_index);
   run_view(camera_for(frame_index), frame.rgba.data(), background, options_.masked, true, profile,
-           retune_due(stats_.step + 1), false, pose ? kFlagPoseGrad : 0);
+           retune_due(stats_.step + 1), false, (pose ? kFlagPoseGrad : 0) | (motion ? kFlagMotionGrad : 0),
+           motion ? &motion_[frame_index] : nullptr);
   if (pose) {
     update_pose(0, frame_index, 1.0f);
     update_pose_stats();
+  }
+  if (motion) {
+    update_motion(0, frame_index);
+    update_motion_stats();
   }
   last_slot_ = 0;
   set_view_stats();
@@ -845,14 +942,17 @@ void Trainer::run_batch(uint32_t count) {
   const bool buckets = needs_bucket_state(true, false);
   const bool ssim = uses_ssim();
   size_t frames[kBatch];
-  bool pose[kBatch];
+  bool pose[kBatch], motion[kBatch];
   for (uint32_t s = 0; s < count; ++s) {
     float bg[3];
     next_view(frames[s], bg);
     pose[s] = refines_pose_at(stats_.step + s);
+    motion[s] = refines_motion_at(stats_.step + s);
+    if (motion[s]) start_motion(frames[s]);
     const DatasetFrame& f = dataset_.frames.at(frames[s]);
     write_frame(s, camera_for(frames[s]), bg, options_.masked, stats_.step + s, buckets, ssim,
-                pose[s] ? kFlagPoseGrad : 0);
+                (pose[s] ? kFlagPoseGrad : 0) | (motion[s] ? kFlagMotionGrad : 0),
+                motion[s] ? &motion_[frames[s]] : nullptr);
     std::memcpy(targets_[s].mapped(), f.rgba.data(), size_t(width_) * height_ * 4);
   }
   const RunTiming time = ctx_.run([&](VkCommandBuffer cmd) {
@@ -866,7 +966,7 @@ void Trainer::run_batch(uint32_t count) {
     }
     VkContext::barrier_to_host(cmd);
   });
-  bool moved = false;
+  bool moved = false, fidgeted = false;
   for (uint32_t s = 0; s < count; ++s) {
     // A step whose pairs did not fit left the model alone; later ones went on.
     const bool overflow = read_slot(s);
@@ -875,11 +975,16 @@ void Trainer::run_batch(uint32_t count) {
       update_pose(s, frames[s], 1.0f);
       moved = true;
     }
+    if (motion[s] && !overflow) {
+      update_motion(s, frames[s]);
+      fidgeted = true;
+    }
     set_view_stats();
     stats_.sh_degree = int(sh_degree_at(stats_.step));
     ++stats_.step;
   }
   if (moved) update_pose_stats();
+  if (fidgeted) update_motion_stats();
   last_slot_ = count - 1;
   after_step();  // only the last step of a batch can have any
   // Moving averages as if each step had been timed alone.
@@ -941,10 +1046,20 @@ void Trainer::reset_opacity() {
 }
 
 std::vector<uint8_t> Trainer::render(const Camera& camera, const float background[3]) {
+  return render_with(camera, background, nullptr);
+}
+
+std::vector<uint8_t> Trainer::render_view(size_t frame, const float background[3]) {
+  if (!uses_motion()) return render_with(camera_for(frame), background, nullptr);
+  const ViewMotion motion = view_motion(frame);
+  return render_with(camera_for(frame), background, &motion);
+}
+
+std::vector<uint8_t> Trainer::render_with(const Camera& camera, const float background[3], const ViewMotion* motion) {
   if (camera.width != width_ || camera.height != height_) {
     throw std::invalid_argument("Trainer::render: camera size must match the dataset");
   }
-  run_view(camera, nullptr, background, false, false);
+  run_view(camera, nullptr, background, false, false, false, false, false, 0, motion);
   ctx_.run([&](VkCommandBuffer cmd) {
     VkBufferCopy region{0, 0, image_.size()};
     vkCmdCopyBuffer(cmd, image_.handle(), readback_image_.handle(), 1, &region);
@@ -955,12 +1070,62 @@ std::vector<uint8_t> Trainer::render(const Camera& camera, const float backgroun
   return out;
 }
 
-EvalResult Trainer::evaluate() {
+EvalResult Trainer::evaluate() { return evaluate_views(dataset_, true); }
+
+EvalResult Trainer::evaluate_at_rest(const Dataset& other) {
+  if (other.width != width_ || other.height != height_) {
+    throw std::invalid_argument("Trainer::evaluate_at_rest: the dataset's resolution must match");
+  }
+  return evaluate_views(other, false);
+}
+
+Trainer::PoseFix Trainer::align_camera(const Camera& camera, const DatasetFrame& frame, const ViewMotion* motion) {
+  // The model was fitted to corrected poses: give each held-out view the
+  // same chance, moving only its camera. Gradient descent whose step grows
+  // after a step that lowered the loss and halves (from the best pose) after
+  // one that did not; turns count as the shift they cause at the cameras'
+  // distance. The view keeps the best pose seen, so it is never worse than
+  // given. (Adam moved poses that were already right.)
+  const float black[3] = {0.0f, 0.0f, 0.0f};
+  const double reach = dataset_.camera_extent;
+  PoseFix best{}, current{};
+  double best_loss = std::numeric_limits<double>::infinity(), best_grad[6] = {0, 0, 0, 0, 0, 0};
+  double length = options_.eval_pose_step * reach;
+  for (uint32_t k = 0; k < options_.eval_pose_steps; ++k) {
+    run_view(with_fix(camera, current), frame.rgba.data(), black, options_.masked, true, false, false, uses_ssim(),
+             kFlagPoseGrad | kFlagPoseOnly, motion);
+    const double lambda = lambda_at(stats_.step);
+    const double loss = (1.0 - lambda) * last_losses_[3] + lambda * (last_losses_[5] - last_losses_[4]);
+    if (loss < best_loss) {
+      best = current;
+      best_loss = loss;
+      pose_gradient(0, best_grad);
+      if (k > 0) length *= 1.5;
+    } else {
+      length *= 0.5;
+    }
+    double g[6], norm = 0.0;
+    for (int c = 0; c < 6; ++c) {
+      g[c] = c < 3 ? best_grad[c] : best_grad[c] / reach;
+      norm += g[c] * g[c];
+    }
+    if (!(norm > 0.0)) break;
+    norm = std::sqrt(norm);
+    double step[6];
+    for (int c = 0; c < 6; ++c) step[c] = -length * g[c] / norm / (c < 3 ? 1.0 : reach);
+    current = best;
+    current.updates = 1;
+    apply_pose_step(current, step);
+  }
+  return best;
+}
+
+EvalResult Trainer::evaluate_views(const Dataset& ds, bool own) {
   EvalResult result;
   const float black[3] = {0.0f, 0.0f, 0.0f};
   const double n = 3.0 * width_ * height_;
-  auto measure = [&](const Camera& camera, const DatasetFrame& frame, double sums[5]) {
-    run_view(camera, frame.rgba.data(), black, options_.masked, false, false, false, true);
+  auto measure = [&](const Camera& camera, const DatasetFrame& frame, const ViewMotion* motion, double sums[5]) {
+    run_view(camera, frame.rgba.data(), black, options_.masked, false, false, false, true, 0, motion);
     sums[0] += -10.0 * std::log10(std::max(last_losses_[1] / n, 1e-12));
     sums[1] += last_losses_[0] / n;
     sums[2] += last_losses_[2] / n;
@@ -970,52 +1135,22 @@ EvalResult Trainer::evaluate() {
     }
   };
   const bool align = options_.refine_poses && options_.eval_pose_steps > 0;
+  const bool moving = own && uses_motion();
   double sums[5] = {0, 0, 0, 0, 0}, unaligned[5] = {0, 0, 0, 0, 0};
-  for (size_t i = 0; i < dataset_.frames.size(); ++i) {
-    const DatasetFrame& frame = dataset_.frames[i];
+  for (size_t i = 0; i < ds.frames.size(); ++i) {
+    const DatasetFrame& frame = ds.frames[i];
     if (!frame.holdout) continue;
+    ViewMotion motion;
+    if (moving) motion = view_motion(i);
+    const ViewMotion* m = moving ? &motion : nullptr;
+    const Camera given = dataset_camera(ds, frame);
+    PoseFix fix{};
     if (align) {
-      // The model was fitted to corrected poses: give each held-out view the
-      // same chance, moving only its camera. Gradient descent whose step
-      // grows after a step that lowered the loss and halves (from the best
-      // pose) after one that did not; turns count as the shift they cause at
-      // the cameras' distance. The view keeps the best pose seen, so it is
-      // never worse than given. (Adam moved poses that were already right.)
-      measure(dataset_camera(dataset_, frame), frame, unaligned);
-      const double reach = dataset_.camera_extent;
-      PoseFix best{}, current{};
-      double best_loss = std::numeric_limits<double>::infinity(), best_grad[6] = {0, 0, 0, 0, 0, 0};
-      double length = options_.eval_pose_step * reach;
-      for (uint32_t k = 0; k < options_.eval_pose_steps; ++k) {
-        pose_fix_[i] = current;
-        run_view(camera_for(i), frame.rgba.data(), black, options_.masked, true, false, false, uses_ssim(),
-                 kFlagPoseGrad | kFlagPoseOnly);
-        const double lambda = lambda_at(stats_.step);
-        const double loss = (1.0 - lambda) * last_losses_[3] + lambda * (last_losses_[5] - last_losses_[4]);
-        if (loss < best_loss) {
-          best = current;
-          best_loss = loss;
-          pose_gradient(0, best_grad);
-          if (k > 0) length *= 1.5;
-        } else {
-          length *= 0.5;
-        }
-        double g[6], norm = 0.0;
-        for (int c = 0; c < 6; ++c) {
-          g[c] = c < 3 ? best_grad[c] : best_grad[c] / reach;
-          norm += g[c] * g[c];
-        }
-        if (!(norm > 0.0)) break;
-        norm = std::sqrt(norm);
-        double step[6];
-        for (int c = 0; c < 6; ++c) step[c] = -length * g[c] / norm / (c < 3 ? 1.0 : reach);
-        current = best;
-        current.updates = 1;
-        apply_pose_step(current, step);
-      }
-      pose_fix_[i] = best;
+      measure(given, frame, m, unaligned);
+      fix = align_camera(given, frame, m);
+      if (own) pose_fix_[i] = fix;
     }
-    measure(camera_for(i), frame, sums);
+    measure(with_fix(given, fix), frame, m, sums);
     ++result.views;
   }
   if (result.views > 0) {
@@ -1030,27 +1165,8 @@ EvalResult Trainer::evaluate() {
   return result;
 }
 
-namespace {
-
-// exp([w]x): rotation by |w| radians about w, row-major.
-void rotation_from(const double w[3], double out[9]) {
-  const double theta = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
-  const double K[9] = {0, -w[2], w[1], w[2], 0, -w[0], -w[1], w[0], 0};
-  double K2[9];
-  for (int r = 0; r < 3; ++r) {
-    for (int c = 0; c < 3; ++c) K2[r * 3 + c] = K[r * 3] * K[c] + K[r * 3 + 1] * K[3 + c] + K[r * 3 + 2] * K[6 + c];
-  }
-  const double a = theta > 1e-9 ? std::sin(theta) / theta : 1.0;
-  const double b = theta > 1e-9 ? (1.0 - std::cos(theta)) / (theta * theta) : 0.5;
-  for (int i = 0; i < 9; ++i) out[i] = (i % 4 == 0 ? 1.0 : 0.0) + a * K[i] + b * K2[i];
-}
-
-}  // namespace
-
-Camera Trainer::camera_for(size_t frame) const {
-  Camera cam = dataset_camera(dataset_, dataset_.frames.at(frame));
-  if (frame >= pose_fix_.size() || pose_fix_[frame].updates == 0) return cam;
-  const PoseFix& p = pose_fix_[frame];
+Camera Trainer::with_fix(Camera cam, const PoseFix& p) {
+  if (p.updates == 0) return cam;
   // World -> camera [R | t] becomes [E R | E t + d].
   float rot[9], t[3];
   for (int r = 0; r < 3; ++r) {
@@ -1065,6 +1181,11 @@ Camera Trainer::camera_for(size_t frame) const {
   std::copy(t, t + 3, cam.translation);
   for (int c = 0; c < 3; ++c) cam.position[c] = -(rot[c] * t[0] + rot[3 + c] * t[1] + rot[6 + c] * t[2]);
   return cam;
+}
+
+Camera Trainer::camera_for(size_t frame) const {
+  const Camera cam = dataset_camera(dataset_, dataset_.frames.at(frame));
+  return frame < pose_fix_.size() ? with_fix(cam, pose_fix_[frame]) : cam;
 }
 
 bool Trainer::refines_pose_at(uint32_t step) const { return options_.refine_poses && step >= options_.pose_from; }
@@ -1144,6 +1265,313 @@ void Trainer::update_pose_stats() {
   stats_.pose_shift_max = shift_max;
   stats_.pose_turn_max = turn_max;
   stats_.pose_updates = updates;
+}
+
+// --- Subject motion -------------------------------------------------------------
+
+void Trainer::place_nodes(const SplatScene& initial) {
+  // k-means (k-means++ seeds, Lloyd's iterations) over up to 20000 of the
+  // initial gaussians: the nodes spread over the subject like its surface.
+  if (initial.count == 0) return;
+  const uint32_t stride = std::max(1u, initial.count / 20000);
+  std::vector<std::array<float, 3>> pts;
+  for (uint32_t i = 0; i < initial.count; i += stride) {
+    pts.push_back({initial.positions[i * 3], initial.positions[i * 3 + 1], initial.positions[i * 3 + 2]});
+  }
+  const size_t k_count = std::min<size_t>({options_.motion_nodes, kMaxMotionNodes, pts.size()});
+  if (k_count == 0) return;
+  auto dist2 = [](const std::array<float, 3>& a, const std::array<float, 3>& b) {
+    const float x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2];
+    return x * x + y * y + z * z;
+  };
+  std::mt19937 rng(options_.seed * 7919u + 17u);  // not rng_: the view order stays as without motion
+  std::vector<std::array<float, 3>> centres;
+  centres.push_back(pts[std::uniform_int_distribution<size_t>(0, pts.size() - 1)(rng)]);
+  std::vector<float> nearest(pts.size(), std::numeric_limits<float>::max());
+  while (centres.size() < k_count) {
+    double total = 0.0;
+    for (size_t i = 0; i < pts.size(); ++i) {
+      nearest[i] = std::min(nearest[i], dist2(pts[i], centres.back()));
+      total += nearest[i];
+    }
+    double pick = std::uniform_real_distribution<double>(0.0, total)(rng);
+    size_t chosen = pts.size() - 1;
+    for (size_t i = 0; i < pts.size(); ++i) {
+      pick -= nearest[i];
+      if (pick <= 0.0) {
+        chosen = i;
+        break;
+      }
+    }
+    centres.push_back(pts[chosen]);
+  }
+  std::vector<uint32_t> owner(pts.size(), 0);
+  for (int iteration = 0; iteration < 15; ++iteration) {
+    std::vector<std::array<double, 4>> sum(k_count, {0, 0, 0, 0});
+    for (size_t i = 0; i < pts.size(); ++i) {
+      float best = std::numeric_limits<float>::max();
+      for (size_t k = 0; k < k_count; ++k) {
+        const float d = dist2(pts[i], centres[k]);
+        if (d < best) {
+          best = d;
+          owner[i] = uint32_t(k);
+        }
+      }
+      for (int c = 0; c < 3; ++c) sum[owner[i]][c] += pts[i][c];
+      sum[owner[i]][3] += 1.0;
+    }
+    for (size_t k = 0; k < k_count; ++k) {
+      if (sum[k][3] == 0.0) continue;  // keeps its place
+      for (int c = 0; c < 3; ++c) centres[k][c] = float(sum[k][c] / sum[k][3]);
+    }
+  }
+  // Radius: the mean distance to the 3 nearest other nodes; neighbours: the 6 nearest.
+  nodes_.resize(k_count);
+  node_neighbors_.assign(k_count, {});
+  std::vector<float> radii;
+  for (size_t k = 0; k < k_count; ++k) {
+    std::vector<std::pair<float, uint32_t>> others;
+    for (size_t j = 0; j < k_count; ++j) {
+      if (j != k) others.emplace_back(std::sqrt(dist2(centres[k], centres[j])), uint32_t(j));
+    }
+    std::sort(others.begin(), others.end());
+    double r = 0.0;
+    const size_t near = std::min<size_t>(3, others.size());
+    for (size_t j = 0; j < near; ++j) r += others[j].first;
+    float radius = near > 0 ? float(r / near) : 0.0f;
+    if (!(radius > 1e-4f)) radius = std::max(0.05f * dataset_.camera_extent, 1e-3f);
+    for (size_t j = 0; j < std::min<size_t>(6, others.size()); ++j) node_neighbors_[k].push_back(others[j].second);
+    for (int c = 0; c < 3; ++c) nodes_[k].position[c] = centres[k][c];
+    nodes_[k].radius = radius;
+    radii.push_back(radius);
+  }
+  std::nth_element(radii.begin(), radii.begin() + radii.size() / 2, radii.end());
+  node_spacing_ = radii[radii.size() / 2];
+  motion_.assign(dataset_.frames.size(), ViewMotion(k_count));
+  motion_updates_.assign(dataset_.frames.size(), 0);
+  train_before_.assign(dataset_.frames.size(), kNone);
+  train_after_.assign(dataset_.frames.size(), kNone);
+  size_t last = kNone;
+  for (size_t f = 0; f < dataset_.frames.size(); ++f) {
+    train_before_[f] = last;
+    if (!dataset_.frames[f].holdout) last = f;
+  }
+  last = kNone;
+  for (size_t f = dataset_.frames.size(); f-- > 0;) {
+    train_after_[f] = last;
+    if (!dataset_.frames[f].holdout) last = f;
+  }
+  stats_.motion_nodes = uint32_t(k_count);
+  log_info("trainer: %zu motion nodes, spacing %.3f", k_count, node_spacing_);
+}
+
+void Trainer::bind_motion() {
+  const uint32_t push[2] = {slots_, uint32_t(nodes_.size())};
+  if (slots_ > 0) {
+    ctx_.run([&](VkCommandBuffer cmd) {
+      kernel(cmd, motion_bind_, {&params_, &motion_nodes_buf_, &motion_bind_buf_}, div_up(slots_, 128), 1, push,
+             sizeof(push));
+    });
+  }
+  bound_at_ = stats_.step;
+}
+
+bool Trainer::refines_motion_at(uint32_t step) const { return !nodes_.empty() && step >= options_.motion_from; }
+
+bool Trainer::uses_motion() const {
+  return std::any_of(motion_updates_.begin(), motion_updates_.end(), [](uint32_t u) { return u > 0; });
+}
+
+Trainer::ViewMotion Trainer::view_motion(size_t frame) const {
+  if (motion_updates_.at(frame) > 0) return motion_[frame];
+  ViewMotion out(nodes_.size());
+  size_t a = train_before_[frame], b = train_after_[frame];
+  if (a != kNone && motion_updates_[a] == 0) a = kNone;
+  if (b != kNone && motion_updates_[b] == 0) b = kNone;
+  if (a == kNone && b == kNone) return out;
+  const double t = a == kNone ? 1.0 : b == kNone ? 0.0 : double(frame - a) / double(b - a);
+  for (size_t k = 0; k < nodes_.size(); ++k) {
+    for (int c = 0; c < 3; ++c) {
+      const double ta = a == kNone ? 0.0 : motion_[a][k].turn[c], tb = b == kNone ? 0.0 : motion_[b][k].turn[c];
+      const double sa = a == kNone ? 0.0 : motion_[a][k].shift[c], sb = b == kNone ? 0.0 : motion_[b][k].shift[c];
+      out[k].turn[c] = float(a == kNone ? tb : b == kNone ? ta : ta + (tb - ta) * t);
+      out[k].shift[c] = float(a == kNone ? sb : b == kNone ? sa : sa + (sb - sa) * t);
+    }
+  }
+  return out;
+}
+
+void Trainer::start_motion(size_t frame) {
+  if (motion_updates_.at(frame) > 0) return;
+  // The subject moves smoothly: start where the views next to it got.
+  const ViewMotion guess = view_motion(frame);
+  for (size_t k = 0; k < nodes_.size(); ++k) {
+    std::copy(guess[k].turn, guess[k].turn + 3, motion_[frame][k].turn);
+    std::copy(guess[k].shift, guess[k].shift + 3, motion_[frame][k].shift);
+  }
+}
+
+void Trainer::update_motion(uint32_t slot, size_t frame) {
+  const size_t K = nodes_.size();
+  ViewMotion& m = motion_.at(frame);
+  // The image loss's gradient (train_motion_sum), then the penalties'.
+  const float* g = static_cast<const float*>(motion_grads_[slot].mapped());
+  std::vector<double> grad(K * 6);
+  for (size_t k = 0; k < K; ++k) {
+    for (int c = 0; c < 3; ++c) {
+      grad[k * 6 + c] = g[k * 8 + c];
+      grad[k * 6 + 3 + c] = g[k * 8 + 4 + c];
+    }
+  }
+  last_motion_grad_ = grad;
+  const double inv_s2 = 1.0 / (double(node_spacing_) * node_spacing_);
+  const double decay = options_.motion_decay, rigid = options_.motion_rigidity;
+  const double smooth = options_.motion_smoothness;
+  for (size_t k = 0; k < K; ++k) {
+    for (int c = 0; c < 3; ++c) {
+      grad[k * 6 + c] += 2.0 * decay * m[k].shift[c] * inv_s2;
+      grad[k * 6 + 3 + c] += 2.0 * decay * m[k].turn[c];
+    }
+  }
+  if (rigid > 0.0) {
+    // As rigid as possible: neighbour j should be where node k's motion takes
+    // it, e = (n_j + s_j) - (n_k + s_k) - R_k (n_j - n_k). A turn u of R_k
+    // changes e by (R_k d) x u.
+    for (size_t k = 0; k < K; ++k) {
+      const double w[3] = {m[k].turn[0], m[k].turn[1], m[k].turn[2]};
+      double R[9];
+      rotation_from(w, R);
+      for (uint32_t j : node_neighbors_[k]) {
+        double d[3], Rd[3], e[3];
+        for (int c = 0; c < 3; ++c) d[c] = double(nodes_[j].position[c]) - nodes_[k].position[c];
+        for (int r = 0; r < 3; ++r) {
+          Rd[r] = R[r * 3] * d[0] + R[r * 3 + 1] * d[1] + R[r * 3 + 2] * d[2];
+          e[r] = d[r] + m[j].shift[r] - m[k].shift[r] - Rd[r];
+        }
+        const double f = 2.0 * rigid * inv_s2;
+        for (int c = 0; c < 3; ++c) {
+          grad[j * 6 + c] += f * e[c];
+          grad[k * 6 + c] -= f * e[c];
+        }
+        grad[k * 6 + 3] += f * (e[1] * Rd[2] - e[2] * Rd[1]);
+        grad[k * 6 + 4] += f * (e[2] * Rd[0] - e[0] * Rd[2]);
+        grad[k * 6 + 5] += f * (e[0] * Rd[1] - e[1] * Rd[0]);
+      }
+    }
+  }
+  if (options_.motion_center > 0.0f) {
+    // The mean over the trained views (this one included), per node.
+    std::vector<double> mean(K * 6, 0.0);
+    double views = 0.0;
+    for (size_t f : train_frames_) {
+      if (motion_updates_[f] == 0 && f != frame) continue;
+      views += 1.0;
+      for (size_t k = 0; k < K; ++k) {
+        for (int c = 0; c < 3; ++c) {
+          mean[k * 6 + c] += motion_[f][k].shift[c];
+          mean[k * 6 + 3 + c] += motion_[f][k].turn[c];
+        }
+      }
+    }
+    const double f = 2.0 * options_.motion_center / std::max(views, 1.0);
+    for (size_t k = 0; k < K; ++k) {
+      for (int c = 0; c < 3; ++c) {
+        grad[k * 6 + c] += f * mean[k * 6 + c] * inv_s2;
+        grad[k * 6 + 3 + c] += f * mean[k * 6 + 3 + c];
+      }
+    }
+  }
+  if (smooth > 0.0) {
+    for (size_t other : {train_before_[frame], train_after_[frame]}) {
+      if (other == kNone || motion_updates_[other] == 0) continue;
+      for (size_t k = 0; k < K; ++k) {
+        for (int c = 0; c < 3; ++c) {
+          grad[k * 6 + c] += 2.0 * smooth * (m[k].shift[c] - motion_[other][k].shift[c]) * inv_s2;
+          grad[k * 6 + 3 + c] += 2.0 * smooth * (m[k].turn[c] - motion_[other][k].turn[c]);
+        }
+      }
+    }
+  }
+  // Adam with one second moment per vector (shift, turn), so a step keeps
+  // the gradient's direction: directions the image barely constrains (along
+  // the view) move little.
+  const uint32_t n = ++motion_updates_[frame];
+  const double c1 = 1.0 / (1.0 - std::pow(double(kBeta1), double(n)));
+  const double c2 = 1.0 / (1.0 - std::pow(double(kBeta2), double(n)));
+  const double t = options_.iterations > 0 ? std::min(1.0, double(stats_.step) / options_.iterations) : 1.0;
+  const double fade = std::pow(double(std::max(options_.lr_motion_final, 1e-6f)), t);
+  const double lr[2] = {options_.lr_motion_shift * dataset_.camera_extent * fade, options_.lr_motion_turn * fade};
+  for (size_t k = 0; k < K; ++k) {
+    NodeMotion& node = m[k];
+    for (int part = 0; part < 2; ++part) {
+      double sq = 0.0;
+      for (int c = 0; c < 3; ++c) {
+        const double gi = grad[k * 6 + part * 3 + c];
+        node.m[part * 3 + c] = kBeta1 * node.m[part * 3 + c] + (1.0 - kBeta1) * gi;
+        sq += gi * gi;
+      }
+      node.v[part] = kBeta2 * node.v[part] + (1.0 - kBeta2) * sq / 3.0;
+      if (!(node.v[part] > 0.0)) continue;
+      const double denom = std::sqrt(node.v[part] * c2) + 1e-30;
+      float* value = part == 0 ? node.shift : node.turn;
+      for (int c = 0; c < 3; ++c) value[c] -= float(lr[part] * node.m[part * 3 + c] * c1 / denom);
+    }
+  }
+}
+
+void Trainer::update_motion_stats() {
+  double shift_sum = 0.0, turn_sum = 0.0, shift_max = 0.0, turn_max = 0.0;
+  size_t n = 0;
+  uint32_t updates = 0;
+  for (size_t f : train_frames_) {
+    if (motion_updates_[f] == 0) continue;
+    updates += motion_updates_[f];
+    for (const NodeMotion& m : motion_[f]) {
+      const double shift = std::sqrt(double(m.shift[0]) * m.shift[0] + double(m.shift[1]) * m.shift[1] +
+                                     double(m.shift[2]) * m.shift[2]);
+      const double turn = std::sqrt(double(m.turn[0]) * m.turn[0] + double(m.turn[1]) * m.turn[1] +
+                                    double(m.turn[2]) * m.turn[2]) * 180.0 / M_PI;
+      shift_sum += shift;
+      turn_sum += turn;
+      shift_max = std::max(shift_max, shift);
+      turn_max = std::max(turn_max, turn);
+      ++n;
+    }
+  }
+  stats_.motion_shift_mean = n ? shift_sum / n : 0.0;
+  stats_.motion_turn_mean = n ? turn_sum / n : 0.0;
+  stats_.motion_shift_max = shift_max;
+  stats_.motion_turn_max = turn_max;
+  stats_.motion_updates = updates;
+}
+
+void Trainer::node_motion(size_t frame, uint32_t node, float turn[3], float shift[3]) const {
+  const NodeMotion& m = motion_.at(frame).at(node);
+  std::copy(m.turn, m.turn + 3, turn);
+  std::copy(m.shift, m.shift + 3, shift);
+}
+
+void Trainer::set_node_motion(size_t frame, uint32_t node, const float turn[3], const float shift[3]) {
+  NodeMotion& m = motion_.at(frame).at(node);
+  std::copy(turn, turn + 3, m.turn);
+  std::copy(shift, shift + 3, m.shift);
+  if (motion_updates_[frame] == 0) motion_updates_[frame] = 1;  // counts as trained: used as is
+}
+
+Trainer::MotionBinding Trainer::motion_binding() {
+  MotionBinding b;
+  if (nodes_.empty() || slots_ == 0) return b;
+  std::vector<uint32_t> raw(size_t(slots_) * 8);
+  ctx_.download(motion_bind_buf_, raw.data(), raw.size() * 4);
+  b.nodes.resize(size_t(slots_) * 4);
+  b.weights.resize(size_t(slots_) * 4);
+  for (size_t i = 0; i < slots_; ++i) {
+    for (int j = 0; j < 4; ++j) {
+      b.nodes[i * 4 + j] = raw[i * 8 + j];
+      std::memcpy(&b.weights[i * 4 + j], &raw[i * 8 + 4 + j], 4);
+    }
+  }
+  return b;
 }
 
 SplatScene Trainer::export_scene() {

@@ -391,6 +391,196 @@ void test_pose_recovery(gs::VkContext& ctx) {
   EXPECT(shift1 < 0.25 * shift0 && turn1 < 0.25 * turn0, "pose not recovered: %.3f m %.2f deg left", shift1, turn1);
 }
 
+void test_motion_gradient(gs::VkContext& ctx) {
+  // With every node at rest the gaussians are where they are, so a shift s of
+  // node k moves its gaussians by w s: dL/ds = sum_i w_i dL/dp_i. A turn u
+  // about the node moves them by w u x (p_i - n_k) and turns their
+  // orientation by w u: dL/du = sum_i w_i ((p_i - n_k) x dL/dp_i + tau_i),
+  // tau_i the orientation's share (as in test_pose_gradient), all from the
+  // per-gaussian gradients checked against the CPU reference. SH degree 0.
+  gs::Dataset ds = gs::make_test_dataset(kWidth, kHeight, 2, true, 3);
+  gs::SplatScene scene = gs::make_test_scene(120, 0, 9);
+  const float bg[3] = {0.2f, 0.3f, 0.4f};
+  gs::TrainOptions o = gs::frozen_train_options(0, true);
+  o.refine_motion = true;
+  o.motion_from = 0;
+  o.motion_nodes = 6;
+  o.lr_motion_shift = o.lr_motion_turn = 0.0f;  // measure only
+  gs::Trainer t(ctx, ds, scene, o);
+  EXPECT(t.motion_nodes().size() == 6, "%zu motion nodes", t.motion_nodes().size());
+  t.step_on(1, bg);
+  const std::vector<double>& g = t.last_motion_gradient();
+  const gs::Trainer::Gradients grads = t.first_step_gradients();
+  const gs::Trainer::MotionBinding bind = t.motion_binding();
+  const size_t nodes = t.motion_nodes().size();
+  std::vector<double> expected(nodes * 6, 0.0);
+  double weight_error = 0.0;
+  for (uint32_t i = 0; i < scene.count; ++i) {
+    const float* gp = &grads.params[size_t(i) * 16];
+    const float* q = &scene.rotations[i * 4];
+    const double len = std::sqrt(double(q[0]) * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    const double w = q[0] / len, u[3] = {q[1] / len, q[2] / len, q[3] / len};
+    const double gw = gp[8] * len, gu[3] = {gp[9] * len, gp[10] * len, gp[11] * len};
+    const double ug[3] = {u[1] * gu[2] - u[2] * gu[1], u[2] * gu[0] - u[0] * gu[2], u[0] * gu[1] - u[1] * gu[0]};
+    double tau[3];
+    for (int k = 0; k < 3; ++k) tau[k] = 0.5 * (-gw * u[k] + w * gu[k] + ug[k]);
+    double total = 0.0;
+    for (int j = 0; j < 4; ++j) {
+      const double wk = bind.weights[i * 4 + j];
+      total += wk;
+      if (wk == 0.0) continue;
+      const uint32_t k = bind.nodes[i * 4 + j];
+      double r[3];
+      for (int c = 0; c < 3; ++c) r[c] = double(scene.positions[i * 3 + c]) - t.motion_nodes()[k].position[c];
+      const double rg[3] = {r[1] * gp[2] - r[2] * gp[1], r[2] * gp[0] - r[0] * gp[2], r[0] * gp[1] - r[1] * gp[0]};
+      for (int c = 0; c < 3; ++c) {
+        expected[k * 6 + c] += wk * gp[c];
+        expected[k * 6 + 3 + c] += wk * (rg[c] + tau[c]);
+      }
+    }
+    weight_error = std::max(weight_error, std::fabs(total - 1.0));
+  }
+  EXPECT(weight_error < 1e-5, "binding weights sum to 1 +- %.3g", weight_error);
+  double worst = 0.0, largest = 0.0;
+  for (size_t k = 0; k < nodes * 6; ++k) {
+    worst = std::max(worst, std::fabs(g[k] - expected[k]));
+    largest = std::max(largest, std::fabs(expected[k]));
+  }
+  std::printf("  motion gradient: %zu nodes, node 0 shift %.4g/%.4g turn %.4g/%.4g, worst error %.3g of %.3g\n", nodes,
+              g[0], expected[0], g[3], expected[3], worst, largest);
+  EXPECT(largest > 0.0 && worst <= 1e-3 * largest, "motion gradient off by %.3g (largest %.3g)", worst, largest);
+}
+
+// Where the gaussians are in view `frame` (train_motion.glsl): sum_k w_k (R_k (p - n_k) + n_k + s_k).
+std::vector<double> moved_positions(const gs::Trainer& t, const gs::Trainer::MotionBinding& bind,
+                                    const gs::SplatScene& scene, size_t frame) {
+  std::vector<double> out(size_t(scene.count) * 3, 0.0);
+  for (uint32_t i = 0; i < scene.count; ++i) {
+    for (int j = 0; j < 4; ++j) {
+      const double wk = bind.weights[i * 4 + j];
+      if (wk == 0.0) continue;
+      const uint32_t k = bind.nodes[i * 4 + j];
+      float turn[3], shift[3];
+      t.node_motion(frame, k, turn, shift);
+      const double th = std::sqrt(double(turn[0]) * turn[0] + double(turn[1]) * turn[1] + double(turn[2]) * turn[2]);
+      double a[3] = {0, 0, 0};
+      if (th > 0) {
+        for (int c = 0; c < 3; ++c) a[c] = turn[c] / th;
+      }
+      const float* n = t.motion_nodes()[k].position;
+      double r[3];
+      for (int c = 0; c < 3; ++c) r[c] = double(scene.positions[i * 3 + c]) - n[c];
+      // Rodrigues: r cos + (a x r) sin + a (a . r)(1 - cos).
+      const double ar[3] = {a[1] * r[2] - a[2] * r[1], a[2] * r[0] - a[0] * r[2], a[0] * r[1] - a[1] * r[0]};
+      const double dot = a[0] * r[0] + a[1] * r[1] + a[2] * r[2];
+      for (int c = 0; c < 3; ++c) {
+        const double rr = r[c] * std::cos(th) + ar[c] * std::sin(th) + a[c] * dot * (1 - std::cos(th));
+        out[i * 3 + c] += wk * (rr + n[c] + shift[c]);
+      }
+    }
+  }
+  return out;
+}
+
+// Mean on-screen distance (px) between two sets of positions seen by `cam`.
+double screen_distance(const gs::Camera& cam, const std::vector<double>& a, const std::vector<double>& b) {
+  auto project = [&](const double* p, double out[2]) {
+    double t[3];
+    for (int r = 0; r < 3; ++r) {
+      t[r] = cam.translation[r];
+      for (int c = 0; c < 3; ++c) t[r] += cam.rotation[r * 3 + c] * p[c];
+    }
+    out[0] = cam.fx * t[0] / t[2] + cam.cx;
+    out[1] = cam.fy * t[1] / t[2] + cam.cy;
+  };
+  double sum = 0.0;
+  const size_t n = a.size() / 3;
+  for (size_t i = 0; i < n; ++i) {
+    double pa[2], pb[2];
+    project(&a[i * 3], pa);
+    project(&b[i * 3], pb);
+    sum += std::hypot(pa[0] - pb[0], pa[1] - pb[1]);
+  }
+  return n ? sum / n : 0.0;
+}
+
+void test_motion_recovery(gs::VkContext& ctx) {
+  // A view's target rendered with one node moved (9 cm and 11 degrees; at 3 m
+  // and 128 px its gaussians move a few pixels); with the gaussians frozen,
+  // refining that view's motion must bring them back where the target shows
+  // them, on screen (along the view a single image says little).
+  constexpr uint32_t w = 128, h = 96;
+  gs::Dataset ds = gs::make_test_dataset(w, h, 2, false, 3);
+  gs::SplatScene scene = gs::make_test_scene(300, 0, 9);
+  const float black[3] = {0.0f, 0.0f, 0.0f};
+  gs::TrainOptions o = gs::frozen_train_options(0, false);
+  o.refine_motion = true;
+  o.motion_from = 0;
+  o.motion_nodes = 8;
+  o.motion_decay = o.motion_smoothness = 0.0f;
+  std::vector<double> truth;
+  {
+    gs::Trainer renderer(ctx, ds, scene, o);
+    const float turn[3] = {0.0f, 0.2f, 0.0f}, shift[3] = {0.08f, -0.04f, 0.0f};
+    renderer.set_node_motion(1, 0, turn, shift);
+    ds.frames[1].rgba = renderer.render_view(1, black);
+    for (size_t p = 0; p < size_t(w) * h; ++p) ds.frames[1].rgba[p * 4 + 3] = 255;
+    truth = moved_positions(renderer, renderer.motion_binding(), scene, 1);
+  }
+  o.iterations = 200;
+  o.lr_motion_shift = 2e-3f;
+  o.lr_motion_turn = 3e-3f;
+  o.lr_motion_final = 1.0f;
+  gs::Trainer t(ctx, ds, scene, o);
+  const gs::Trainer::MotionBinding bind = t.motion_binding();
+  const gs::Camera cam = gs::dataset_camera(ds, ds.frames[1]);
+  const double before = screen_distance(cam, moved_positions(t, bind, scene, 1), truth);
+  for (int s = 0; s < 150; ++s) t.step_on(1, black);
+  const double after = screen_distance(cam, moved_positions(t, bind, scene, 1), truth);
+  std::printf("  motion recovery: gaussians %.2f px from the target's -> %.2f px\n", before, after);
+  EXPECT(before > 0.5 && after < 0.25 * before, "motion not recovered: %.2f -> %.2f px", before, after);
+}
+
+void test_motion_batched(gs::VkContext& ctx) {
+  // Batches with motion: each step's view gets its own motion slot and
+  // gradient, and every step from motion_from updates its view once. (Not
+  // bit-equal to single steps: a batch's views start from, and are pulled
+  // towards, their neighbours' motions as they were before the batch.)
+  gs::Dataset ds = gs::make_test_dataset(kWidth, kHeight, 6, true, 31);
+  gs::SplatScene scene = gs::make_test_scene(150, 1, 37);
+  gs::TrainOptions o = gs::scaled_options(45);
+  o.sh_degree = 1;
+  o.max_gaussians = 400;
+  o.densify_from = 5;
+  o.densify_until = 40;
+  o.densify_interval = 10;
+  o.refine_motion = true;
+  o.motion_nodes = 8;
+  o.motion_from = 5;
+  gs::Trainer t(ctx, ds, scene, o);
+  while (!t.finished()) t.steps(17);
+  bool finite = true;
+  for (float v : t.export_scene().positions) finite = finite && std::isfinite(v);
+  double largest = 0.0;
+  for (size_t f = 0; f < ds.frames.size(); ++f) {
+    for (uint32_t k = 0; k < t.motion_nodes().size(); ++k) {
+      float turn[3], shift[3];
+      t.node_motion(f, k, turn, shift);
+      for (int c = 0; c < 3; ++c) {
+        finite = finite && std::isfinite(turn[c]) && std::isfinite(shift[c]);
+        largest = std::max(largest, double(std::fabs(shift[c])));
+      }
+    }
+  }
+  const gs::TrainStats& s = t.stats();
+  std::printf("  motion in batches: %u view updates, %u densify events, shift mean %.3g max %.3g\n", s.motion_updates,
+              s.densify_events, s.motion_shift_mean, largest);
+  EXPECT(s.motion_updates == 40 && finite && largest > 0.0, "%u motion updates (40 expected), finite %d",
+         s.motion_updates, int(finite));
+  const gs::EvalResult e = t.evaluate();
+  EXPECT(std::isfinite(e.psnr) && e.views > 0, "evaluation with motion: %.2f dB over %u views", e.psnr, e.views);
+}
+
 void test_batched_matches_single(gs::VkContext& ctx) {
   // Steps recorded kBatch to a submission (pair count read on the GPU) must
   // train exactly like steps run one at a time. Densification places new
@@ -701,6 +891,9 @@ int main() {
     test_pose_gradient(ctx, 0.0f);
     test_pose_gradient(ctx, 0.5f);
     test_pose_recovery(ctx);
+    test_motion_gradient(ctx);
+    test_motion_recovery(ctx);
+    test_motion_batched(ctx);
     test_batched_matches_single(ctx);
     test_pair_overflow_retry(ctx);
     test_probes(ctx);

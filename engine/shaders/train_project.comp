@@ -2,6 +2,8 @@
 #extension GL_GOOGLE_include_directive : require
 // Training pass 1: project every gaussian (EWA 2D covariance, SH colour) and
 // count the 16x16 tiles its opacity-aware footprint (an ellipse) reaches.
+// With kFlagMotion, each gaussian first follows the subject's motion in this
+// view (train_motion.glsl).
 layout(local_size_x = 128) in;
 
 #include "train_common.glsl"
@@ -11,6 +13,10 @@ layout(std430, binding = 1) readonly buffer Params { vec4 params[]; };
 layout(std430, binding = 2) readonly buffer Sh { float sh[]; };
 layout(std430, binding = 3) writeonly buffer Projected { vec4 projected[]; };
 layout(std430, binding = 4) writeonly buffer Tiles { uint tiles_touched[]; };
+layout(std430, binding = 5) readonly buffer Motion { vec4 motion[]; };
+layout(std430, binding = 6) readonly buffer Bind { uvec4 bind[]; };
+
+#include "train_motion.glsl"
 
 void main() {
   uint i = gl_GlobalInvocationID.x;
@@ -23,6 +29,11 @@ void main() {
   vec4 out3 = vec4(0.0);
 
   vec3 p = p0.xyz;
+  mat3 turn = mat3(1.0);  // of the orientation, by the subject's motion
+  if ((frame.model.w & kFlagMotion) != 0u && p1.w > 0.5) {
+    mat3 A;
+    deform(i, p0.xyz, p, turn, A);
+  }
   vec3 t = vec3(dot(frame.rot0.xyz, p) + frame.rot0.w, dot(frame.rot1.xyz, p) + frame.rot1.w,
                 dot(frame.rot2.xyz, p) + frame.rot2.w);
   float opacity = sigmoid(p0.w);
@@ -38,7 +49,7 @@ void main() {
     float tx = clamp(t.x * inv_z, -lim_x, lim_x);
     float ty = clamp(t.y * inv_z, -lim_y, lim_y);
     mat3 J = mat3(fx * inv_z, 0.0, 0.0, 0.0, fy * inv_z, 0.0, -fx * tx * inv_z, -fy * ty * inv_z, 0.0);
-    mat3 W = transpose(mat3(frame.rot0.xyz, frame.rot1.xyz, frame.rot2.xyz));
+    mat3 W = transpose(mat3(frame.rot0.xyz, frame.rot1.xyz, frame.rot2.xyz)) * turn;
     vec4 q = params[i * 4u + 2u];
     mat3 R = quat_to_matrix(q / max(length(q), 1e-12));
     vec3 s = exp(p1.xyz);
@@ -68,7 +79,8 @@ void main() {
         uint degree = frame.model.y;
         uint base = i * frame.model.z;
         float basis[16];
-        sh_basis(normalize(p - frame.cam_pos.xyz), degree, basis);
+        // The view direction in the gaussian's own (rest) frame.
+        sh_basis(normalize(transpose(turn) * (p - frame.cam_pos.xyz)), degree, basis);
         vec3 color = basis[0] * params[i * 4u + 3u].xyz;
         int coeffs = sh_rest_coeffs(degree);
         for (int k = 0; k < coeffs; ++k) {

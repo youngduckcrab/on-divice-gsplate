@@ -301,6 +301,13 @@ void write_stats(gs::JsonWriter& w, const gs::Trainer& t) {
   w.field("pose_shift_max", s.pose_shift_max);
   w.field("pose_turn_mean", s.pose_turn_mean);
   w.field("pose_turn_max", s.pose_turn_max);
+  w.field("refine_motion", t.options().refine_motion);
+  w.field("motion_nodes", s.motion_nodes);
+  w.field("motion_updates", s.motion_updates);
+  w.field("motion_shift_mean", s.motion_shift_mean);
+  w.field("motion_shift_max", s.motion_shift_max);
+  w.field("motion_turn_mean", s.motion_turn_mean);
+  w.field("motion_turn_max", s.motion_turn_max);
   w.key("timing").begin_object();
   w.field("wall", s.timing.wall_ms);
   w.field("gpu", s.timing.gpu_ms);
@@ -325,7 +332,7 @@ void write_stats(gs::JsonWriter& w, const gs::Trainer& t) {
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, jstring jdir, jint width,
                                                jint iterations, jint max_gaussians, jint sh_degree, jboolean masked,
-                                               jboolean refine_poses) {
+                                               jboolean refine_poses, jboolean refine_motion) {
   const std::string dir = from_jstring(env, jdir);
   std::lock_guard<std::mutex> lock(g_train_mutex);
   try {
@@ -362,6 +369,8 @@ Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, js
     options.sh_degree = sh_degree;
     options.masked = masked == JNI_TRUE;
     options.refine_poses = refine_poses == JNI_TRUE;
+    // The subject's motion needs nodes on the subject: only with its mask.
+    options.refine_motion = refine_motion == JNI_TRUE && options.masked && ds.has_masks;
     const auto t1 = Clock::now();
     gs::InitOptions init;
     init.max_gaussians = std::min<uint32_t>(options.max_gaussians / 2, 150000);
