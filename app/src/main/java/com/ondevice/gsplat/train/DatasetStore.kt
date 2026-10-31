@@ -22,7 +22,11 @@ data class DatasetInfo(
     val depth: Boolean,
     val points: Boolean,
     val bytes: Long,
+    val capture: String? = null,  // what tracked the camera ("arcore" for scans from this app)
 ) {
+    /** Poses from a phone's tracking, not exact: worth correcting while training. */
+    val trackedPoses: Boolean get() = capture == "arcore"
+
     val name: String get() = dir.name
 }
 
@@ -56,6 +60,7 @@ object DatasetStore {
             depth = first.has("depth_file_path"),
             points = json.has("ply_file_path"),
             bytes = dir.walkTopDown().filter { it.isFile }.sumOf { it.length() },
+            capture = json.optJSONObject("gsplat_lab")?.optString("capture")?.takeIf { it.isNotEmpty() },
         )
     }.getOrNull()
 

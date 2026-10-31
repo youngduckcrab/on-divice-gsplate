@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -975,13 +976,44 @@ EvalResult Trainer::evaluate() {
     if (!frame.holdout) continue;
     if (align) {
       // The model was fitted to corrected poses: give each held-out view the
-      // same chance, moving only its camera (quicker steps: it starts afresh).
+      // same chance, moving only its camera. Gradient descent whose step
+      // grows after a step that lowered the loss and halves (from the best
+      // pose) after one that did not; turns count as the shift they cause at
+      // the cameras' distance. The view keeps the best pose seen, so it is
+      // never worse than given. (Adam moved poses that were already right.)
       measure(dataset_camera(dataset_, frame), frame, unaligned);
+      const double reach = dataset_.camera_extent;
+      PoseFix best{}, current{};
+      double best_loss = std::numeric_limits<double>::infinity(), best_grad[6] = {0, 0, 0, 0, 0, 0};
+      double length = options_.eval_pose_step * reach;
       for (uint32_t k = 0; k < options_.eval_pose_steps; ++k) {
+        pose_fix_[i] = current;
         run_view(camera_for(i), frame.rgba.data(), black, options_.masked, true, false, false, uses_ssim(),
                  kFlagPoseGrad | kFlagPoseOnly);
-        update_pose(0, i, 3.0f);
+        const double lambda = lambda_at(stats_.step);
+        const double loss = (1.0 - lambda) * last_losses_[3] + lambda * (last_losses_[5] - last_losses_[4]);
+        if (loss < best_loss) {
+          best = current;
+          best_loss = loss;
+          pose_gradient(0, best_grad);
+          if (k > 0) length *= 1.5;
+        } else {
+          length *= 0.5;
+        }
+        double g[6], norm = 0.0;
+        for (int c = 0; c < 6; ++c) {
+          g[c] = c < 3 ? best_grad[c] : best_grad[c] / reach;
+          norm += g[c] * g[c];
+        }
+        if (!(norm > 0.0)) break;
+        norm = std::sqrt(norm);
+        double step[6];
+        for (int c = 0; c < 6; ++c) step[c] = -length * g[c] / norm / (c < 3 ? 1.0 : reach);
+        current = best;
+        current.updates = 1;
+        apply_pose_step(current, step);
       }
+      pose_fix_[i] = best;
     }
     measure(camera_for(i), frame, sums);
     ++result.views;
@@ -1037,29 +1069,20 @@ Camera Trainer::camera_for(size_t frame) const {
 
 bool Trainer::refines_pose_at(uint32_t step) const { return options_.refine_poses && step >= options_.pose_from; }
 
-void Trainer::update_pose(uint32_t slot, size_t frame, float lr_scale) {
+void Trainer::pose_gradient(uint32_t slot, double grad[6]) const {
   // Sum the workgroups' shares (train_step): dL/dd, then dL/dw.
   const uint32_t groups = div_up(slots_, 128u);
   const float* g = static_cast<const float*>(pose_grads_[slot].mapped());
-  double grad[6] = {0, 0, 0, 0, 0, 0};
+  for (int c = 0; c < 6; ++c) grad[c] = 0.0;
   for (uint32_t k = 0; k < groups; ++k) {
     for (int c = 0; c < 3; ++c) {
       grad[c] += g[k * 8 + c];
       grad[3 + c] += g[k * 8 + 4 + c];
     }
   }
-  std::copy(grad, grad + 6, last_pose_grad_);
-  PoseFix& p = pose_fix_.at(frame);
-  ++p.updates;
-  const double c1 = 1.0 / (1.0 - std::pow(double(kBeta1), double(p.updates)));
-  const double c2 = 1.0 / (1.0 - std::pow(double(kBeta2), double(p.updates)));
-  double step[6];
-  for (int i = 0; i < 6; ++i) {
-    p.m[i] = kBeta1 * p.m[i] + (1.0 - kBeta1) * grad[i];
-    p.v[i] = kBeta2 * p.v[i] + (1.0 - kBeta2) * grad[i] * grad[i];
-    const double lr = (i < 3 ? options_.lr_pose_shift * dataset_.camera_extent : options_.lr_pose_turn) * lr_scale;
-    step[i] = p.v[i] > 0.0 ? -lr * (p.m[i] * c1) / (std::sqrt(p.v[i] * c2) + 1e-30) : 0.0;
-  }
+}
+
+void Trainer::apply_pose_step(PoseFix& p, const double step[6]) {
   // The step applies after the current correction: [R | s] <- [E | d] [R | s].
   double E[9];
   rotation_from(step + 3, E);
@@ -1075,6 +1098,26 @@ void Trainer::update_pose(uint32_t slot, size_t frame, float lr_scale) {
   }
   std::copy(rot, rot + 9, p.rotation);
   std::copy(shift, shift + 3, p.shift);
+}
+
+void Trainer::update_pose(uint32_t slot, size_t frame, float lr_scale) {
+  double grad[6];
+  pose_gradient(slot, grad);
+  std::copy(grad, grad + 6, last_pose_grad_);
+  PoseFix& p = pose_fix_.at(frame);
+  ++p.updates;
+  const double c1 = 1.0 / (1.0 - std::pow(double(kBeta1), double(p.updates)));
+  const double c2 = 1.0 / (1.0 - std::pow(double(kBeta2), double(p.updates)));
+  const double t = options_.iterations > 0 ? std::min(1.0, double(stats_.step) / options_.iterations) : 1.0;
+  lr_scale *= float(std::pow(double(std::max(options_.lr_pose_final, 1e-6f)), t));
+  double step[6];
+  for (int i = 0; i < 6; ++i) {
+    p.m[i] = kBeta1 * p.m[i] + (1.0 - kBeta1) * grad[i];
+    p.v[i] = kBeta2 * p.v[i] + (1.0 - kBeta2) * grad[i] * grad[i];
+    const double lr = (i < 3 ? options_.lr_pose_shift * dataset_.camera_extent : options_.lr_pose_turn) * lr_scale;
+    step[i] = p.v[i] > 0.0 ? -lr * (p.m[i] * c1) / (std::sqrt(p.v[i] * c2) + 1e-30) : 0.0;
+  }
+  apply_pose_step(p, step);
 }
 
 void Trainer::update_pose_stats() {

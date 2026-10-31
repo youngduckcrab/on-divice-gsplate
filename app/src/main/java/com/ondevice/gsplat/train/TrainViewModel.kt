@@ -124,7 +124,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         val scan = pendingScan
         if (scan != null && list.none { it.dir == scan.dir }) {
             // Still being saved; trainable from memory meanwhile.
-            list = list + DatasetInfo(scan.dir, "person", scan.frames, scan.width, scan.height, true, scan.depth, false, 0)
+            list = list + DatasetInfo(scan.dir, "person", scan.frames, scan.width, scan.height, true, scan.depth, false, 0, "arcore")
         }
         datasets = list
         val current = list.firstOrNull { it.dir == selected?.dir }
@@ -148,6 +148,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         if (running) return
         selected = info
         useMasks = info?.masks == true
+        refinePoses = info?.trackedPoses == true
     }
 
     fun delete(info: DatasetInfo) {

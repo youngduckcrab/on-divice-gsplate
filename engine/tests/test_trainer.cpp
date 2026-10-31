@@ -308,6 +308,89 @@ void test_pose_gradient(gs::VkContext& ctx, float lambda) {
   EXPECT(largest > 0.0 && worst <= 1e-3 * largest, "pose gradient off by %.3g (largest %.3g)", worst, largest);
 }
 
+// Moves frame `f`'s camera as the trainer's pose correction does: world ->
+// camera [W | t] becomes [E W | E t + d], E the rotation by w.
+void nudge_camera(gs::Dataset& ds, size_t f, const double d[3], const double w[3]) {
+  const gs::Camera cam = gs::dataset_camera(ds, ds.frames[f]);
+  const double theta = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+  double k[3] = {0, 0, 0};
+  if (theta > 0) {
+    for (int i = 0; i < 3; ++i) k[i] = w[i] / theta;
+  }
+  const double s = std::sin(theta), c = 1 - std::cos(theta);
+  const double K[9] = {0, -k[2], k[1], k[2], 0, -k[0], -k[1], k[0], 0};
+  double E[9];
+  for (int r = 0; r < 3; ++r) {
+    for (int col = 0; col < 3; ++col) {
+      double k2 = 0;
+      for (int i = 0; i < 3; ++i) k2 += K[r * 3 + i] * K[i * 3 + col];
+      E[r * 3 + col] = (r == col ? 1 : 0) + s * K[r * 3 + col] + c * k2;
+    }
+  }
+  double W[9], t[3];
+  for (int r = 0; r < 3; ++r) {
+    t[r] = d[r];
+    for (int col = 0; col < 3; ++col) {
+      W[r * 3 + col] = 0.0;
+      for (int i = 0; i < 3; ++i) W[r * 3 + col] += E[r * 3 + i] * cam.rotation[i * 3 + col];
+      t[r] += E[r * 3 + col] * cam.translation[col];
+    }
+  }
+  // Back to camera-to-world, OpenGL axes: rotation W^T with y and z flipped, centre -W^T t.
+  float* m = ds.frames[f].c2w;
+  for (int r = 0; r < 3; ++r) {
+    m[r * 4 + 0] = float(W[0 * 3 + r]);
+    m[r * 4 + 1] = float(-W[1 * 3 + r]);
+    m[r * 4 + 2] = float(-W[2 * 3 + r]);
+    m[r * 4 + 3] = float(-(W[0 * 3 + r] * t[0] + W[1 * 3 + r] * t[1] + W[2 * 3 + r] * t[2]));
+  }
+}
+
+// Distance between camera centres and the angle between their rotations (degrees).
+void camera_error(const gs::Camera& a, const gs::Camera& b, double* shift, double* turn) {
+  double d2 = 0.0, trace = 0.0;
+  for (int k = 0; k < 3; ++k) d2 += double(a.position[k] - b.position[k]) * (a.position[k] - b.position[k]);
+  for (int r = 0; r < 3; ++r) {
+    for (int k = 0; k < 3; ++k) trace += double(a.rotation[r * 3 + k]) * b.rotation[r * 3 + k];
+  }
+  *shift = std::sqrt(d2);
+  *turn = std::acos(std::clamp((trace - 1.0) / 2.0, -1.0, 1.0)) * 180.0 / M_PI;
+}
+
+void test_pose_recovery(gs::VkContext& ctx) {
+  // Targets rendered from a scene at the true cameras, one camera then moved
+  // 10 cm and 1.7 degrees (3 m away: about 2 px each at 128 px); with the
+  // gaussians frozen, refining that view's pose must bring it back.
+  constexpr uint32_t w = 128, h = 96;
+  gs::Dataset ds = gs::make_test_dataset(w, h, 2, false, 3);
+  gs::SplatScene scene = gs::make_test_scene(300, 0, 9);
+  const float black[3] = {0.0f, 0.0f, 0.0f};
+  gs::TrainOptions o = gs::frozen_train_options(0, false);
+  {
+    gs::Trainer renderer(ctx, ds, scene, o);
+    for (gs::DatasetFrame& f : ds.frames) {
+      f.rgba = renderer.render(gs::dataset_camera(ds, f), black);
+      for (size_t p = 0; p < size_t(w) * h; ++p) f.rgba[p * 4 + 3] = 255;
+    }
+  }
+  const gs::Camera truth = gs::dataset_camera(ds, ds.frames[1]);
+  gs::Dataset moved = ds;
+  const double d[3] = {0.07, -0.05, 0.05}, rot[3] = {0.012, 0.02, -0.01};
+  nudge_camera(moved, 1, d, rot);
+  o.iterations = 200;
+  o.refine_poses = true;
+  o.pose_from = 0;
+  o.lr_pose_shift = 2e-3f;
+  o.lr_pose_turn = 2e-3f;
+  gs::Trainer t(ctx, moved, scene, o);
+  for (int s = 0; s < 150; ++s) t.step_on(1, black);
+  double shift0, turn0, shift1, turn1;
+  camera_error(gs::dataset_camera(moved, moved.frames[1]), truth, &shift0, &turn0);
+  camera_error(t.camera_for(1), truth, &shift1, &turn1);
+  std::printf("  pose recovery: %.1f cm, %.2f deg -> %.1f cm, %.2f deg\n", 100 * shift0, turn0, 100 * shift1, turn1);
+  EXPECT(shift1 < 0.25 * shift0 && turn1 < 0.25 * turn0, "pose not recovered: %.3f m %.2f deg left", shift1, turn1);
+}
+
 void test_batched_matches_single(gs::VkContext& ctx) {
   // Steps recorded kBatch to a submission (pair count read on the GPU) must
   // train exactly like steps run one at a time. Densification places new
@@ -617,6 +700,7 @@ int main() {
     test_bucket_refit(ctx);
     test_pose_gradient(ctx, 0.0f);
     test_pose_gradient(ctx, 0.5f);
+    test_pose_recovery(ctx);
     test_batched_matches_single(ctx);
     test_pair_overflow_retry(ctx);
     test_probes(ctx);

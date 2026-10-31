@@ -101,6 +101,8 @@ int main(int argc, char** argv) {
         if (std::sscanf(next(), "%f,%f", &options.lr_pose_shift, &options.lr_pose_turn) != 2) {
           throw std::runtime_error("--pose-lr needs shift,turn");
         }
+      } else if (arg == "--pose-lr-final") {
+        options.lr_pose_final = float(std::atof(next()));
       } else if (arg == "--pose-from") {
         pose_from = std::atoi(next());
       } else if (arg == "--eval-pose-steps") {

@@ -75,7 +75,9 @@ struct TrainOptions {
   uint32_t pose_from = 300;
   float lr_pose_shift = 1e-3f;   // per update, times the camera extent
   float lr_pose_turn = 1e-3f;    // radians per update
-  uint32_t eval_pose_steps = 10;
+  float lr_pose_final = 1.0f;    // the rates decay exponentially to this fraction by the last step
+  uint32_t eval_pose_steps = 20;
+  float eval_pose_step = 0.005f;  // the alignment's first step, times the camera extent
 
   // Adaptive density control.
   uint32_t densify_from = 300;
@@ -275,6 +277,9 @@ class Trainer {
   bool refines_pose_at(uint32_t step) const;
   // Adam step on `frame`'s pose correction from the gradient slot `slot` left.
   void update_pose(uint32_t slot, size_t frame, float lr_scale);
+  struct PoseFix;
+  void pose_gradient(uint32_t slot, double grad[6]) const;  // dL/dd, dL/dw summed over workgroups
+  static void apply_pose_step(PoseFix& fix, const double step[6]);
   void update_pose_stats();
   void run_batch(uint32_t count);
   void next_view(size_t& frame, float background[3]);

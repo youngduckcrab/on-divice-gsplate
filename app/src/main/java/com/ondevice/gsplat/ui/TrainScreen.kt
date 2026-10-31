@@ -227,9 +227,9 @@ private fun SettingsCard(vm: TrainViewModel) {
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
-                    Text("카메라 위치 보정 (실험)")
+                    Text("카메라 위치 보정")
                     Text(
-                        "학습하면서 사진마다 카메라 위치·방향의 작은 오차를 고침 (실제 촬영용)",
+                        "학습하면서 사진마다 카메라 위치·방향의 작은 오차를 고침. 직접 찍은 스캔은 기본으로 켜짐",
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
