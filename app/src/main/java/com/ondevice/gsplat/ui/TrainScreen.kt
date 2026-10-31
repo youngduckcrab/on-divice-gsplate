@@ -225,6 +225,20 @@ private fun SettingsCard(vm: TrainViewModel) {
                     onCheckedChange = { vm.useMasks = it },
                 )
             }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("카메라 위치 보정 (실험)")
+                    Text(
+                        "학습하면서 사진마다 카메라 위치·방향의 작은 오차를 고침 (실제 촬영용)",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Switch(
+                    checked = vm.refinePoses,
+                    enabled = !vm.running,
+                    onCheckedChange = { vm.refinePoses = it },
+                )
+            }
         }
     }
 }

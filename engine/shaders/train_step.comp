@@ -5,6 +5,11 @@
 // densification statistics, and take an Adam step on the 16 parameters. The
 // SH coefficients' step is train_step_sh, one thread per float, from the
 // colour gradient and view direction left in sh_input.
+//
+// With kFlagPoseGrad it also sums, per workgroup, the gradient with respect
+// to a small change of the camera pose: world -> camera becomes
+// [(I + [w]x) W | (I + [w]x) t + d], so a camera-space point t moves to
+// t + w x t + d. The trainer adds up the workgroups and moves the camera.
 layout(local_size_x = 128) in;
 
 #include "train_common.glsl"
@@ -20,6 +25,10 @@ layout(std430, binding = 7) readonly buffer Projected { vec4 projected[]; };
 layout(std430, binding = 8) buffer Stats { vec4 stats[]; };  // grad norm sum, visible count, max radius, abs grad sum
 layout(std430, binding = 9) readonly buffer Totals { uint totals[]; };  // [0] pairs this step
 layout(std430, binding = 10) writeonly buffer ShInput { vec4 sh_input[]; };  // 2 per slot: dL/dcolour, view direction
+layout(std430, binding = 11) writeonly buffer PoseGrad { vec4 pose_grad[]; };  // 2 per workgroup: dL/dd, dL/dw
+
+shared vec3 s_grad_d[128];
+shared vec3 s_grad_w[128];
 
 vec4 adam(vec4 p, vec4 g, uint index, vec4 lr) {
   vec4 m = mix(g, m_params[index], frame.adam.x);
@@ -29,11 +38,8 @@ vec4 adam(vec4 p, vec4 g, uint index, vec4 lr) {
   return p - lr * (m * frame.bias.x) / (sqrt(v * frame.bias.y) + frame.adam.z);
 }
 
-void main() {
-  uint i = gl_GlobalInvocationID.x;
-  // More pairs than the buffers hold: some were dropped, so the gradients are
-  // incomplete. Leave everything as it was; the trainer grows the buffers.
-  if (i >= frame.model.x || totals[0] > frame.limits.x) return;
+// One gaussian's step; its share of the camera pose gradient goes to grad_d, grad_w.
+void step_gaussian(uint i, bool pose_only, inout vec3 grad_d, inout vec3 grad_w) {
   vec4 p0 = params[i * 4u], p1 = params[i * 4u + 1u], q = params[i * 4u + 2u], p3 = params[i * 4u + 3u];
   if (p1.w < 0.5) return;  // free slot
 
@@ -52,12 +58,14 @@ void main() {
     // Densification statistics: the view-space positional gradient in NDC units.
     float width = float(frame.image.x), height = float(frame.image.y);
     vec2 ndc_scale = 0.5 * vec2(width, height);
-    vec4 st = stats[i];
-    st.x += length(dL_dmean * ndc_scale);
-    st.y += 1.0;
-    st.z = max(st.z, projected[i * 4u + 1u].w);
-    st.w += length(a2.yz * ndc_scale);
-    stats[i] = st;
+    if (!pose_only) {
+      vec4 st = stats[i];
+      st.x += length(dL_dmean * ndc_scale);
+      st.y += 1.0;
+      st.z = max(st.z, projected[i * 4u + 1u].w);
+      st.w += length(a2.yz * ndc_scale);
+      stats[i] = st;
+    }
 
     // Recompute the projection.
     vec3 p = p0.xyz;
@@ -148,6 +156,12 @@ void main() {
     dL_dp += transpose(W) * dL_dt;
     dp0.xyz = dL_dp;
 
+    // Camera pose: through the camera-space position (t moves by w x t + d)
+    // and through W in the covariance (T = J W, W moves by [w]x W).
+    grad_d += dL_dt;
+    mat3 GW = transpose(J) * dT * transpose(W);  // dL/dW W^T; GW[c][r] is row r, column c
+    grad_w += cross(t, dL_dt) + vec3(GW[1][2] - GW[2][1], GW[2][0] - GW[0][2], GW[0][1] - GW[1][0]);
+
     // 3D covariance -> scale and rotation.
     mat3 dM = 2.0 * dSigma * M;
     dp1.xyz = vec3(dot(dM[0], R[0]), dot(dM[1], R[1]), dot(dM[2], R[2])) * s;  // d/d(log scale)
@@ -164,6 +178,7 @@ void main() {
     dq = (dqn - qn * dot(qn, dqn)) / qlen;
   }
 
+  if (pose_only) return;
   vec4 lr0 = vec4(vec3(frame.lr0.x), frame.lr0.w);
   vec4 lr1 = vec4(vec3(frame.lr0.y), 0.0);
   params[i * 4u] = adam(p0, dp0, i * 4u, lr0);
@@ -173,4 +188,31 @@ void main() {
 
   sh_input[i * 2u] = sh_colour;
   sh_input[i * 2u + 1u] = sh_dir;
+}
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  uint flags = frame.model.w;
+  vec3 grad_d = vec3(0.0), grad_w = vec3(0.0);
+  // More pairs than the buffers hold: some were dropped, so the gradients are
+  // incomplete. Leave everything as it was; the trainer grows the buffers.
+  if (i < frame.model.x && totals[0] <= frame.limits.x) {
+    step_gaussian(i, (flags & kFlagPoseOnly) != 0u, grad_d, grad_w);
+  }
+  if ((flags & kFlagPoseGrad) == 0u) return;  // the same for the whole dispatch
+  uint l = gl_LocalInvocationID.x;
+  s_grad_d[l] = grad_d;
+  s_grad_w[l] = grad_w;
+  barrier();
+  for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+    if (l < stride) {
+      s_grad_d[l] += s_grad_d[l + stride];
+      s_grad_w[l] += s_grad_w[l + stride];
+    }
+    barrier();
+  }
+  if (l == 0u) {
+    pose_grad[gl_WorkGroupID.x * 2u] = vec4(s_grad_d[0], 0.0);
+    pose_grad[gl_WorkGroupID.x * 2u + 1u] = vec4(s_grad_w[0], 0.0);
+  }
 }

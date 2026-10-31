@@ -7,6 +7,7 @@
 //            [--reduction bucket|bucket2|subgroup|subgroup_scalar|subgroup_lane4|subgroup_lane1|serial_cut2|serial_cut|serial|shared]
 //            [--alternatives serial_cut2,subgroup_lane4,...] (timed on real steps; the fastest is kept)
 //            [--no-masks] [--preview <dir>] [--eval-every 1000] [--dssim 0.2 (0 = L1 only)] [--dssim-end L (ramp to L)] [--head-weight 3]
+//            [--refine-poses] [--pose-lr shift,turn] [--pose-from N] [--eval-pose-steps N] [--pose-out poses.json]
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -50,7 +51,8 @@ int main(int argc, char** argv) {
   uint32_t width = 360, eval_every = 1000, max_init = 150000;
   int reset_override = -1;
   float grad_threshold = -1.0f;
-  std::string preview;
+  std::string preview, pose_out;
+  int pose_from = -1;
   gs::TrainOptions options;
   uint32_t iterations = options.iterations;
   for (int i = 3; i < argc; ++i) {
@@ -93,6 +95,18 @@ int main(int argc, char** argv) {
         preview = next();
       } else if (arg == "--eval-every") {
         eval_every = std::atoi(next());
+      } else if (arg == "--refine-poses") {
+        options.refine_poses = true;
+      } else if (arg == "--pose-lr") {
+        if (std::sscanf(next(), "%f,%f", &options.lr_pose_shift, &options.lr_pose_turn) != 2) {
+          throw std::runtime_error("--pose-lr needs shift,turn");
+        }
+      } else if (arg == "--pose-from") {
+        pose_from = std::atoi(next());
+      } else if (arg == "--eval-pose-steps") {
+        options.eval_pose_steps = std::atoi(next());
+      } else if (arg == "--pose-out") {
+        pose_out = next();
       } else {
         std::fprintf(stderr, "unknown option %s\n", arg.c_str());
         return 2;
@@ -131,6 +145,7 @@ int main(int argc, char** argv) {
     options.densify_until = defaults.densify_until;
     options.opacity_reset_interval = defaults.opacity_reset_interval;
     options.sh_degree_interval = defaults.sh_degree_interval;
+    options.pose_from = pose_from >= 0 ? uint32_t(pose_from) : defaults.pose_from;
     if (reset_override >= 0) options.opacity_reset_interval = uint32_t(reset_override);
     if (grad_threshold >= 0.0f) options.densify_grad_threshold = grad_threshold;
     gs::VkContext ctx;
@@ -160,8 +175,14 @@ int main(int argc, char** argv) {
       }
       if (eval_every > 0 && (s.step % eval_every == 0 || trainer.finished())) {
         const gs::EvalResult e = trainer.evaluate();
-        std::printf("  eval: held-out PSNR %.2f dB, SSIM %.4f over %u views; head PSNR %.2f dB over %u\n", e.psnr,
+        std::printf("  eval: held-out PSNR %.2f dB, SSIM %.4f over %u views; head PSNR %.2f dB over %u", e.psnr,
                     e.ssim, e.views, e.head_psnr, e.head_views);
+        if (e.aligned) std::printf(" (poses aligned; %.2f dB at the given poses)", e.psnr_unaligned);
+        std::printf("\n");
+        if (options.refine_poses) {
+          std::printf("  poses: %u updates, shift mean %.2f max %.2f cm, turn mean %.3f max %.3f deg\n", s.pose_updates,
+                      100.0 * s.pose_shift_mean, 100.0 * s.pose_shift_max, s.pose_turn_mean, s.pose_turn_max);
+        }
         if (!preview.empty()) {
           for (size_t f = 0; f < ds.frames.size(); f += ds.frames.size() / 4) {
             const float black[3] = {0, 0, 0};
@@ -178,6 +199,25 @@ int main(int argc, char** argv) {
       std::printf("backward timing at step %u:", r.step);
       for (const auto& [name, ms] : r.ms) std::printf("  %s %.1f", name.c_str(), ms);
       std::printf("  -> %s\n", r.chosen.c_str());
+    }
+    if (!pose_out.empty()) {
+      // Every frame's camera-to-world (OpenGL axes, row-major) after refinement.
+      std::ofstream poses(pose_out);
+      poses.precision(9);
+      poses << "{\"frames\": [";
+      for (size_t f = 0; f < trainer.dataset().frames.size(); ++f) {
+        const gs::Camera c = trainer.camera_for(f);
+        poses << (f ? "," : "") << "\n{\"file_path\": \"" << trainer.dataset().frames[f].name
+              << "\", \"holdout\": " << (trainer.dataset().frames[f].holdout ? "true" : "false")
+              << ", \"transform_matrix\": [";
+        for (int r = 0; r < 3; ++r) {
+          // c2w_gl: columns W^T e0, -W^T e1, -W^T e2, and the centre.
+          poses << (r ? "," : "") << "[" << c.rotation[0 * 3 + r] << "," << -c.rotation[1 * 3 + r] << ","
+                << -c.rotation[2 * 3 + r] << "," << c.position[r] << "]";
+        }
+        poses << ",[0,0,0,1]]}";
+      }
+      poses << "\n]}\n";
     }
     gs::SplatScene out = trainer.export_scene();
     gs::convert_convention(out, gs::AxisConvention::RDF);  // what .ply readers expect

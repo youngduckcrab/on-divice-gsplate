@@ -246,6 +246,68 @@ void test_bucket_refit(gs::VkContext& ctx) {
   EXPECT(t.stats().overflow_steps == 0, "%u overflow steps", t.stats().overflow_steps);
 }
 
+void test_pose_gradient(gs::VkContext& ctx, float lambda) {
+  // Moving the camera is moving every gaussian the other way, so the pose
+  // gradient summed in train_step must equal what the per-gaussian gradients
+  // (checked against the CPU reference above) imply. A shift d moves the
+  // camera-space positions by d: dL/dd = W sum dL/dp. A turn w about the
+  // camera centre c is the gaussians turning by W^T w about c, positions and
+  // orientations: dL/dw = W sum((p - c) x dL/dp + tau), tau the orientation's
+  // share. (Finite differences of the renderer do not work here: a camera
+  // move shifts every footprint's alpha cutoff at once, a jump the analytic
+  // gradient, like 3DGS's, leaves out.) SH degree 0: colour does not depend
+  // on the view direction, which the pose gradient leaves out.
+  gs::Dataset ds = gs::make_test_dataset(kWidth, kHeight, 2, true, 3);
+  gs::SplatScene scene = gs::make_test_scene(120, 0, 9);
+  const float bg[3] = {0.2f, 0.3f, 0.4f};
+  gs::TrainOptions o = gs::frozen_train_options(0, true);
+  o.lambda_dssim = o.lambda_dssim_end = lambda;
+  o.refine_poses = true;
+  o.pose_from = 0;
+  o.lr_pose_shift = o.lr_pose_turn = 0.0f;  // measure only
+  gs::Trainer t(ctx, ds, scene, o);
+  t.step_on(0, bg);
+  const double* g = t.last_pose_gradient();
+  const gs::Trainer::Gradients grads = t.first_step_gradients();
+  const gs::Camera cam = gs::dataset_camera(ds, ds.frames[0]);
+  double sum_d[3] = {0, 0, 0}, sum_w[3] = {0, 0, 0};
+  for (uint32_t i = 0; i < scene.count; ++i) {
+    const float* gp = &grads.params[size_t(i) * 16];
+    double rel[3];
+    for (int k = 0; k < 3; ++k) {
+      sum_d[k] += gp[k];
+      rel[k] = double(scene.positions[i * 3 + k]) - cam.position[k];
+    }
+    sum_w[0] += rel[1] * gp[2] - rel[2] * gp[1];
+    sum_w[1] += rel[2] * gp[0] - rel[0] * gp[2];
+    sum_w[2] += rel[0] * gp[1] - rel[1] * gp[0];
+    // Orientation (w, x, y, z): q -> (1, phi / 2) q, so dL/dphi = (-g_w u + w g_u + u x g_u) / 2
+    // with q = (w, u) normalised and g the gradient's tangent part (train_step's dq times |q|).
+    const float* q = &scene.rotations[i * 4];
+    const double len = std::sqrt(double(q[0]) * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    const double w = q[0] / len, u[3] = {q[1] / len, q[2] / len, q[3] / len};
+    const double gw = gp[8] * len, gu[3] = {gp[9] * len, gp[10] * len, gp[11] * len};
+    const double ug[3] = {u[1] * gu[2] - u[2] * gu[1], u[2] * gu[0] - u[0] * gu[2], u[0] * gu[1] - u[1] * gu[0]};
+    for (int k = 0; k < 3; ++k) sum_w[k] += 0.5 * (-gw * u[k] + w * gu[k] + ug[k]);
+  }
+  double expected[6], worst = 0.0, largest = 0.0;
+  for (int r = 0; r < 3; ++r) {
+    expected[r] = expected[3 + r] = 0.0;
+    for (int c = 0; c < 3; ++c) {
+      expected[r] += cam.rotation[r * 3 + c] * sum_d[c];
+      expected[3 + r] += cam.rotation[r * 3 + c] * sum_w[c];
+    }
+  }
+  std::printf("  pose gradient (lambda %.1f):", lambda);
+  for (int k = 0; k < 6; ++k) {
+    std::printf(" %s%c %.4g/%.4g", k < 3 ? "d" : "w", "xyz"[k % 3], g[k], expected[k]);
+    worst = std::max(worst, std::fabs(g[k] - expected[k]));
+    largest = std::max(largest, std::fabs(expected[k]));
+  }
+  std::printf("\n");
+  EXPECT(largest > 0.0 && worst <= 1e-3 * largest, "pose gradient off by %.3g (largest %.3g)", worst, largest);
+}
+
 void test_batched_matches_single(gs::VkContext& ctx) {
   // Steps recorded kBatch to a submission (pair count read on the GPU) must
   // train exactly like steps run one at a time. Densification places new
@@ -553,6 +615,8 @@ int main() {
     test_footprint(ctx);
     test_retune(ctx);
     test_bucket_refit(ctx);
+    test_pose_gradient(ctx, 0.0f);
+    test_pose_gradient(ctx, 0.5f);
     test_batched_matches_single(ctx);
     test_pair_overflow_retry(ctx);
     test_probes(ctx);

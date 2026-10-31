@@ -46,6 +46,8 @@ bool in_head(vec4 head, vec2 p) { return head.z > 0.0 && length(p - head.xy) <= 
 const uint kFlagMaskedTarget = 1u;  // composite the target over the background using its alpha
 const uint kFlagBucketState = 2u;   // the forward pass saves state for train_backward_bucket
 const uint kFlagSsim = 4u;          // the forward pass saves render and target colours for train_ssim
+const uint kFlagPoseGrad = 8u;      // train_step sums the gradient of the camera pose, per workgroup
+const uint kFlagPoseOnly = 16u;     // only that gradient: no parameter, moment or statistics updates
 
 // SSIM window: 11x11 Gaussian, sigma 1.5, separable (as in 3D Gaussian Splatting).
 const int kSsimRadius = 5;

@@ -8,7 +8,8 @@ package com.ondevice.gsplat
 object NativeTrainer {
     /**
      * Loads the dataset folder (transforms.json) at [width] px, initialises gaussians
-     * and allocates the trainer. Returns dataset info, init stats and timings.
+     * and allocates the trainer. With [refinePoses] the camera poses are corrected
+     * while training. Returns dataset info, init stats and timings.
      */
     external fun prepare(
         datasetDir: String,
@@ -17,6 +18,7 @@ object NativeTrainer {
         maxGaussians: Int,
         shDegree: Int,
         masked: Boolean,
+        refinePoses: Boolean,
     ): String
 
     /** Runs up to [count] steps. With [profile], the first one reports GPU ms per pass. */

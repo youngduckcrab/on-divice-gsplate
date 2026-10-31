@@ -295,6 +295,12 @@ void write_stats(gs::JsonWriter& w, const gs::Trainer& t) {
   w.field("tile_mismatch", s.tile_mismatch);
   w.field("finished", t.finished());
   w.field("overflow_steps", s.overflow_steps);
+  w.field("refine_poses", t.options().refine_poses);
+  w.field("pose_updates", s.pose_updates);
+  w.field("pose_shift_mean", s.pose_shift_mean);
+  w.field("pose_shift_max", s.pose_shift_max);
+  w.field("pose_turn_mean", s.pose_turn_mean);
+  w.field("pose_turn_max", s.pose_turn_max);
   w.key("timing").begin_object();
   w.field("wall", s.timing.wall_ms);
   w.field("gpu", s.timing.gpu_ms);
@@ -318,7 +324,8 @@ void write_stats(gs::JsonWriter& w, const gs::Trainer& t) {
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, jstring jdir, jint width,
-                                               jint iterations, jint max_gaussians, jint sh_degree, jboolean masked) {
+                                               jint iterations, jint max_gaussians, jint sh_degree, jboolean masked,
+                                               jboolean refine_poses) {
   const std::string dir = from_jstring(env, jdir);
   std::lock_guard<std::mutex> lock(g_train_mutex);
   try {
@@ -354,6 +361,7 @@ Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, js
     options.max_gaussians = static_cast<uint32_t>(max_gaussians);
     options.sh_degree = sh_degree;
     options.masked = masked == JNI_TRUE;
+    options.refine_poses = refine_poses == JNI_TRUE;
     const auto t1 = Clock::now();
     gs::InitOptions init;
     init.max_gaussians = std::min<uint32_t>(options.max_gaussians / 2, 150000);
@@ -467,7 +475,7 @@ Java_com_ondevice_gsplat_NativeTrainer_preview(JNIEnv* env, jobject /*this*/, ji
       const gs::Dataset& ds = t.dataset();
       const size_t frame = g_train->preview_frames[size_t(index) % g_train->preview_frames.size()];
       const float bg[3] = {0.08f, 0.09f, 0.11f};
-      render = t.render(gs::dataset_camera(ds, ds.frames[frame]), bg);
+      render = t.render(t.camera_for(frame), bg);
       target = ds.frames[frame].rgba;
       const bool masked = t.options().masked;
       for (size_t p = 0; p < target.size() / 4; ++p) {
@@ -510,6 +518,8 @@ Java_com_ondevice_gsplat_NativeTrainer_evaluate(JNIEnv* env, jobject /*this*/) {
     w.field("head_views", e.head_views);
     w.field("l1", e.l1);
     w.field("views", e.views);
+    w.field("aligned", e.aligned);
+    w.field("psnr_unaligned", e.psnr_unaligned);
     w.field("ms", ms_since(t0));
     w.end_object();
     return w.str();

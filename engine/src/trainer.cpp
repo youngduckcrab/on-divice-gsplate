@@ -64,6 +64,8 @@ constexpr float kEpsilon = 1e-15f;
 constexpr uint32_t kFlagMaskedTarget = 1;
 constexpr uint32_t kFlagBucketState = 2;
 constexpr uint32_t kFlagSsim = 4;
+constexpr uint32_t kFlagPoseGrad = 8;
+constexpr uint32_t kFlagPoseOnly = 16;
 constexpr uint32_t kBucketLanes = 32;   // splats per bucket (train_backward_bucket.comp)
 constexpr uint32_t kBucketGroups = 8;   // buckets per workgroup
 constexpr uint32_t kScanBlock = 1024;
@@ -99,6 +101,7 @@ TrainOptions scaled_options(uint32_t iterations) {
   o.densify_until = uint32_t(o.densify_until * scale);
   o.opacity_reset_interval = uint32_t(o.opacity_reset_interval * scale);
   o.sh_degree_interval = std::max(1u, uint32_t(o.sh_degree_interval * scale));
+  o.pose_from = uint32_t(o.pose_from * scale);
   return o;
 }
 
@@ -152,7 +155,7 @@ Trainer::Trainer(VkContext& ctx, Dataset dataset, const SplatScene& initial, con
   ssim_ = make("train_ssim", shaders::train_ssim, 4, 0);
   ssim_grad_ = make("train_ssim_grad", shaders::train_ssim_grad, 5, 0);
   pair_sum_ = make("train_pair_sum", shaders::train_pair_sum, 6, 0);
-  step_ = make("train_step", shaders::train_step, 11, 0);
+  step_ = make("train_step", shaders::train_step, 12, 0);
   step_sh_ = make("train_step_sh", shaders::train_step_sh, 7, 0);
   densify_mark_ = make("train_densify_mark", shaders::train_densify_mark, 11, 0);
   densify_spawn_ = make("train_densify_spawn", shaders::train_densify_spawn, 11, sizeof(uint32_t));
@@ -261,7 +264,9 @@ Trainer::Trainer(VkContext& ctx, Dataset dataset, const SplatScene& initial, con
     targets_.push_back(ctx.create_buffer(pixels * 4, MemoryKind::Upload));
     readback_smalls_.push_back(ctx.create_buffer(16, MemoryKind::Readback));
     readback_losses_.push_back(ctx.create_buffer(tiles * 32, MemoryKind::Readback));
+    pose_grads_.push_back(ctx.create_buffer(std::max<uint64_t>(div_up(cap, 128), 1) * 32, MemoryKind::Readback));
   }
+  pose_fix_.resize(dataset_.frames.size());
   // Persistent descriptor sets: per batch slot about 16 pipelines (and one
   // per backward variant), up to 14 buffers each.
   set_pool_ = ctx.create_descriptor_pool(64 + kBatch * 32, 512 + kBatch * 384);
@@ -347,7 +352,7 @@ uint32_t Trainer::sh_degree_at(uint32_t step) const {
 }
 
 void Trainer::write_frame(uint32_t slot, const Camera& camera, const float background[3], bool masked_target,
-                          uint32_t step, bool bucket_state, bool ssim) {
+                          uint32_t step, bool bucket_state, bool ssim, uint32_t pose_flags) {
   FrameData f{};
   for (int r = 0; r < 3; ++r) {
     for (int c = 0; c < 3; ++c) f.rot[r][c] = camera.rotation[r * 3 + c];
@@ -366,7 +371,7 @@ void Trainer::write_frame(uint32_t slot, const Camera& camera, const float backg
   f.model[1] = sh_degree_at(step);
   f.model[2] = sh_stride_;
   f.model[3] = (masked_target ? kFlagMaskedTarget : 0) | (bucket_state ? kFlagBucketState : 0) |
-               (ssim ? kFlagSsim : 0);
+               (ssim ? kFlagSsim : 0) | pose_flags;
   for (int c = 0; c < 3; ++c) f.background[c] = background[c];
   f.background[3] = 1.0f / (3.0f * float(width_) * float(height_));
 
@@ -607,7 +612,7 @@ void Trainer::record_optimize(VkCommandBuffer cmd, uint32_t slot, int part) {
   if (part == 0 || part == 2) {
     kernel(cmd, step_,
            {&frames_[slot], &params_, &sh_, &m_params_, &v_params_, &tiles_, &grad_sum_, &projected_, &stats_buf_,
-            &totals_, &sh_input_},
+            &totals_, &sh_input_, &pose_grads_[slot]},
            div_up(slots_, 128));
     VkContext::barrier(cmd);
   }
@@ -645,7 +650,7 @@ void Trainer::set_view_stats() {
 }
 
 void Trainer::run_view(const Camera& camera, const uint8_t* target, const float background[3], bool masked_target,
-                       bool train, bool profile, bool retune, bool ssim) {
+                       bool train, bool profile, bool retune, bool ssim, uint32_t pose_flags) {
   stats_.sh_degree = int(sh_degree_at(stats_.step));
   const bool ssim_grad = train && uses_ssim();
   ssim = ssim || ssim_grad;
@@ -655,7 +660,8 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
     reserve_pairs(max_pairs_seen_ > 0          ? max_pairs_seen_
                   : options_.initial_pair_guess ? options_.initial_pair_guess
                                                 : uint64_t(slots_) * 4);
-    write_frame(0, camera, background, masked_target, stats_.step, needs_bucket_state(train, retune), ssim);
+    write_frame(0, camera, background, masked_target, stats_.step, needs_bucket_state(train, retune), ssim,
+                train ? pose_flags : 0);
 
     if (!profile && !retune) {
       // Everything in one submission; the passes read the pair count on the GPU.
@@ -785,8 +791,13 @@ void Trainer::after_step() {
 void Trainer::step_on(size_t frame_index, const float background[3], bool profile) {
   const auto start = std::chrono::steady_clock::now();
   const DatasetFrame& frame = dataset_.frames.at(frame_index);
-  run_view(dataset_camera(dataset_, frame), frame.rgba.data(), background, options_.masked, true, profile,
-           retune_due(stats_.step + 1));
+  const bool pose = refines_pose_at(stats_.step);
+  run_view(camera_for(frame_index), frame.rgba.data(), background, options_.masked, true, profile,
+           retune_due(stats_.step + 1), false, pose ? kFlagPoseGrad : 0);
+  if (pose) {
+    update_pose(0, frame_index, 1.0f);
+    update_pose_stats();
+  }
   last_slot_ = 0;
   set_view_stats();
   ++stats_.step;
@@ -832,12 +843,15 @@ void Trainer::run_batch(uint32_t count) {
   const size_t backward = backward_to_run();
   const bool buckets = needs_bucket_state(true, false);
   const bool ssim = uses_ssim();
+  size_t frames[kBatch];
+  bool pose[kBatch];
   for (uint32_t s = 0; s < count; ++s) {
-    size_t frame = 0;
     float bg[3];
-    next_view(frame, bg);
-    const DatasetFrame& f = dataset_.frames.at(frame);
-    write_frame(s, dataset_camera(dataset_, f), bg, options_.masked, stats_.step + s, buckets, ssim);
+    next_view(frames[s], bg);
+    pose[s] = refines_pose_at(stats_.step + s);
+    const DatasetFrame& f = dataset_.frames.at(frames[s]);
+    write_frame(s, camera_for(frames[s]), bg, options_.masked, stats_.step + s, buckets, ssim,
+                pose[s] ? kFlagPoseGrad : 0);
     std::memcpy(targets_[s].mapped(), f.rgba.data(), size_t(width_) * height_ * 4);
   }
   const RunTiming time = ctx_.run([&](VkCommandBuffer cmd) {
@@ -851,13 +865,20 @@ void Trainer::run_batch(uint32_t count) {
     }
     VkContext::barrier_to_host(cmd);
   });
+  bool moved = false;
   for (uint32_t s = 0; s < count; ++s) {
     // A step whose pairs did not fit left the model alone; later ones went on.
-    if (read_slot(s)) ++stats_.overflow_steps;
+    const bool overflow = read_slot(s);
+    if (overflow) ++stats_.overflow_steps;
+    if (pose[s] && !overflow) {
+      update_pose(s, frames[s], 1.0f);
+      moved = true;
+    }
     set_view_stats();
     stats_.sh_degree = int(sh_degree_at(stats_.step));
     ++stats_.step;
   }
+  if (moved) update_pose_stats();
   last_slot_ = count - 1;
   after_step();  // only the last step of a batch can have any
   // Moving averages as if each step had been timed alone.
@@ -936,28 +957,150 @@ std::vector<uint8_t> Trainer::render(const Camera& camera, const float backgroun
 EvalResult Trainer::evaluate() {
   EvalResult result;
   const float black[3] = {0.0f, 0.0f, 0.0f};
-  double psnr_sum = 0.0, l1_sum = 0.0, ssim_sum = 0.0, head_sum = 0.0;
   const double n = 3.0 * width_ * height_;
-  for (const DatasetFrame& frame : dataset_.frames) {
-    if (!frame.holdout) continue;
-    run_view(dataset_camera(dataset_, frame), frame.rgba.data(), black, options_.masked, false, false, false, true);
-    const double abs_sum = last_losses_[0], sq_sum = last_losses_[1];
-    psnr_sum += -10.0 * std::log10(std::max(sq_sum / n, 1e-12));
-    l1_sum += abs_sum / n;
-    ssim_sum += last_losses_[2] / n;
+  auto measure = [&](const Camera& camera, const DatasetFrame& frame, double sums[5]) {
+    run_view(camera, frame.rgba.data(), black, options_.masked, false, false, false, true);
+    sums[0] += -10.0 * std::log10(std::max(last_losses_[1] / n, 1e-12));
+    sums[1] += last_losses_[0] / n;
+    sums[2] += last_losses_[2] / n;
     if (last_losses_[7] > 0.0) {
-      head_sum += -10.0 * std::log10(std::max(last_losses_[6] / (3.0 * last_losses_[7]), 1e-12));
-      ++result.head_views;
+      sums[3] += -10.0 * std::log10(std::max(last_losses_[6] / (3.0 * last_losses_[7]), 1e-12));
+      sums[4] += 1.0;
     }
+  };
+  const bool align = options_.refine_poses && options_.eval_pose_steps > 0;
+  double sums[5] = {0, 0, 0, 0, 0}, unaligned[5] = {0, 0, 0, 0, 0};
+  for (size_t i = 0; i < dataset_.frames.size(); ++i) {
+    const DatasetFrame& frame = dataset_.frames[i];
+    if (!frame.holdout) continue;
+    if (align) {
+      // The model was fitted to corrected poses: give each held-out view the
+      // same chance, moving only its camera (quicker steps: it starts afresh).
+      measure(dataset_camera(dataset_, frame), frame, unaligned);
+      for (uint32_t k = 0; k < options_.eval_pose_steps; ++k) {
+        run_view(camera_for(i), frame.rgba.data(), black, options_.masked, true, false, false, uses_ssim(),
+                 kFlagPoseGrad | kFlagPoseOnly);
+        update_pose(0, i, 3.0f);
+      }
+    }
+    measure(camera_for(i), frame, sums);
     ++result.views;
   }
   if (result.views > 0) {
-    result.psnr = psnr_sum / result.views;
-    result.ssim = ssim_sum / result.views;
-    result.head_psnr = result.head_views > 0 ? head_sum / result.head_views : 0.0;
-    result.l1 = l1_sum / result.views;
+    result.psnr = sums[0] / result.views;
+    result.l1 = sums[1] / result.views;
+    result.ssim = sums[2] / result.views;
+    result.head_views = uint32_t(sums[4]);
+    result.head_psnr = sums[4] > 0.0 ? sums[3] / sums[4] : 0.0;
+    result.aligned = align;
+    result.psnr_unaligned = align ? unaligned[0] / result.views : result.psnr;
   }
   return result;
+}
+
+namespace {
+
+// exp([w]x): rotation by |w| radians about w, row-major.
+void rotation_from(const double w[3], double out[9]) {
+  const double theta = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+  const double K[9] = {0, -w[2], w[1], w[2], 0, -w[0], -w[1], w[0], 0};
+  double K2[9];
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) K2[r * 3 + c] = K[r * 3] * K[c] + K[r * 3 + 1] * K[3 + c] + K[r * 3 + 2] * K[6 + c];
+  }
+  const double a = theta > 1e-9 ? std::sin(theta) / theta : 1.0;
+  const double b = theta > 1e-9 ? (1.0 - std::cos(theta)) / (theta * theta) : 0.5;
+  for (int i = 0; i < 9; ++i) out[i] = (i % 4 == 0 ? 1.0 : 0.0) + a * K[i] + b * K2[i];
+}
+
+}  // namespace
+
+Camera Trainer::camera_for(size_t frame) const {
+  Camera cam = dataset_camera(dataset_, dataset_.frames.at(frame));
+  if (frame >= pose_fix_.size() || pose_fix_[frame].updates == 0) return cam;
+  const PoseFix& p = pose_fix_[frame];
+  // World -> camera [R | t] becomes [E R | E t + d].
+  float rot[9], t[3];
+  for (int r = 0; r < 3; ++r) {
+    t[r] = p.shift[r];
+    for (int c = 0; c < 3; ++c) {
+      rot[r * 3 + c] = 0.0f;
+      for (int k = 0; k < 3; ++k) rot[r * 3 + c] += p.rotation[r * 3 + k] * cam.rotation[k * 3 + c];
+      t[r] += p.rotation[r * 3 + c] * cam.translation[c];
+    }
+  }
+  std::copy(rot, rot + 9, cam.rotation);
+  std::copy(t, t + 3, cam.translation);
+  for (int c = 0; c < 3; ++c) cam.position[c] = -(rot[c] * t[0] + rot[3 + c] * t[1] + rot[6 + c] * t[2]);
+  return cam;
+}
+
+bool Trainer::refines_pose_at(uint32_t step) const { return options_.refine_poses && step >= options_.pose_from; }
+
+void Trainer::update_pose(uint32_t slot, size_t frame, float lr_scale) {
+  // Sum the workgroups' shares (train_step): dL/dd, then dL/dw.
+  const uint32_t groups = div_up(slots_, 128u);
+  const float* g = static_cast<const float*>(pose_grads_[slot].mapped());
+  double grad[6] = {0, 0, 0, 0, 0, 0};
+  for (uint32_t k = 0; k < groups; ++k) {
+    for (int c = 0; c < 3; ++c) {
+      grad[c] += g[k * 8 + c];
+      grad[3 + c] += g[k * 8 + 4 + c];
+    }
+  }
+  std::copy(grad, grad + 6, last_pose_grad_);
+  PoseFix& p = pose_fix_.at(frame);
+  ++p.updates;
+  const double c1 = 1.0 / (1.0 - std::pow(double(kBeta1), double(p.updates)));
+  const double c2 = 1.0 / (1.0 - std::pow(double(kBeta2), double(p.updates)));
+  double step[6];
+  for (int i = 0; i < 6; ++i) {
+    p.m[i] = kBeta1 * p.m[i] + (1.0 - kBeta1) * grad[i];
+    p.v[i] = kBeta2 * p.v[i] + (1.0 - kBeta2) * grad[i] * grad[i];
+    const double lr = (i < 3 ? options_.lr_pose_shift * dataset_.camera_extent : options_.lr_pose_turn) * lr_scale;
+    step[i] = p.v[i] > 0.0 ? -lr * (p.m[i] * c1) / (std::sqrt(p.v[i] * c2) + 1e-30) : 0.0;
+  }
+  // The step applies after the current correction: [R | s] <- [E | d] [R | s].
+  double E[9];
+  rotation_from(step + 3, E);
+  float rot[9], shift[3];
+  for (int r = 0; r < 3; ++r) {
+    shift[r] = float(step[r]);
+    for (int c = 0; c < 3; ++c) {
+      double v = 0.0;
+      for (int k = 0; k < 3; ++k) v += E[r * 3 + k] * p.rotation[k * 3 + c];
+      rot[r * 3 + c] = float(v);
+      shift[r] += float(E[r * 3 + c] * p.shift[c]);
+    }
+  }
+  std::copy(rot, rot + 9, p.rotation);
+  std::copy(shift, shift + 3, p.shift);
+}
+
+void Trainer::update_pose_stats() {
+  double shift_sum = 0.0, turn_sum = 0.0, shift_max = 0.0, turn_max = 0.0;
+  uint32_t n = 0, updates = 0;
+  for (size_t i : train_frames_) {
+    const PoseFix& p = pose_fix_[i];
+    if (p.updates == 0) continue;
+    const Camera a = dataset_camera(dataset_, dataset_.frames[i]), b = camera_for(i);
+    double d2 = 0.0;
+    for (int k = 0; k < 3; ++k) d2 += double(b.position[k] - a.position[k]) * (b.position[k] - a.position[k]);
+    const double shift = std::sqrt(d2);
+    const double trace = double(p.rotation[0]) + p.rotation[4] + p.rotation[8];
+    const double turn = std::acos(std::clamp((trace - 1.0) / 2.0, -1.0, 1.0)) * 180.0 / M_PI;
+    shift_sum += shift;
+    turn_sum += turn;
+    shift_max = std::max(shift_max, shift);
+    turn_max = std::max(turn_max, turn);
+    updates += p.updates;
+    ++n;
+  }
+  stats_.pose_shift_mean = n ? shift_sum / n : 0.0;
+  stats_.pose_turn_mean = n ? turn_sum / n : 0.0;
+  stats_.pose_shift_max = shift_max;
+  stats_.pose_turn_max = turn_max;
+  stats_.pose_updates = updates;
 }
 
 SplatScene Trainer::export_scene() {

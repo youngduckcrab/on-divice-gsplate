@@ -65,6 +65,18 @@ struct TrainOptions {
   HeadRegion head;
   float head_weight = 1.0f;
 
+  // Camera pose refinement. Phone poses (ARCore) are off by up to
+  // centimetres, which blurs and doubles the model. Each training view gets
+  // a small correction (a rotation and a shift in its camera's axes), taken
+  // by Adam from the same backward pass whenever the view is trained on, from
+  // step `pose_from`. Before evaluation each held-out view is aligned the same
+  // way with `eval_pose_steps` steps that move only its camera.
+  bool refine_poses = false;
+  uint32_t pose_from = 300;
+  float lr_pose_shift = 1e-3f;   // per update, times the camera extent
+  float lr_pose_turn = 1e-3f;    // radians per update
+  uint32_t eval_pose_steps = 10;
+
   // Adaptive density control.
   uint32_t densify_from = 300;
   uint32_t densify_until = 2000;
@@ -134,6 +146,10 @@ struct TrainStats {
   // Steps in a batch whose pairs did not fit the buffers (sized from earlier
   // steps, with headroom): their update was skipped, and the buffers grew.
   uint32_t overflow_steps = 0;
+  // Pose refinement: the corrections of the training views so far.
+  double pose_shift_mean = 0.0, pose_shift_max = 0.0;  // dataset units (metres for captures)
+  double pose_turn_mean = 0.0, pose_turn_max = 0.0;    // degrees
+  uint32_t pose_updates = 0;
   // Moving averages per training step: wall clock around the submit + wait,
   // GPU time from timestamps, and steps per submission.
   struct Timing {
@@ -151,7 +167,9 @@ struct RetuneResult {
 };
 
 struct EvalResult {
-  double psnr = 0.0;  // mean over the held-out views
+  double psnr = 0.0;  // mean over the held-out views (aligned first when refining poses)
+  bool aligned = false;
+  double psnr_unaligned = 0.0;  // at the poses as given, when aligned
   double ssim = 0.0;
   double head_psnr = 0.0;  // within the head circle, over the views that show it
   uint32_t head_views = 0;
@@ -192,6 +210,8 @@ class Trainer {
   std::vector<uint8_t> render(const Camera& camera, const float background[3]);
   // Held-out views over a black background.
   EvalResult evaluate();
+  // A view's camera with its pose correction (the dataset's pose without refinement).
+  Camera camera_for(size_t frame) const;
   // The alive gaussians, in the dataset's world (Y-up, RUB).
   SplatScene export_scene();
 
@@ -224,6 +244,8 @@ class Trainer {
   const std::vector<RetuneResult>& retunes() const { return retunes_; }
   // Testing: makes the named variant (one of those created) the active one.
   bool select_backward(const std::string& name);
+  // Testing: the pose gradient of the latest pose update: dL/dd xyz, dL/dw xyz.
+  const double* last_pose_gradient() const { return last_pose_grad_; }
 
   static constexpr uint32_t kTileSize = 16;
 
@@ -241,7 +263,7 @@ class Trainer {
   // Per-step inputs live in slot `slot` of frames_/targets_; `step` (0-based)
   // sets the learning-rate schedule, SH degree and seed.
   void write_frame(uint32_t slot, const Camera& camera, const float background[3], bool masked_target,
-                   uint32_t step, bool bucket_state, bool ssim);
+                   uint32_t step, bool bucket_state, bool ssim, uint32_t pose_flags = 0);
   uint32_t sh_degree_at(uint32_t step) const;
   float lambda_at(uint32_t step) const;  // the D-SSIM weight of a step
   bool uses_ssim() const;                // any step has a D-SSIM part
@@ -249,7 +271,11 @@ class Trainer {
   // With `retune`, every backward variant is timed on this step (implies profiling).
   // With `ssim`, also measures SSIM (training does whenever lambda_dssim > 0).
   void run_view(const Camera& camera, const uint8_t* target, const float background[3], bool masked_target,
-                bool train, bool profile = false, bool retune = false, bool ssim = false);
+                bool train, bool profile = false, bool retune = false, bool ssim = false, uint32_t pose_flags = 0);
+  bool refines_pose_at(uint32_t step) const;
+  // Adam step on `frame`'s pose correction from the gradient slot `slot` left.
+  void update_pose(uint32_t slot, size_t frame, float lr_scale);
+  void update_pose_stats();
   void run_batch(uint32_t count);
   void next_view(size_t& frame, float background[3]);
   bool housekeeping_after(uint32_t step) const;  // densification or opacity reset after this step
@@ -330,6 +356,15 @@ class Trainer {
   Buffer ssim_input_, ssim_maps_;  // per pixel: render and target colour; SSIM gradient parts A, B, C
   Buffer dispatch_args_buf_;  // indirect group counts of the passes over pairs (train_dispatch_args)  // per slot: summed pair gradients; colour gradient and view direction
   std::vector<Buffer> readback_smalls_, readback_losses_;  // per batch slot
+  std::vector<Buffer> pose_grads_;  // per batch slot: 2 vec4 per train_step workgroup
+  struct PoseFix {
+    float rotation[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};  // applied after the dataset's rotation (camera axes)
+    float shift[3] = {0, 0, 0};
+    double m[6] = {}, v[6] = {};  // Adam moments: shift xyz, turn xyz
+    uint32_t updates = 0;
+  };
+  std::vector<PoseFix> pose_fix_;  // per dataset frame
+  double last_pose_grad_[6] = {0, 0, 0, 0, 0, 0};
   Buffer readback_image_;
 };
 

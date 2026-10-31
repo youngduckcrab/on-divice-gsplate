@@ -60,6 +60,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         private set
     var preset by mutableStateOf(Preset.STANDARD)
     var useMasks by mutableStateOf(true)
+    var refinePoses by mutableStateOf(false)
     var phase by mutableStateOf(Phase.IDLE)
         private set
     var importProgress by mutableStateOf(0f)
@@ -189,6 +190,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         if (running || loadError != null) return
         val settings = preset
         val masked = useMasks && dataset.masks
+        val poses = refinePoses
         stopRequested = false
         prepared = null
         stats = null
@@ -214,7 +216,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
             thermal = thermalStart
             val prep = nativeCall {
                 NativeTrainer.prepare(
-                    dataset.dir.path, settings.width, settings.iterations, settings.maxGaussians, 3, masked,
+                    dataset.dir.path, settings.width, settings.iterations, settings.maxGaussians, 3, masked, poses,
                 )
             }
             if (!prep.optBoolean("ok")) return@launch fail("준비 실패: ${prep.optString("error")}")
@@ -419,6 +421,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                 appendLine(
                     "설정: ${preset.label} · ${prep.optInt("iterations")}회 · 최대 ${preset.maxGaussians / 1000}k · " +
                         "SH 3 · 배경 제거 ${ox(prep.optBoolean("masked"))} · " +
+                        "카메라 위치 보정 ${ox(prep.optBoolean("refine_poses"))} · " +
                         "손실 L1+D-SSIM (λ ${f1(prep.optDouble("lambda_start"))} → ${f1(prep.optDouble("lambda_end"))}) · " +
                         if (prep.optBoolean("head_found")) {
                             "머리 가중치 ${f1(prep.optDouble("head_weight"))}배 (반지름 " +
@@ -453,6 +456,13 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                         if (r?.stopped == true) " · 중간에 중지" else "",
                 )
             }
+            if (s != null && s.optBoolean("refine_poses") && s.optInt("pose_updates") > 0) {
+                appendLine(
+                    "카메라 위치 보정: ${s.optInt("pose_updates")}회 · 이동 평균 ${cm(s.optDouble("pose_shift_mean"))} " +
+                        "(최대 ${cm(s.optDouble("pose_shift_max"))}) · 회전 평균 ${deg(s.optDouble("pose_turn_mean"))} " +
+                        "(최대 ${deg(s.optDouble("pose_turn_max"))})",
+                )
+            }
             s?.optJSONObject("timing")?.let { t ->
                 appendLine(
                     "제출 ms/회 (벽시계/GPU): ${f1(t.optDouble("wall"))}/${f1(t.optDouble("gpu"))} · " +
@@ -478,7 +488,12 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
             evalJson?.let { e ->
                 if (e.optBoolean("ok")) {
                     appendLine(
-                        "결과: 검증 PSNR ${"%.2f".format(Locale.US, e.optDouble("psnr"))} dB · " +
+                        "결과: 검증 PSNR ${"%.2f".format(Locale.US, e.optDouble("psnr"))} dB" +
+                            (if (e.optBoolean("aligned")) {
+                                " (검증 사진도 위치 맞춘 뒤; 원래 위치로는 ${"%.2f".format(Locale.US, e.optDouble("psnr_unaligned"))} dB)"
+                            } else {
+                                ""
+                            }) + " · " +
                             "SSIM ${"%.4f".format(Locale.US, e.optDouble("ssim"))} (${e.optInt("views")}장) · " +
                             (if (e.optInt("head_views") > 0) {
                                 "머리 PSNR ${"%.2f".format(Locale.US, e.optDouble("head_psnr"))} dB (${e.optInt("head_views")}장) · "
@@ -570,6 +585,8 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun sec(ms: Double) = "%.1f s".format(Locale.US, ms / 1000.0)
 
+    private fun cm(m: Double) = "%.1f cm".format(Locale.US, m * 100)
+    private fun deg(d: Double) = "%.2f°".format(Locale.US, d)
     private fun f1(v: Double) = "%.1f".format(Locale.US, v)
 
     /** Training-view PSNR averaged over ten equal stretches of the run, e.g. "0-400: 18.2, 400-800: 22.5". */
