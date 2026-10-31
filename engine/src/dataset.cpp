@@ -63,6 +63,25 @@ size_t Dataset::train_count() const {
 
 size_t Dataset::holdout_count() const { return frames.size() - train_count(); }
 
+void compute_camera_bounds(Dataset& ds) {
+  if (ds.frames.empty()) return;
+  double sum[3] = {0, 0, 0};
+  for (const DatasetFrame& f : ds.frames) {
+    for (int k = 0; k < 3; ++k) sum[k] += f.c2w[k * 4 + 3];
+  }
+  for (int k = 0; k < 3; ++k) ds.camera_center[k] = float(sum[k] / ds.frames.size());
+  float max_dist = 0.0f;
+  for (const DatasetFrame& f : ds.frames) {
+    float d2 = 0.0f;
+    for (int k = 0; k < 3; ++k) {
+      const float d = f.c2w[k * 4 + 3] - ds.camera_center[k];
+      d2 += d * d;
+    }
+    max_dist = std::max(max_dist, std::sqrt(d2));
+  }
+  ds.camera_extent = std::max(1.1f * max_dist, 1e-3f);
+}
+
 Dataset load_dataset(const std::string& directory, uint32_t target_width) {
   const std::vector<uint8_t> text = read_file(join(directory, "transforms.json"));
   const JsonValue root = parse_json(std::string_view(reinterpret_cast<const char*>(text.data()), text.size()));
@@ -200,21 +219,7 @@ Dataset load_dataset(const std::string& directory, uint32_t target_width) {
     }
   }
 
-  double sum[3] = {0, 0, 0};
-  for (const DatasetFrame& f : ds.frames) {
-    for (int k = 0; k < 3; ++k) sum[k] += f.c2w[k * 4 + 3];
-  }
-  for (int k = 0; k < 3; ++k) ds.camera_center[k] = float(sum[k] / ds.frames.size());
-  float max_dist = 0.0f;
-  for (const DatasetFrame& f : ds.frames) {
-    float d2 = 0.0f;
-    for (int k = 0; k < 3; ++k) {
-      const float d = f.c2w[k * 4 + 3] - ds.camera_center[k];
-      d2 += d * d;
-    }
-    max_dist = std::max(max_dist, std::sqrt(d2));
-  }
-  ds.camera_extent = std::max(1.1f * max_dist, 1e-3f);
+  compute_camera_bounds(ds);
   return ds;
 }
 

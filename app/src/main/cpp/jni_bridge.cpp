@@ -21,12 +21,13 @@
 #include "gs/dataset.h"
 #include "gs/device_probe.h"
 #include "gs/json.h"
-#include "gs/png_write.h"
 #include "gs/splat_renderer.h"
 #include "gs/splat_scene.h"
 #include "gs/train_selftest.h"
 #include "gs/trainer.h"
 #include "gs/vk_context.h"
+#include "capture_handoff.h"
+#include "jni_util.h"
 #include "viewer.h"
 
 namespace {
@@ -76,28 +77,6 @@ std::string guarded(F&& f) {
   } catch (const std::exception& e) {
     return error_json(e.what());
   }
-}
-
-jstring to_jstring(JNIEnv* env, std::string s) {
-  // NewStringUTF expects modified UTF-8. Our messages contain Korean text, so
-  // build the string from UTF-8 bytes through java.lang.String instead.
-  jbyteArray bytes = env->NewByteArray(static_cast<jsize>(s.size()));
-  env->SetByteArrayRegion(bytes, 0, static_cast<jsize>(s.size()), reinterpret_cast<const jbyte*>(s.data()));
-  jclass string_class = env->FindClass("java/lang/String");
-  jmethodID ctor = env->GetMethodID(string_class, "<init>", "([BLjava/lang/String;)V");
-  jstring charset = env->NewStringUTF("UTF-8");
-  auto result = static_cast<jstring>(env->NewObject(string_class, ctor, bytes, charset));
-  env->DeleteLocalRef(charset);
-  env->DeleteLocalRef(bytes);
-  env->DeleteLocalRef(string_class);
-  return result;
-}
-
-std::string from_jstring(JNIEnv* env, jstring s) {
-  const char* chars = env->GetStringUTFChars(s, nullptr);
-  std::string out = chars != nullptr ? chars : "";
-  if (chars != nullptr) env->ReleaseStringUTFChars(s, chars);
-  return out;
 }
 
 std::vector<uint8_t> read_fd(int fd) {
@@ -154,34 +133,6 @@ std::string load_scene(F&& make_scene) {
 }  // namespace
 
 // --- NativeBridge (diagnostics) --------------------------------------------------
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_ondevice_gsplat_NativeBridge_writePng16(JNIEnv* env, jobject /*this*/, jstring jpath, jshortArray jpixels,
-                                                 jint width, jint height) {
-  if (width <= 0 || height <= 0 || env->GetArrayLength(jpixels) < width * height) return JNI_FALSE;
-  try {
-    std::vector<uint16_t> pixels(size_t(width) * height);
-    env->GetShortArrayRegion(jpixels, 0, width * height, reinterpret_cast<jshort*>(pixels.data()));
-    gs::write_file(from_jstring(env, jpath), gs::encode_png_gray16(pixels.data(), uint32_t(width), uint32_t(height)));
-    return JNI_TRUE;
-  } catch (const std::exception&) {
-    return JNI_FALSE;
-  }
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_ondevice_gsplat_NativeBridge_writePng8(JNIEnv* env, jobject /*this*/, jstring jpath, jbyteArray jpixels,
-                                                jint width, jint height) {
-  if (width <= 0 || height <= 0 || env->GetArrayLength(jpixels) < width * height) return JNI_FALSE;
-  try {
-    std::vector<uint8_t> pixels(size_t(width) * height);
-    env->GetByteArrayRegion(jpixels, 0, width * height, reinterpret_cast<jbyte*>(pixels.data()));
-    gs::write_file(from_jstring(env, jpath), gs::encode_png_gray8(pixels.data(), uint32_t(width), uint32_t(height)));
-    return JNI_TRUE;
-  } catch (const std::exception&) {
-    return JNI_FALSE;
-  }
-}
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_ondevice_gsplat_NativeBridge_probeDevice(JNIEnv* env, jobject /*this*/) {
@@ -378,7 +329,13 @@ Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, js
       session->ctx = context_locked();
     }
     const auto t0 = Clock::now();
-    gs::Dataset ds = gs::load_dataset(dir, static_cast<uint32_t>(width));
+    // A capture just finished is still in memory: no need to read its files.
+    const size_t slash = dir.find_last_of('/');
+    std::unique_ptr<CapturedDataset> captured =
+        take_capture(slash == std::string::npos ? dir : dir.substr(slash + 1), static_cast<uint32_t>(width));
+    const char* source = captured ? "memory" : "files";
+    gs::Dataset ds = captured ? std::move(captured->dataset) : gs::load_dataset(dir, static_cast<uint32_t>(width));
+    captured.reset();
     const double load_ms = ms_since(t0);
 
     if (!g_reduction) {
@@ -416,7 +373,7 @@ Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, js
     if (session->preview_frames.empty()) session->preview_frames.push_back(0);
 
     const auto t2 = Clock::now();
-    session->trainer = std::make_unique<gs::Trainer>(*session->ctx, ds, scene, options);
+    session->trainer = std::make_unique<gs::Trainer>(*session->ctx, std::move(ds), scene, options);
     const double setup_ms = ms_since(t2);
     const gs::Dataset& d = session->trainer->dataset();
 
@@ -442,6 +399,7 @@ Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, js
     w.field("subject_height", options.head.subject_height);
     w.field("head_weight", options.head_weight);
     w.field("load_ms", load_ms);
+    w.field("load_source", source);
     w.field("init_ms", init_ms);
     w.field("setup_ms", setup_ms);
     w.field("lambda_start", session->trainer->options().lambda_dssim);

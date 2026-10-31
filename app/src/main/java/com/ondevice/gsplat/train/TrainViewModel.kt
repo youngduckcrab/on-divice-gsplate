@@ -15,6 +15,7 @@ import androidx.lifecycle.viewModelScope
 import com.ondevice.gsplat.BuildConfig
 import com.ondevice.gsplat.NativeBridge
 import com.ondevice.gsplat.NativeTrainer
+import com.ondevice.gsplat.capture.ScanHandoff
 import com.ondevice.gsplat.diagnostics.AndroidDeviceInfo
 import com.ondevice.gsplat.diagnostics.Thermal
 import java.io.File
@@ -106,6 +107,8 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
     private var thermalStart: JSONObject? = null
     private var thermalEnd: JSONObject? = null
     private var evalJson: JSONObject? = null
+    /** A scan just captured: in memory now, in the dataset list once its files are saved. */
+    private var pendingScan: ScanHandoff? = null
 
     /** Average ms per step for each block of [SEGMENT] steps, to see throttling. */
     private val segmentMs = mutableListOf<Double>()
@@ -116,13 +119,28 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun refreshDatasets() {
-        val list = DatasetStore.list(getApplication())
+        var list = DatasetStore.list(getApplication())
+        val scan = pendingScan
+        if (scan != null && list.none { it.dir == scan.dir }) {
+            // Still being saved; trainable from memory meanwhile.
+            list = list + DatasetInfo(scan.dir, "person", scan.frames, scan.width, scan.height, true, scan.depth, false, 0)
+        }
         datasets = list
-        if (selected == null || list.none { it.dir == selected?.dir }) select(list.firstOrNull())
+        val current = list.firstOrNull { it.dir == selected?.dir }
+        if (current == null) select(list.firstOrNull()) else if (!running) selected = current
     }
 
-    fun selectByName(name: String) {
-        datasets.firstOrNull { it.name == name }?.let { select(it) }
+    /** Trains on a scan the moment it is captured (from memory when the preset allows). */
+    fun trainScan(scan: ScanHandoff) {
+        if (running) return
+        pendingScan = scan
+        refreshDatasets()
+        select(datasets.firstOrNull { it.dir == scan.dir })
+        viewModelScope.launch {
+            scan.saved.await()
+            refreshDatasets()
+        }
+        start()
     }
 
     fun select(info: DatasetInfo?) {
@@ -183,8 +201,14 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         previewRender = null
         previewTarget = null
         elapsedSeconds = 0.0
+        val scan = pendingScan?.takeIf { it.dir == dataset.dir }
         viewModelScope.launch {
             phase = Phase.PREPARING
+            // The in-memory scan is at one resolution and is used once; otherwise its files are needed.
+            if (scan != null && (settings.width != scan.shortSide || !scan.inMemory)) {
+                if (!scan.saved.isCompleted) status = "스캔 파일 저장이 끝나기를 기다리는 중…"
+                if (!scan.saved.await()) return@launch fail("스캔 파일을 저장하지 못해 이 설정으로는 학습할 수 없음")
+            }
             status = "데이터셋 불러오고 초기화하는 중…"
             thermalStart = Thermal.snapshot(getApplication())
             thermal = thermalStart
@@ -194,6 +218,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
             if (!prep.optBoolean("ok")) return@launch fail("준비 실패: ${prep.optString("error")}")
+            if (prep.optString("load_source") == "memory") scan?.inMemory = false
             prepared = prep
             stats = prep
             phase = Phase.TRAINING
@@ -405,7 +430,8 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 appendLine(
                     "초기화: ${prep.optString("init_source")} ${prep.optLong("init_points")}점 → " +
-                        "${prep.optInt("init_gaussians")}개 · 불러오기 ${sec(prep.optDouble("load_ms"))} · " +
+                        "${prep.optInt("init_gaussians")}개 · 불러오기 ${sec(prep.optDouble("load_ms"))}" +
+                        (if (prep.optString("load_source") == "memory") " (촬영 직후 메모리에서)" else "") + " · " +
                         "초기화 ${sec(prep.optDouble("init_ms"))} · GPU 준비 ${sec(prep.optDouble("setup_ms"))}",
                 )
                 if (prep.optInt("skipped") > 0) {

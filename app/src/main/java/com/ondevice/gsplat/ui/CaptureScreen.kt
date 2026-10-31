@@ -52,12 +52,16 @@ import com.ondevice.gsplat.capture.CaptureController
 import com.ondevice.gsplat.capture.CaptureStatus
 import com.ondevice.gsplat.capture.CaptureViewModel
 import com.ondevice.gsplat.capture.CaptureViewModel.Phase
+import com.ondevice.gsplat.capture.ScanHandoff
 import com.ondevice.gsplat.diagnostics.ArCoreProbe
 import java.util.Locale
 
-/** Walk round a person with the camera; the scan becomes a dataset for training. */
+/**
+ * Walk round a person with the camera. The person is picked out of every
+ * keyframe while recording, so the scan can be trained on the moment it ends.
+ */
 @Composable
-fun CaptureScreen(onTrain: (String) -> Unit, vm: CaptureViewModel = viewModel()) {
+fun CaptureScreen(onTrain: (ScanHandoff) -> Unit, vm: CaptureViewModel = viewModel()) {
     val context = LocalContext.current
     var permitted by remember {
         mutableStateOf(context.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
@@ -132,7 +136,7 @@ private fun Camera(vm: CaptureViewModel) {
     }
     // Capturing takes a minute of walking; keep the screen on.
     DisposableEffect(vm.phase) {
-        view.keepScreenOn = vm.phase == Phase.RECORDING || vm.phase == Phase.SAVING
+        view.keepScreenOn = vm.phase == Phase.RECORDING || vm.phase == Phase.FINISHING
         onDispose { view.keepScreenOn = false }
     }
 
@@ -148,10 +152,11 @@ private fun Camera(vm: CaptureViewModel) {
             Modifier.align(Alignment.TopCenter).fillMaxWidth().background(Color(0x99000000)).padding(12.dp),
         ) {
             Text(error ?: guidance(vm), color = Color.White)
-            if (vm.phase == Phase.RECORDING || vm.phase == Phase.SAVING) {
+            if (vm.phase == Phase.RECORDING || vm.phase == Phase.FINISHING) {
                 val s = vm.status
                 Text(
-                    "키프레임 ${s.keyframes} · 거리 ${"%.1f".format(Locale.US, s.distance)} m · 저장 대기 ${vm.queued}",
+                    "키프레임 ${s.keyframes} · 거리 ${"%.1f".format(Locale.US, s.distance)} m · 처리 대기 ${vm.queued}" +
+                        (if (vm.keyframeCoverage >= 0f) " · 사람 ${(vm.keyframeCoverage * 100).toInt()}%" else ""),
                     color = Color.White,
                 )
             }
@@ -171,7 +176,7 @@ private fun Camera(vm: CaptureViewModel) {
                         Button(onClick = { vm.finish() }, enabled = vm.status.keyframes >= 10) { Text("완료") }
                         OutlinedButton(onClick = { vm.cancel() }) { Text("취소") }
                     }
-                    Phase.SAVING -> Text("저장하는 중… (남은 ${vm.queued}장)", color = Color.White)
+                    Phase.FINISHING -> Text("마무리하는 중… (남은 ${vm.queued}장)", color = Color.White)
                     else -> Unit
                 }
             }
@@ -223,30 +228,33 @@ private fun guidance(vm: CaptureViewModel): String {
         }
     }
     return when (vm.phase) {
-        Phase.PREVIEW -> "사람(가만히 서 있기)을 가운데 원에 맞추고 [시작]을 눌러 주세요. 1~1.5 m 거리에서 배경이 함께 보이게"
+        Phase.PREVIEW -> "사람(가만히 서 있기)을 가운데 원에 맞추고 [시작]을 눌러 주세요. 1~1.5 m 거리에서 배경이 함께 보이게. " +
+            "밝게 보이는 사람이 인식된 사람이에요"
         Phase.RECORDING -> when {
+            s.subjectInView in 0f..0.01f -> "사람이 보이지 않아요: 사람을 화면 안에 두세요"
             s.angularSpeed > 45f || s.linearSpeed > 0.6f -> "천천히 움직여 주세요"
             s.distance in 0.01f..0.7f -> "너무 가까워요: 한 걸음 물러나 주세요"
             s.distance > 2.5f -> "너무 멀어요: 조금 다가가 주세요"
             s.coverage.all { it } -> "한 바퀴 완료! [완료]를 눌러 주세요"
-            else -> "사람 주위를 천천히 한 바퀴 돌아 주세요 (초록이 찬 구간은 찍힘)"
+            else -> "사람 주위를 천천히 한 바퀴 돌아 주세요 (초록이 찬 구간은 찍힘). 밝게 보이는 사람만 저장돼요"
         }
-        Phase.SAVING -> "마무리하는 중…"
+        Phase.FINISHING -> "마무리하는 중…"
         else -> ""
     }
 }
 
 @Composable
-private fun Finished(vm: CaptureViewModel, onTrain: (String) -> Unit) {
+private fun Finished(vm: CaptureViewModel, onTrain: (ScanHandoff) -> Unit) {
     val context = LocalContext.current
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text(if (vm.phase == Phase.DONE) "스캔 저장 완료" else "스캔 실패")
+        Text(if (vm.phase == Phase.DONE) "스캔 완료: 바로 학습할 수 있어요" else "스캔 실패")
+        if (vm.saving.isNotEmpty()) Text(vm.saving)
         Text(vm.summaryText())
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            vm.savedDataset?.let { name -> Button(onClick = { onTrain(name) }) { Text("이 스캔으로 학습") } }
+            vm.scan?.let { scan -> Button(onClick = { onTrain(scan) }) { Text("바로 학습") } }
             OutlinedButton(onClick = {
                 context.getSystemService(ClipboardManager::class.java)
                     .setPrimaryClip(ClipData.newPlainText("GSplat Lab 촬영", vm.summaryText()))

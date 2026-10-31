@@ -3,7 +3,6 @@ package com.ondevice.gsplat.capture
 import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
-import android.media.Image
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.view.Surface
@@ -18,7 +17,8 @@ import com.google.ar.core.Point
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingFailureReason
 import com.google.ar.core.TrackingState
-import java.nio.ByteOrder
+import com.ondevice.gsplat.NativeCapture
+import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
@@ -35,39 +35,34 @@ data class CaptureStatus(
     val angularSpeed: Float = 0f,  // deg/s
     val linearSpeed: Float = 0f,  // m/s
     val anchorFailed: Boolean = false,
+    val subjectInView: Float = -1f,  // fraction of the view the (chosen) person covers, live; -1 unknown
 )
 
-/** Counters for the capture summary. */
-class CaptureCounters {
-    var candidates = 0
-    var rejectedBlur = 0
-    var rejectedFast = 0
-    var trackingLost = 0
-    var depthMissing = 0
-    var imageErrors = 0
-
-    fun reset() {
-        candidates = 0
-        rejectedBlur = 0
-        rejectedFast = 0
-        trackingLost = 0
-        depthMissing = 0
-        imageErrors = 0
-    }
-}
+/** Counters for the capture summary (keyframe choice, in the engine). */
+data class CaptureCounters(
+    val candidates: Int = 0,
+    val rejectedFast: Int = 0,
+    val rejectedBlur: Int = 0,
+    val trackingLost: Int = 0,
+    val imageErrors: Int = 0,
+)
 
 /**
- * Runs the ARCore session on a GLSurfaceView: draws the camera image, finds
- * the subject when asked (hit test at the view centre), and while recording
- * picks keyframes (moved or turned enough, not too fast, sharp) and hands
- * them to [onKeyframe]. ARCore's world is gravity-aligned (+Y up, metres).
+ * Runs the ARCore session on a GLSurfaceView: draws the camera image with the
+ * live person mask over it, finds the subject when asked (hit test at the view
+ * centre), and while recording hands keyframes to the engine (which decides
+ * which frames they are: gs::KeyframePolicy) and their indices to [onKeyframe].
+ * ARCore's world is gravity-aligned (+Y up, metres).
  */
 class CaptureController(
     private val context: Context,
     private val onStatus: (CaptureStatus) -> Unit,
-    private val onKeyframe: (CapturedFrame) -> Unit,
+    private val onKeyframe: (Int) -> Unit,
 ) : GLSurfaceView.Renderer {
     private val background = BackgroundRenderer()
+    private val overlay = MaskOverlay()
+    private val latestMask = AtomicReference<LiveMask?>(null)
+    private val live = LiveSegmenter { latestMask.set(it) }
     @Volatile var session: Session? = null
         private set
     private var textureSet = false
@@ -78,28 +73,21 @@ class CaptureController(
     // Commands from the UI thread.
     @Volatile private var anchorRequested = false
     @Volatile private var resetRequested = false
+    /** The engine capture keyframes go to while recording (NativeCapture.begin). */
+    @Volatile var handle = 0L
     @Volatile var recording = false
-    @Volatile var maxKeyframes = 250
 
     // State on the GL thread.
     private var anchor: FloatArray? = null
-    private var keyframes = 0
-    private var lastKeyPosition: FloatArray? = null
-    private var lastKeyRotation: FloatArray? = null
-    private var lastKeyTimeNs = 0L
-    private var previousPosition: FloatArray? = null
-    private var previousRotation: FloatArray? = null
-    private var previousTimeNs = 0L
-    private var angularSpeed = 0f
-    private var linearSpeed = 0f
-    private val coverage = BooleanArray(BINS)
-    private val recentSharpness = ArrayDeque<Double>()
+    private var engineRecording = false
     private var lastStatusNs = 0L
-    private var lastTracking = TrackingState.PAUSED
-    val counters = CaptureCounters()
+    private var lastLiveNs = 0L
+    private var subjectInView = -1f
+    @Volatile var counters = CaptureCounters()
+        private set
 
-    /** Intrinsics of the CPU image, from the first keyframe (focus is fixed). */
-    @Volatile var intrinsics: FloatArray? = null  // fx, fy, cx, cy, width, height
+    /** Intrinsics of the CPU image (focus is fixed): fx, fy, cx, cy, width, height. */
+    @Volatile var intrinsics: FloatArray? = null
         private set
     @Volatile var anchorPosition: FloatArray? = null
         private set
@@ -110,6 +98,9 @@ class CaptureController(
         private set
     var imageSize = ""
         private set
+    val maxKeyframes = 250  // the engine's KeyframePolicy::Options::max_keyframes
+    val liveMasks: Int get() = live.count
+    val liveMs: Double get() = if (live.count > 0) live.totalMs / live.count else 0.0
 
     /** Creates and configures the session (main thread). Throws on failure. */
     fun open(rotation: Int) {
@@ -142,6 +133,7 @@ class CaptureController(
     fun pause() = session?.pause()
 
     fun close() {
+        live.close()
         session?.close()
         session = null
         textureSet = false
@@ -155,12 +147,14 @@ class CaptureController(
     /** Forget the subject, keyframes and coverage (for a new capture). */
     fun reset() {
         recording = false
+        handle = 0L
         resetRequested = true
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         background.create()
+        overlay.create()
         textureSet = false
     }
 
@@ -185,6 +179,11 @@ class CaptureController(
             return
         }
         background.draw(frame)
+        latestMask.getAndSet(null)?.let {
+            overlay.upload(it)
+            subjectInView = it.coverage
+        }
+        overlay.draw(frame)
         process(frame)
     }
 
@@ -193,44 +192,40 @@ class CaptureController(
             resetRequested = false
             anchor = null
             anchorPosition = null
-            keyframes = 0
-            lastKeyPosition = null
-            lastKeyRotation = null
-            coverage.fill(false)
-            recentSharpness.clear()
-            intrinsics = null
-            counters.reset()
+            engineRecording = false
+            subjectInView = -1f
+            latestMask.set(null)
+            overlay.clear()
+            NativeCapture.reset()
+        }
+        if (recording != engineRecording) {
+            engineRecording = recording
+            NativeCapture.setRecording(recording)
         }
         val camera = frame.camera
         val now = frame.timestamp
-        val tracking = camera.trackingState
-        if (recording && lastTracking == TrackingState.TRACKING && tracking != TrackingState.TRACKING) {
-            counters.trackingLost++
-        }
-        lastTracking = tracking
+        val tracking = camera.trackingState == TrackingState.TRACKING
+        if (tracking && intrinsics == null) intrinsics = intrinsicsOf(camera.imageIntrinsics)
         var anchorFailed = false
-        if (tracking == TrackingState.TRACKING) {
+        var usedImage = false
+        if (tracking) {
             val pose = camera.pose
-            val position = pose.translation
-            val rotation = pose.rotationQuaternion
-            previousPosition?.let { prev ->
-                val dt = (now - previousTimeNs) / 1e9f
-                if (dt > 0f) {
-                    linearSpeed = 0.8f * linearSpeed + 0.2f * (CaptureMath.distance(position, prev) / dt)
-                    angularSpeed = 0.8f * angularSpeed + 0.2f * (CaptureMath.angleDegrees(rotation, previousRotation!!) / dt)
-                }
-            }
-            previousPosition = position
-            previousRotation = rotation
-            previousTimeNs = now
-
             if (anchorRequested) {
                 anchorRequested = false
-                anchor = findSubject(frame, pose.zAxis)
+                anchor = findSubject(frame, pose.zAxis)?.also { NativeCapture.setSubject(it[0], it[1], it[2]) }
                 anchorPosition = anchor
                 anchorFailed = anchor == null
             }
-            if (recording && anchor != null && keyframes < maxKeyframes) considerKeyframe(frame, position, rotation, now)
+            if (NativeCapture.track(true, pose.translation, pose.rotationQuaternion, now)) {
+                usedImage = true
+                takeKeyframe(frame, now)
+            }
+        } else {
+            NativeCapture.track(false, ZERO3, IDENTITY, now)
+        }
+        if (!usedImage && tracking && now - lastLiveNs > LIVE_INTERVAL_NS && live.idle) {
+            lastLiveNs = now
+            liveFrame(frame)
         }
         if (now - lastStatusNs > 100_000_000L || anchorFailed) {
             lastStatusNs = now
@@ -253,141 +248,115 @@ class CaptureController(
         return null
     }
 
-    private fun considerKeyframe(frame: Frame, position: FloatArray, rotation: FloatArray, now: Long) {
-        val a = anchor ?: return
-        val toSubject = CaptureMath.horizontal(position, a)
-        val dist = maxOf(toSubject, 0.3f)
-        val lastP = lastKeyPosition
-        if (lastP != null) {
-            if (now - lastKeyTimeNs < 200_000_000L) return
-            val moved = CaptureMath.distance(position, lastP)
-            val turned = CaptureMath.angleDegrees(rotation, lastKeyRotation!!)
-            if (moved < maxOf(0.03f, 0.05f * dist) && turned < 5f) return
-        }
-        counters.candidates++
-        if (angularSpeed > 60f || linearSpeed > 0.8f) {
-            counters.rejectedFast++
-            return
-        }
-        val image: Image = try {
+    /** A keyframe candidate: the engine checks its sharpness, then copies image, depth and pose. */
+    private fun takeKeyframe(frame: Frame, now: Long) {
+        val h = handle
+        if (h == 0L) return  // recording just ended
+        val image = try {
             frame.acquireCameraImage()
         } catch (e: Exception) {
-            counters.imageErrors++
+            NativeCapture.imageError()
             return
         }
-        val captured = try {
-            val sharp = sharpness(image)
-            val median = recentSharpness.sorted().let { if (it.isEmpty()) 0.0 else it[it.size / 2] }
-            recentSharpness.addLast(sharp)
-            if (recentSharpness.size > 30) recentSharpness.removeFirst()
-            if (recentSharpness.size >= 5 && sharp < 0.6 * median) {
-                counters.rejectedBlur++
+        try {
+            val planes = image.planes
+            if (!NativeCapture.accept(planes[0].buffer, planes[0].rowStride, image.width, image.height)) return
+            // Depth is missing until ARCore has seen enough motion; the frame is kept without it.
+            val depth = try {
+                frame.acquireRawDepthImage16Bits()
+            } catch (e: Exception) {
                 null
-            } else {
-                copy(frame, image, now)
+            }
+            val confidence = depth?.let {
+                try {
+                    frame.acquireRawDepthConfidenceImage()
+                } catch (e: Exception) {
+                    null
+                }
+            }
+            try {
+                val pose = FloatArray(16)
+                frame.camera.pose.toMatrix(pose, 0)
+                val dp = depth?.planes?.get(0)
+                val cp = if (depth != null && confidence != null && confidence.width == depth.width &&
+                    confidence.height == depth.height
+                ) confidence.planes[0] else null
+                val index = NativeCapture.submit(
+                    h, planes[0].buffer, planes[1].buffer, planes[2].buffer,
+                    planes[0].rowStride, planes[1].rowStride, planes[1].pixelStride, image.width, image.height,
+                    pose, now,
+                    dp?.buffer, dp?.rowStride ?: 0, dp?.pixelStride ?: 0, depth?.width ?: 0, depth?.height ?: 0,
+                    cp?.buffer, cp?.rowStride ?: 0, cp?.pixelStride ?: 0,
+                )
+                if (index >= 0) onKeyframe(index) else NativeCapture.imageError()
+            } finally {
+                depth?.close()
+                confidence?.close()
             }
         } finally {
             image.close()
         }
-        if (captured == null) return
-        if (intrinsics == null) intrinsics = intrinsicsOf(frame.camera.imageIntrinsics)
-        onKeyframe(captured)
-        keyframes++
-        lastKeyPosition = position
-        lastKeyRotation = rotation
-        lastKeyTimeNs = now
-        val bin = CaptureMath.azimuthBin(position, a)
-        if (bin >= 0) coverage[bin] = true
     }
 
-    private fun copy(frame: Frame, image: Image, now: Long): CapturedFrame {
-        val planes = image.planes
-        fun bytes(i: Int): ByteArray {
-            val buffer = planes[i].buffer
-            buffer.rewind()
-            return ByteArray(buffer.remaining()).also { buffer.get(it) }
-        }
-        var depth: ShortArray? = null
-        var confidence: ByteArray? = null
-        var dw = 0
-        var dh = 0
-        try {
-            frame.acquireRawDepthImage16Bits().use { d ->
-                dw = d.width
-                dh = d.height
-                val plane = d.planes[0]
-                val buffer = plane.buffer.order(ByteOrder.LITTLE_ENDIAN)
-                depth = ShortArray(dw * dh)
-                for (y in 0 until dh) for (x in 0 until dw) {
-                    depth!![y * dw + x] = buffer.getShort(y * plane.rowStride + x * plane.pixelStride)
-                }
-            }
-            frame.acquireRawDepthConfidenceImage().use { c ->
-                if (c.width == dw && c.height == dh) {
-                    val plane = c.planes[0]
-                    val buffer = plane.buffer
-                    confidence = ByteArray(dw * dh)
-                    for (y in 0 until dh) for (x in 0 until dw) {
-                        confidence!![y * dw + x] = buffer.get(y * plane.rowStride + x * plane.pixelStride)
-                    }
-                }
-            }
+    /** A small copy of this frame for the live person mask. */
+    private fun liveFrame(frame: Frame) {
+        val k = intrinsics ?: return
+        val image = try {
+            frame.acquireCameraImage()
         } catch (e: Exception) {
-            // NotYetAvailableException until ARCore has depth; others if depth is off.
-            depth = null
-            confidence = null
-            dw = 0
-            dh = 0
-            counters.depthMissing++
+            return
         }
-        val pose = FloatArray(16)
-        frame.camera.pose.toMatrix(pose, 0)
-        return CapturedFrame(
-            index = keyframes,
-            width = image.width,
-            height = image.height,
-            y = bytes(0),
-            yRowStride = planes[0].rowStride,
-            u = bytes(1),
-            v = bytes(2),
-            uvRowStride = planes[1].rowStride,
-            uvPixelStride = planes[1].pixelStride,
-            depth = depth,
-            depthWidth = dw,
-            depthHeight = dh,
-            confidence = confidence,
-            pose = pose,
-            timestampNs = now,
-        )
+        try {
+            val planes = image.planes
+            val (w, h) = CaptureMath.scaledSize(image.width, image.height, LIVE_SHORT_SIDE)
+            val pixels = NativeCapture.liveImage(
+                planes[0].buffer, planes[1].buffer, planes[2].buffer,
+                planes[0].rowStride, planes[1].rowStride, planes[1].pixelStride, image.width, image.height,
+                w, h, uprightDegrees,
+            ) ?: return
+            val pose = FloatArray(16)
+            frame.camera.pose.toMatrix(pose, 0)
+            val s = w.toFloat() / image.width
+            live.submit(
+                LiveJob(pixels, uprightDegrees, w, h, pose, floatArrayOf(k[0] * s, k[1] * s, k[2] * s, k[3] * s), anchor?.copyOf()),
+            )
+        } finally {
+            image.close()
+        }
     }
 
     private fun status(frame: Frame, anchorFailed: Boolean): CaptureStatus {
         val camera = frame.camera
-        val a = anchor
-        var bin = -1
-        var dist = 0f
-        if (a != null && camera.trackingState == TrackingState.TRACKING) {
-            val p = camera.pose.translation
-            bin = CaptureMath.azimuthBin(p, a)
-            dist = CaptureMath.horizontal(p, a)
-        }
+        val n = NativeCapture.status()
+        counters = CaptureCounters(
+            candidates = n[NativeCapture.CANDIDATES].toInt(),
+            rejectedFast = n[NativeCapture.REJECTED_FAST].toInt(),
+            rejectedBlur = n[NativeCapture.REJECTED_BLUR].toInt(),
+            trackingLost = n[NativeCapture.TRACKING_LOST].toInt(),
+            imageErrors = n[NativeCapture.IMAGE_ERRORS].toInt(),
+        )
         return CaptureStatus(
             tracking = camera.trackingState,
             failure = camera.trackingFailureReason,
-            anchored = a != null,
+            anchored = anchor != null,
             recording = recording,
-            keyframes = keyframes,
-            coverage = coverage.copyOf(),
-            azimuthBin = bin,
-            distance = dist,
-            angularSpeed = angularSpeed,
-            linearSpeed = linearSpeed,
+            keyframes = n[NativeCapture.KEYFRAMES].toInt(),
+            coverage = BooleanArray(BINS) { n[NativeCapture.COVERAGE + it] > 0.5f },
+            azimuthBin = n[NativeCapture.AZIMUTH_BIN].toInt(),
+            distance = n[NativeCapture.DISTANCE],
+            angularSpeed = n[NativeCapture.ANGULAR_SPEED],
+            linearSpeed = n[NativeCapture.LINEAR_SPEED],
             anchorFailed = anchorFailed,
+            subjectInView = subjectInView,
         )
     }
 
     companion object {
-        const val BINS = CaptureMath.BINS
+        const val BINS = 36  // the engine's KeyframePolicy::kBins
+        const val LIVE_SHORT_SIDE = 144  // live mask: 256x144 for a 16:9 image
+        const val LIVE_INTERVAL_NS = 80_000_000L  // up to about 12 live masks a second
+        private val ZERO3 = FloatArray(3)
+        private val IDENTITY = floatArrayOf(0f, 0f, 0f, 1f)
 
         fun rotationDegrees(rotation: Int) = when (rotation) {
             Surface.ROTATION_90 -> 90
@@ -401,33 +370,6 @@ class CaptureController(
             val c = i.principalPoint
             val d = i.imageDimensions
             return floatArrayOf(f[0], f[1], c[0], c[1], d[0].toFloat(), d[1].toFloat())
-        }
-
-        /** Variance of a Laplacian over every 4th pixel of the Y plane: higher is sharper. */
-        fun sharpness(image: Image): Double {
-            val plane = image.planes[0]
-            val buffer = plane.buffer
-            val stride = plane.rowStride
-            val step = 4
-            var sum = 0.0
-            var sumSq = 0.0
-            var n = 0
-            var y = step
-            while (y < image.height - step) {
-                var x = step
-                while (x < image.width - step) {
-                    fun at(px: Int, py: Int) = buffer.get(py * stride + px).toInt() and 0xff
-                    val l = 4 * at(x, y) - at(x - step, y) - at(x + step, y) - at(x, y - step) - at(x, y + step)
-                    sum += l
-                    sumSq += l.toDouble() * l
-                    n++
-                    x += step
-                }
-                y += step
-            }
-            if (n == 0) return 0.0
-            val mean = sum / n
-            return sumSq / n - mean * mean
         }
     }
 }

@@ -102,15 +102,15 @@ TrainOptions scaled_options(uint32_t iterations) {
   return o;
 }
 
-Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initial, const TrainOptions& options)
-    : ctx_(ctx), dataset_(dataset), options_(options), rng_(options.seed) {
+Trainer::Trainer(VkContext& ctx, Dataset dataset, const SplatScene& initial, const TrainOptions& options)
+    : ctx_(ctx), dataset_(std::move(dataset)), options_(options), rng_(options.seed) {
   const DeviceInfo& info = ctx.info();
-  if (dataset.frames.empty() || dataset.width == 0) throw std::runtime_error("데이터셋이 비어 있음");
+  if (dataset_.frames.empty() || dataset_.width == 0) throw std::runtime_error("데이터셋이 비어 있음");
   options_.sh_degree = std::clamp(options_.sh_degree, 0, 3);
-  options_.masked = options_.masked && dataset.has_masks;
+  options_.masked = options_.masked && dataset_.has_masks;
 
-  width_ = dataset.width;
-  height_ = dataset.height;
+  width_ = dataset_.width;
+  height_ = dataset_.height;
   tiles_x_ = div_up(width_, kTileSize);
   tiles_y_ = div_up(height_, kTileSize);
   if (uint64_t(tiles_x_) * tiles_y_ > 65535) throw std::runtime_error("학습 해상도가 너무 큼");
@@ -122,11 +122,11 @@ Trainer::Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initi
     throw std::runtime_error("가우시안 최대 개수가 GPU 버퍼 한도를 넘음");
   }
 
-  for (size_t i = 0; i < dataset.frames.size(); ++i) {
-    if (!dataset.frames[i].holdout) train_frames_.push_back(i);
+  for (size_t i = 0; i < dataset_.frames.size(); ++i) {
+    if (!dataset_.frames[i].holdout) train_frames_.push_back(i);
   }
   if (train_frames_.empty()) {
-    for (size_t i = 0; i < dataset.frames.size(); ++i) train_frames_.push_back(i);
+    for (size_t i = 0; i < dataset_.frames.size(); ++i) train_frames_.push_back(i);
   }
 
   // Pipelines. Each failure is collected so one run names every shader the

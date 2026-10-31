@@ -47,9 +47,8 @@ fun AppScreen() {
     ) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
             when (selected) {
-                0 -> CaptureScreen(onTrain = { name ->
-                    trainVm.refreshDatasets()
-                    trainVm.selectByName(name)
+                0 -> CaptureScreen(onTrain = { scan ->
+                    trainVm.trainScan(scan)
                     selected = 1
                 })
                 1 -> TrainScreen(onOpenModel = { file ->

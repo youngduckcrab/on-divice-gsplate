@@ -159,7 +159,8 @@ struct EvalResult {
 class Trainer {
  public:
   // Throws std::runtime_error if the device cannot train.
-  Trainer(VkContext& ctx, const Dataset& dataset, const SplatScene& initial, const TrainOptions& options);
+  // Takes the dataset by value: move it in to avoid a copy of its images.
+  Trainer(VkContext& ctx, Dataset dataset, const SplatScene& initial, const TrainOptions& options);
   ~Trainer();
   Trainer(const Trainer&) = delete;
   Trainer& operator=(const Trainer&) = delete;

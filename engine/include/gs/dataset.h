@@ -45,6 +45,9 @@ struct Dataset {
 // skipped (listed in `skipped`); throws std::runtime_error if too few remain.
 Dataset load_dataset(const std::string& directory, uint32_t target_width);
 
+// Sets camera_center (mean camera position) and camera_extent from the frames.
+void compute_camera_bounds(Dataset& dataset);
+
 // Pinhole camera (scene -> camera, OpenCV convention) for a frame.
 Camera dataset_camera(const Dataset& dataset, const DatasetFrame& frame);
 

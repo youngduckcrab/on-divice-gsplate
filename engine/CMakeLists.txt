@@ -116,9 +116,12 @@ add_custom_target(gs_shaders DEPENDS ${GS_SHADER_HEADERS})
 add_library(gsengine STATIC
   src/benchmarks.cpp
   src/camera.cpp
+  src/capture.cpp
   src/dataset.cpp
   src/device_probe.cpp
   src/image_io.cpp
+  src/image_write.cpp
+  src/live_capture.cpp
   src/png_write.cpp
   src/json_parse.cpp
   src/log.cpp
@@ -145,8 +148,8 @@ else()
 endif()
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(gsengine PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
-  # Third-party single-header code is compiled in image_io.cpp only.
-  set_source_files_properties(src/image_io.cpp PROPERTIES COMPILE_OPTIONS "-w")
+  # Third-party single-header code is compiled in image_io.cpp and image_write.cpp only.
+  set_source_files_properties(src/image_io.cpp src/image_write.cpp PROPERTIES COMPILE_OPTIONS "-w")
 endif()
 
 # --- Desktop tests and tools --------------------------------------------------
@@ -160,12 +163,20 @@ if(GS_BUILD_TESTS AND NOT ANDROID)
   target_link_libraries(gs_splat_tests PRIVATE gsengine)
   add_test(NAME gs_splat_tests COMMAND gs_splat_tests)
 
+  add_executable(gs_capture_tests tests/test_capture.cpp)
+  target_link_libraries(gs_capture_tests PRIVATE gsengine)
+  add_test(NAME gs_capture_tests COMMAND gs_capture_tests)
+
   add_executable(gs_trainer_tests tests/test_trainer.cpp)
   target_link_libraries(gs_trainer_tests PRIVATE gsengine)
   add_test(NAME gs_trainer_tests COMMAND gs_trainer_tests)
 
   add_executable(gs_train cli/gs_train.cpp)
   target_link_libraries(gs_train PRIVATE gsengine)
+
+  add_executable(gs_live_replay cli/gs_live_replay.cpp)
+  target_link_libraries(gs_live_replay PRIVATE gsengine)
+  target_include_directories(gs_live_replay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
   add_executable(gs_probe cli/gs_probe.cpp)
   target_link_libraries(gs_probe PRIVATE gsengine)
