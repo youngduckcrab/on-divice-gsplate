@@ -30,6 +30,10 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -61,6 +65,13 @@ fun TrainScreen(onOpenModel: (File) -> Unit, vm: TrainViewModel = viewModel()) {
     val exportPly = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/octet-stream"),
     ) { uri -> if (uri != null) vm.exportTo(uri) }
+    var exportTarget by remember { mutableStateOf<DatasetInfo?>(null) }
+    val exportDataset = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/zip"),
+    ) { uri ->
+        val d = exportTarget
+        if (uri != null && d != null) vm.exportDataset(d, uri)
+    }
 
     Column(
         Modifier
@@ -73,6 +84,10 @@ fun TrainScreen(onOpenModel: (File) -> Unit, vm: TrainViewModel = viewModel()) {
             vm = vm,
             onImport = { importZip.launch(arrayOf("application/zip", "application/x-zip-compressed", "*/*")) },
             onOpenDownloads = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(DATASETS_URL))) },
+            onExport = { d ->
+                exportTarget = d
+                exportDataset.launch("${d.name}.zip")
+            },
         )
         SettingsCard(vm)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -141,7 +156,12 @@ fun TrainScreen(onOpenModel: (File) -> Unit, vm: TrainViewModel = viewModel()) {
 }
 
 @Composable
-private fun DatasetCard(vm: TrainViewModel, onImport: () -> Unit, onOpenDownloads: () -> Unit) {
+private fun DatasetCard(
+    vm: TrainViewModel,
+    onImport: () -> Unit,
+    onOpenDownloads: () -> Unit,
+    onExport: (DatasetInfo) -> Unit,
+) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text("데이터셋", style = MaterialTheme.typography.titleMedium)
@@ -151,7 +171,7 @@ private fun DatasetCard(vm: TrainViewModel, onImport: () -> Unit, onOpenDownload
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
-            for (d in vm.datasets) DatasetRow(d, selected = vm.selected?.dir == d.dir, vm)
+            for (d in vm.datasets) DatasetRow(d, selected = vm.selected?.dir == d.dir, vm, onExport)
             if (vm.phase == Phase.IMPORTING) {
                 LinearProgressIndicator(progress = { vm.importProgress }, modifier = Modifier.fillMaxWidth())
             }
@@ -166,7 +186,7 @@ private fun DatasetCard(vm: TrainViewModel, onImport: () -> Unit, onOpenDownload
 }
 
 @Composable
-private fun DatasetRow(d: DatasetInfo, selected: Boolean, vm: TrainViewModel) {
+private fun DatasetRow(d: DatasetInfo, selected: Boolean, vm: TrainViewModel, onExport: (DatasetInfo) -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -186,6 +206,7 @@ private fun DatasetRow(d: DatasetInfo, selected: Boolean, vm: TrainViewModel) {
                 style = MaterialTheme.typography.bodySmall,
             )
         }
+        TextButton(enabled = !vm.running && !vm.exporting, onClick = { onExport(d) }) { Text("내보내기") }
         TextButton(enabled = !vm.running, onClick = { vm.delete(d) }) { Text("삭제") }
     }
 }

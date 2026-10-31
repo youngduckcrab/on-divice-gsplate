@@ -1,14 +1,23 @@
 package com.ondevice.gsplat.train
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.net.Uri
+import android.os.Build
 import android.provider.OpenableColumns
+import java.io.BufferedOutputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FilterInputStream
 import java.io.IOException
 import java.io.InputStream
+import java.util.zip.Deflater
+import java.util.zip.ZipEntry
 import java.util.zip.ZipException
 import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
 import org.json.JSONObject
 
 /** A dataset folder (nerfstudio transforms.json layout) in app storage. */
@@ -36,7 +45,7 @@ data class ImportResult(val dataset: DatasetInfo, val damaged: List<String>)
 /** Imports capture zips into app storage and lists them. */
 object DatasetStore {
     /** Large files the trainer does not read. */
-    private val skipped = listOf(".mp4", "depth_gt/")
+    private val skipped = listOf(".mp4", "depth_gt/", "cutout/")
 
     fun root(context: Context): File = File(context.filesDir, "datasets").apply { mkdirs() }
 
@@ -146,6 +155,97 @@ object DatasetStore {
         } finally {
             staging.deleteRecursively()
         }
+    }
+
+    /**
+     * Writes a dataset as a zip (everything in one folder named after it, as
+     * [importZip] reads it back), plus `cutout/`: each image with its person
+     * mask as the alpha channel, upright, as WebP. [onProgress] gets the
+     * fraction done. Returns the bytes written.
+     */
+    fun exportZip(context: Context, info: DatasetInfo, uri: Uri, onProgress: (Float) -> Unit): Long {
+        val files = info.dir.walkTopDown().filter { it.isFile }.sortedBy { it.path }.toList()
+        val json = runCatching { JSONObject(File(info.dir, "transforms.json").readText()) }.getOrNull()
+        val upright = json?.optJSONObject("gsplat_lab")?.optInt("upright_degrees", 0) ?: 0
+        val frames = json?.optJSONArray("frames")
+        val cutouts = (0 until (frames?.length() ?: 0)).mapNotNull { i ->
+            val f = frames!!.getJSONObject(i)
+            val image = f.optString("file_path")
+            val mask = f.optString("mask_path")
+            if (image.isEmpty() || mask.isEmpty()) null else image to mask
+        }
+        val total = (files.size + cutouts.size).coerceAtLeast(1)
+        var done = 0
+        val output = context.contentResolver.openOutputStream(uri) ?: throw IOException("저장할 파일을 열 수 없음")
+        val counting = CountingOutput(output)
+        ZipOutputStream(BufferedOutputStream(counting, 1 shl 16)).use { zip ->
+            zip.setLevel(Deflater.BEST_SPEED)  // images and video are compressed already
+            for (file in files) {
+                zip.putNextEntry(ZipEntry("${info.name}/${file.relativeTo(info.dir).invariantSeparatorsPath}"))
+                file.inputStream().use { it.copyTo(zip, 1 shl 16) }
+                zip.closeEntry()
+                done++
+                onProgress(done.toFloat() / total)
+            }
+            for ((image, mask) in cutouts) {
+                cutout(File(info.dir, image), File(info.dir, mask), upright)?.let { bytes ->
+                    val name = image.substringAfterLast('/').substringBeforeLast('.') + ".webp"
+                    zip.putNextEntry(ZipEntry("${info.name}/cutout/$name"))
+                    zip.write(bytes)
+                    zip.closeEntry()
+                }
+                done++
+                onProgress(done.toFloat() / total)
+            }
+        }
+        return counting.count
+    }
+
+    /** The image with its mask as alpha, turned upright, as lossy WebP (keeps alpha). */
+    private fun cutout(imageFile: File, maskFile: File, upright: Int): ByteArray? {
+        val image = BitmapFactory.decodeFile(imageFile.path) ?: return null
+        // Grey levels in R, G and B (not an ALPHA_8 bitmap, whose colour reads back as 0).
+        val opaque = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
+        val maskSmall = BitmapFactory.decodeFile(maskFile.path, opaque) ?: return null.also { image.recycle() }
+        val mask = Bitmap.createScaledBitmap(maskSmall, image.width, image.height, true)
+        val w = image.width
+        val h = image.height
+        val rgb = IntArray(w * h)
+        val alpha = IntArray(w * h)
+        image.getPixels(rgb, 0, w, 0, 0, w, h)
+        mask.getPixels(alpha, 0, w, 0, 0, w, h)
+        for (i in rgb.indices) rgb[i] = ((alpha[i] and 0xff) shl 24) or (rgb[i] and 0xffffff)
+        var out = Bitmap.createBitmap(rgb, w, h, Bitmap.Config.ARGB_8888)
+        if (upright != 0) {
+            val turned = Bitmap.createBitmap(out, 0, 0, w, h, Matrix().apply { postRotate(upright.toFloat()) }, true)
+            out.recycle()
+            out = turned
+        }
+        val bytes = ByteArrayOutputStream()
+        @Suppress("DEPRECATION")
+        val format = if (Build.VERSION.SDK_INT >= 30) Bitmap.CompressFormat.WEBP_LOSSY else Bitmap.CompressFormat.WEBP
+        out.compress(format, 85, bytes)
+        for (b in listOf(image, maskSmall, mask, out)) if (!b.isRecycled) b.recycle()
+        return bytes.toByteArray()
+    }
+
+    private class CountingOutput(private val out: java.io.OutputStream) : java.io.OutputStream() {
+        var count = 0L
+            private set
+
+        override fun write(b: Int) {
+            out.write(b)
+            count++
+        }
+
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            out.write(b, off, len)
+            count += len
+        }
+
+        override fun flush() = out.flush()
+
+        override fun close() = out.close()
     }
 
     /** A CRC or format error means the downloaded file is damaged (e.g. an interrupted download). */

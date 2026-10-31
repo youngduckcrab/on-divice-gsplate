@@ -4,6 +4,7 @@ import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.opengl.GLES20
+import android.net.Uri
 import android.opengl.GLSurfaceView
 import android.view.Surface
 import com.google.ar.core.CameraConfig
@@ -14,10 +15,13 @@ import com.google.ar.core.DepthPoint
 import com.google.ar.core.Frame
 import com.google.ar.core.Plane
 import com.google.ar.core.Point
+import com.google.ar.core.RecordingConfig
+import com.google.ar.core.RecordingStatus
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingFailureReason
 import com.google.ar.core.TrackingState
 import com.ondevice.gsplat.NativeCapture
+import java.io.File
 import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
@@ -138,6 +142,32 @@ class CaptureController(
         session?.close()
         session = null
         textureSet = false
+    }
+
+    /**
+     * Starts saving the session to [file]: ARCore's recording, an MP4 whose
+     * video track any player shows, with the tracking data alongside (it can
+     * be played back through ARCore). Returns why not, or null.
+     */
+    fun startSessionRecording(file: File): String? {
+        val s = session ?: return "세션 없음"
+        return try {
+            s.startRecording(RecordingConfig(s).setMp4DatasetUri(Uri.fromFile(file)).setAutoStopOnPause(true))
+            null
+        } catch (e: Exception) {
+            "${e.javaClass.simpleName}: ${e.message ?: ""}"
+        }
+    }
+
+    /** Ends the recording (the MP4 is complete when this returns). Returns why it failed, or null. */
+    fun stopSessionRecording(): String? {
+        val s = session ?: return null
+        return try {
+            if (s.recordingStatus == RecordingStatus.OK) s.stopRecording()
+            null
+        } catch (e: Exception) {
+            "${e.javaClass.simpleName}: ${e.message ?: ""}"
+        }
     }
 
     /** Next frame: find the subject at the view centre. */

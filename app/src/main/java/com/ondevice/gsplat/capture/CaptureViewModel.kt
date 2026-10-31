@@ -82,6 +82,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
     private var finishJson: JSONObject? = null
     private var savedJson: JSONObject? = null
     private var pipelineLine = ""
+    private var videoLine = ""
     private var liveLine = ""
     private var counters = CaptureCounters()
     private val main = Handler(Looper.getMainLooper())
@@ -150,6 +151,8 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         }
         handle = json.getLong("handle")
         pipeline = FramePipeline(handle, json.getInt("upright_width"), json.getInt("upright_height"))
+        // The whole walk as a video too (with ARCore's tracking data), kept in the scan.
+        videoLine = c.startSessionRecording(File(dir, VIDEO_FILE))?.let { "녹화 영상: 저장 안 됨 ($it)" } ?: ""
         scanDir = dir
         scanName = name
         startNs = System.nanoTime()
@@ -171,6 +174,14 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         liveLine = "실시간 마스크 ${c.liveMasks}회 · 평균 ${f1(c.liveMs)} ms"
         phase = Phase.FINISHING
         viewModelScope.launch {
+            val stopError = c.stopSessionRecording()  // on the main thread, like the session's other calls
+            val video = File(dir, VIDEO_FILE)
+            videoLine = when {
+                videoLine.isNotEmpty() -> videoLine
+                stopError != null -> "녹화 영상: 저장 실패 ($stopError)"
+                video.exists() -> "녹화 영상: $VIDEO_FILE (${"%.0f".format(Locale.US, video.length() / 1e6)} MB, 데이터셋 내보내기에 포함)"
+                else -> "녹화 영상: 없음"
+            }
             // Only the keyframes still in the pipeline are left to do.
             val ready = withContext(Dispatchers.IO) {
                 runCatching {
@@ -229,6 +240,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun cancel() {
+        controller?.stopSessionRecording()
         controller?.reset()
         pipeline?.abandon()
         pipeline = null
@@ -303,6 +315,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
             }
             if (pipelineLine.isNotEmpty()) appendLine(pipelineLine)
             if (liveLine.isNotEmpty()) appendLine(liveLine)
+            if (videoLine.isNotEmpty()) appendLine(videoLine)
             if (phase == Phase.DONE || phase == Phase.FAILED) {
                 appendLine("완료 → 학습 준비: ${"%.2f".format(Locale.US, readyMs / 1000)} s (메모리 데이터셋 ${finishJson?.optInt("width")}x${finishJson?.optInt("height")})")
                 savedJson?.let { j ->
@@ -325,5 +338,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         const val TRAIN_SHORT_SIDE = 540
         /** The saved images': the high-quality preset's. */
         const val ARCHIVE_SHORT_SIDE = 720
+        /** ARCore's recording of the walk, in the scan folder. */
+        const val VIDEO_FILE = "recording.mp4"
     }
 }

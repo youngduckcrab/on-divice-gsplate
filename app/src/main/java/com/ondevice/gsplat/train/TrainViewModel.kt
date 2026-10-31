@@ -65,6 +65,8 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         private set
     var importProgress by mutableStateOf(0f)
         private set
+    var exporting by mutableStateOf(false)
+        private set
     var status by mutableStateOf("")
         private set
 
@@ -183,6 +185,31 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
             }.onFailure {
                 status = "불러오기 실패: ${it.message ?: it}"
             }
+        }
+    }
+
+    /** Writes [info] as a zip to [uri] (DatasetStore.exportZip). */
+    fun exportDataset(info: DatasetInfo, uri: Uri) {
+        if (running || phase == Phase.IMPORTING || exporting) return
+        if (!File(info.dir, "transforms.json").exists()) {
+            status = "아직 파일을 저장하는 중이라 내보낼 수 없어요. 잠시 뒤에 다시 눌러 주세요"
+            return
+        }
+        exporting = true
+        viewModelScope.launch {
+            status = "데이터셋 내보내는 중… (${info.name})"
+            val written = withContext(Dispatchers.IO) {
+                runCatching {
+                    DatasetStore.exportZip(getApplication(), info, uri) { p ->
+                        status = "데이터셋 내보내는 중… ${(p * 100).toInt()}% (${info.name})"
+                    }
+                }
+            }
+            exporting = false
+            status = written.fold(
+                { "내보냄: ${info.name}.zip (${"%.0f".format(Locale.US, it / 1e6)} MB)" },
+                { "내보내기 실패: ${it.message ?: it}" },
+            )
         }
     }
 

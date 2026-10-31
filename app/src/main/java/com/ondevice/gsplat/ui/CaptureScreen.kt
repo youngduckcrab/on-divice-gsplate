@@ -252,6 +252,10 @@ private fun Finished(vm: CaptureViewModel, onTrain: (ScanHandoff) -> Unit) {
     ) {
         Text(if (vm.phase == Phase.DONE) "스캔 완료: 바로 학습할 수 있어요" else "스캔 실패")
         if (vm.saving.isNotEmpty()) Text(vm.saving)
+        Text(
+            "저장이 끝나면 학습 탭의 데이터셋 목록에서 [내보내기]로 zip 파일을 받을 수 있어요 " +
+                "(촬영 영상, 키프레임 사진, 누끼 이미지, 깊이, 카메라 위치)",
+        )
         Text(vm.summaryText())
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             vm.scan?.let { scan -> Button(onClick = { onTrain(scan) }) { Text("바로 학습") } }
