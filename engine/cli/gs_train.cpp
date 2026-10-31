@@ -115,7 +115,7 @@ int main(int argc, char** argv) {
     init.subject_only = options.masked;
     init.max_gaussians = max_init;
     gs::SplatScene scene = gs::initialize_gaussians(ds, init, &init_stats);
-    if (options.masked && ds.has_masks) options.head = gs::estimate_head(ds, scene);
+    if (options.masked && ds.has_masks && init_stats.source != "random") options.head = gs::estimate_head(ds, scene);
     if (options.head.found) {
       std::printf("head region: centre %.2f %.2f %.2f, radius %.2f m (subject %.2f m tall), weight %.1f\n",
                   options.head.center[0], options.head.center[1], options.head.center[2], options.head.radius,

@@ -403,8 +403,11 @@ Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, js
     init.subject_only = options.masked;
     gs::InitStats init_stats;
     gs::SplatScene scene = gs::initialize_gaussians(ds, init, &init_stats);
-    // From the subject's points only: with the background in, the top would be the ceiling.
-    if (options.masked && ds.has_masks) options.head = gs::estimate_head(ds, scene);
+    // From the subject's points only: with the background in, the top would be the
+    // ceiling, and random points (no depth or points) say nothing about the subject.
+    if (options.masked && ds.has_masks && init_stats.source != "random") {
+      options.head = gs::estimate_head(ds, scene);
+    }
     const double init_ms = ms_since(t1);
 
     for (size_t i = 0; i < ds.frames.size(); ++i) {
