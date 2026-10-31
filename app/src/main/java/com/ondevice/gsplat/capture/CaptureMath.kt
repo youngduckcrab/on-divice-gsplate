@@ -74,7 +74,8 @@ object CaptureMath {
         val dx = camera[0] - subject[0]
         val dz = camera[2] - subject[2]
         if (dx * dx + dz * dz < 1e-6f) return -1
-        val degrees = (Math.toDegrees(atan2(dx, dz).toDouble()) + 360.0) % 360.0
+        // In double: a float -pi/2 is a hair past -90 degrees and would land in the previous bin.
+        val degrees = (Math.toDegrees(atan2(dx.toDouble(), dz.toDouble())) + 360.0) % 360.0
         return min(BINS - 1, (degrees / (360.0 / BINS)).toInt())
     }
 
