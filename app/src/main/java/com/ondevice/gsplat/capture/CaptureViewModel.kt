@@ -70,7 +70,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         private set
 
     var controller: CaptureController? = null
-    private var pipeline: FramePipeline? = null
+    @Volatile private var pipeline: FramePipeline? = null  // read from the GL thread (onKeyframe)
     private var handle = 0L
     private var scanDir: File? = null
     private var scanName = ""

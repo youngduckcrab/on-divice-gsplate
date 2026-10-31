@@ -72,7 +72,8 @@ class CaptureController(
 
     // Commands from the UI thread.
     @Volatile private var anchorRequested = false
-    @Volatile private var resetRequested = false
+    // Starts true: the engine's keyframe state may be left from an earlier capture.
+    @Volatile private var resetRequested = true
     /** The engine capture keyframes go to while recording (NativeCapture.begin). */
     @Volatile var handle = 0L
     @Volatile var recording = false

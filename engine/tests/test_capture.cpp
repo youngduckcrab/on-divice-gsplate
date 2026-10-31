@@ -188,6 +188,19 @@ void test_depth_gate() {
   EXPECT(cut > 0.05f, "depth gate cut %.4f", cut);
   EXPECT(mask[20 * w + 50] == 255 && mask[20 * w + 41] == 255, "subject or its blurred edge cut");
   EXPECT(mask[20 * w + 85] == 0 && mask[40 * w + 80] == 0, "the person behind was not cut");
+  // With the wall's depth missing (too far for ARCore), the person behind is
+  // still cut up to their outline; the subject's blurred edge still stays.
+  std::vector<float> holes = depth;
+  for (float& z : holes) z = z == 4.0f ? 0.0f : z;
+  for (uint32_t v = 0; v < dh; ++v) holes[v * dw + 8] = 4.0f;  // the subject's edge, as before
+  std::vector<uint8_t> m3(w * h, 0);
+  for (uint32_t y = 10; y < 50; ++y) {
+    for (uint32_t x = 40; x < 60; ++x) m3[y * w + x] = 255;
+    for (uint32_t x = 70; x < 95; ++x) m3[y * w + x] = 255;
+  }
+  gs::gate_by_depth(m3.data(), w, h, holes.data(), nullptr, dw, dh, c2w, 100, 100, 50, 30, anchor, up);
+  EXPECT(m3[20 * w + 41] == 255 && m3[20 * w + 50] == 255, "subject edge cut with the wall unknown");
+  EXPECT(m3[20 * w + 71] == 0 && m3[20 * w + 93] == 0 && m3[11 * w + 85] == 0, "person behind kept at their outline");
   // Missing depth decides nothing.
   std::vector<float> none(dw * dh, 0.0f);
   std::vector<uint8_t> m2(w * h, 255);

@@ -292,8 +292,8 @@ float gate_by_depth(uint8_t* mask, uint32_t w, uint32_t h, const float* depth, c
                     uint32_t dw, uint32_t dh, const float c2w[16], float fx, float fy, float cx, float cy,
                     const float anchor[3], const float up[3], float radius, uint8_t min_confidence) {
   if (depth == nullptr || dw < 3 || dh < 3) return 0.0f;
-  // Depth samples further than `radius` from the axis.
-  std::vector<uint8_t> far(size_t(dw) * dh, 0);
+  // Depth samples near the axis (1), further than `radius` (2), or unknown (0).
+  std::vector<uint8_t> state(size_t(dw) * dh, 0);
   for (uint32_t v = 0; v < dh; ++v) {
     for (uint32_t u = 0; u < dw; ++u) {
       const size_t i = size_t(v) * dw + u;
@@ -308,17 +308,28 @@ float gate_by_depth(uint8_t* mask, uint32_t w, uint32_t h, const float* depth, c
       }
       const float along = dot3(d, up);
       const float off[3] = {d[0] - along * up[0], d[1] - along * up[1], d[2] - along * up[2]};
-      far[i] = dot3(off, off) > radius * radius ? 1 : 0;
+      state[i] = dot3(off, off) > radius * radius ? 2 : 1;
     }
   }
-  std::vector<uint8_t> sure(far.size(), 0);
-  for (uint32_t v = 1; v + 1 < dh; ++v) {
-    for (uint32_t u = 1; u + 1 < dw; ++u) {
-      bool all = true;
-      for (int dy = -1; dy <= 1 && all; ++dy) {
-        for (int dx = -1; dx <= 1 && all; ++dx) all = far[size_t(v + dy) * dw + (u + dx)] != 0;
+  // Cut a far sample only with no near sample within two (the subject's own
+  // edge, where depth blurs into the background, stays) and at least three
+  // far ones round it (not a stray value). Unknown samples decide nothing.
+  std::vector<uint8_t> sure(state.size(), 0);
+  for (int v = 0; v < int(dh); ++v) {
+    for (int u = 0; u < int(dw); ++u) {
+      if (state[size_t(v) * dw + u] != 2) continue;
+      bool near = false;
+      int far = 0;
+      for (int dy = -2; dy <= 2 && !near; ++dy) {
+        for (int dx = -2; dx <= 2 && !near; ++dx) {
+          const int x = u + dx, y = v + dy;
+          if (x < 0 || y < 0 || x >= int(dw) || y >= int(dh)) continue;
+          const uint8_t st = state[size_t(y) * dw + x];
+          near = st == 1;
+          if (st == 2 && std::abs(dx) <= 1 && std::abs(dy) <= 1) ++far;
+        }
       }
-      sure[size_t(v) * dw + u] = all ? 1 : 0;
+      sure[size_t(v) * dw + u] = !near && far >= 4 ? 1 : 0;  // itself and 3 more
     }
   }
   double cleared = 0.0;

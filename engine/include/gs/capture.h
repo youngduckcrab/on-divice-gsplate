@@ -79,10 +79,10 @@ SubjectSelection select_subject(uint8_t* mask, uint32_t w, uint32_t h, const Sub
 // Clears mask pixels whose depth puts them further than `radius` metres from
 // the subject's vertical axis (through `anchor` along `up`): someone else who
 // touches the subject in the image. A depth sample (metres, 0 = none; aligned
-// with the image, any resolution) counts only when it and its 8 neighbours all
-// lie that far, so the subject's own edge, where depth blurs into the
-// background, stays. Intrinsics are at the mask's resolution. Returns the
-// fraction of the image cleared.
+// with the image, any resolution) counts only with no sample near the axis
+// within two samples, so the subject's own edge, where depth blurs into the
+// background, stays, and with at least three far neighbours. Intrinsics are
+// at the mask's resolution. Returns the fraction of the image cleared.
 float gate_by_depth(uint8_t* mask, uint32_t w, uint32_t h, const float* depth, const uint8_t* confidence,
                     uint32_t depth_w, uint32_t depth_h, const float c2w[16], float fx, float fy, float cx, float cy,
                     const float anchor[3], const float up[3], float radius = 0.8f, uint8_t min_confidence = 1);
