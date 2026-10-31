@@ -1,5 +1,6 @@
 package com.ondevice.gsplat.ui
 
+import android.net.Uri
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -10,6 +11,7 @@ import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -25,13 +27,21 @@ import java.io.File
 private val tabs = listOf("촬영", "학습", "뷰어", "진단")
 
 @Composable
-fun AppScreen() {
+fun AppScreen(incomingZip: Uri? = null, onIncomingTaken: () -> Unit = {}) {
     var selected by rememberSaveable { mutableIntStateOf(0) }
     // A trained model waiting to be opened by the viewer tab.
     var pendingModel by remember { mutableStateOf<File?>(null) }
     // Training takes minutes and stops if the screen sleeps; keep it on on every tab.
     val trainVm: TrainViewModel = viewModel()
     val view = LocalView.current
+    // A zip opened from another app: import it on the training tab.
+    LaunchedEffect(incomingZip) {
+        if (incomingZip != null) {
+            selected = 1
+            trainVm.importZip(incomingZip)
+            onIncomingTaken()
+        }
+    }
     DisposableEffect(trainVm.running) {
         view.keepScreenOn = trainVm.running
         onDispose { view.keepScreenOn = false }

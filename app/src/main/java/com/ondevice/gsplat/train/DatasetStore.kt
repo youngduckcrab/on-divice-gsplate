@@ -81,9 +81,9 @@ object DatasetStore {
      * Extracts a zip holding a transforms.json (at its root or in one folder) and
      * returns the new dataset. Entries whose data fails the CRC check (a damaged
      * download) are left out and reported; the trainer then skips those frames.
-     * [onProgress] gets the fraction of the zip read.
+     * [onProgress] gets the bytes of the zip read so far and its size (-1 if unknown).
      */
-    fun importZip(context: Context, uri: Uri, onProgress: (Float) -> Unit): ImportResult {
+    fun importZip(context: Context, uri: Uri, onProgress: (Long, Long) -> Unit): ImportResult {
         val resolver = context.contentResolver
         var displayName = "dataset"
         var total = -1L
@@ -103,6 +103,13 @@ object DatasetStore {
                 ZipInputStream(counting).use { zip ->
                     val buffer = ByteArray(1 shl 16)
                     var lastReport = 0L
+                    fun report() {
+                        if (counting.count - lastReport > (1 shl 20)) {
+                            lastReport = counting.count
+                            onProgress(counting.count, total)
+                        }
+                    }
+                    onProgress(0L, total)
                     while (true) {
                         val entry = try {
                             zip.nextEntry
@@ -114,7 +121,20 @@ object DatasetStore {
                         if (name.startsWith("/") || name.split('/').any { it == ".." }) {
                             throw IOException("잘못된 zip 항목: $name")
                         }
-                        if (entry.isDirectory || skipped.any { name.endsWith(it) || name.contains(it) }) continue
+                        if (entry.isDirectory) continue
+                        if (skipped.any { name.endsWith(it) || name.contains(it) }) {
+                            // Read through it here (not in nextEntry) so progress moves over a large video.
+                            while (true) {
+                                val n = try {
+                                    zip.read(buffer)
+                                } catch (e: ZipException) {
+                                    -1
+                                }
+                                if (n < 0) break
+                                report()
+                            }
+                            continue
+                        }
                         val out = File(staging, name)
                         out.parentFile?.mkdirs()
                         var intact = true
@@ -128,10 +148,7 @@ object DatasetStore {
                                 }
                                 if (n < 0) break
                                 stream.write(buffer, 0, n)
-                                if (total > 0 && counting.count - lastReport > (1 shl 20)) {
-                                    lastReport = counting.count
-                                    onProgress((counting.count.toFloat() / total).coerceIn(0f, 1f))
-                                }
+                                report()
                             }
                         }
                         if (!intact) {

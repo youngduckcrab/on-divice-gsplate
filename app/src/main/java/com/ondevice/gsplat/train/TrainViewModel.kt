@@ -67,6 +67,9 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         private set
     var exporting by mutableStateOf(false)
         private set
+    /** What zip import or export is doing, shown by the dataset list. */
+    var importMessage by mutableStateOf("")
+        private set
     var status by mutableStateOf("")
         private set
 
@@ -161,14 +164,22 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun importZip(uri: Uri) {
-        if (running || phase == Phase.IMPORTING) return
+        if (running) {
+            importMessage = "학습 중에는 불러올 수 없어요. 학습이 끝난 뒤에 다시 눌러 주세요"
+            return
+        }
+        if (phase == Phase.IMPORTING) return
         viewModelScope.launch {
             phase = Phase.IMPORTING
             importProgress = 0f
-            status = "압축 푸는 중…"
+            importMessage = "zip 여는 중…"
+            status = importMessage
             val imported = withContext(Dispatchers.IO) {
                 runCatching {
-                    DatasetStore.importZip(getApplication(), uri) { p -> importProgress = p }
+                    DatasetStore.importZip(getApplication(), uri) { read, total ->
+                        if (total > 0) importProgress = (read.toFloat() / total).coerceIn(0f, 1f)
+                        importMessage = "압축 푸는 중… ${mb(read)}" + if (total > 0) " / ${mb(total)}" else ""
+                    }
                 }
             }
             phase = Phase.IDLE
@@ -185,7 +196,13 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
             }.onFailure {
                 status = "불러오기 실패: ${it.message ?: it}"
             }
+            importMessage = status
         }
+    }
+
+    /** The file picker came back without a file. */
+    fun importCancelled() {
+        importMessage = "파일이 선택되지 않았어요. 선택 창에서 zip 파일을 눌러 주세요"
     }
 
     /** Writes [info] as a zip to [uri] (DatasetStore.exportZip). */
@@ -193,15 +210,18 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         if (running || phase == Phase.IMPORTING || exporting) return
         if (!File(info.dir, "transforms.json").exists()) {
             status = "아직 파일을 저장하는 중이라 내보낼 수 없어요. 잠시 뒤에 다시 눌러 주세요"
+            importMessage = status
             return
         }
         exporting = true
         viewModelScope.launch {
             status = "데이터셋 내보내는 중… (${info.name})"
+            importMessage = status
             val written = withContext(Dispatchers.IO) {
                 runCatching {
                     DatasetStore.exportZip(getApplication(), info, uri) { p ->
                         status = "데이터셋 내보내는 중… ${(p * 100).toInt()}% (${info.name})"
+                        importMessage = status
                     }
                 }
             }
@@ -210,6 +230,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                 { "내보냄: ${info.name}.zip (${"%.0f".format(Locale.US, it / 1e6)} MB)" },
                 { "내보내기 실패: ${it.message ?: it}" },
             )
+            importMessage = status
         }
     }
 
@@ -613,6 +634,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun sec(ms: Double) = "%.1f s".format(Locale.US, ms / 1000.0)
 
+    private fun mb(bytes: Long) = "%.0f MB".format(Locale.US, bytes / 1e6)
     private fun cm(m: Double) = "%.1f cm".format(Locale.US, m * 100)
     private fun deg(d: Double) = "%.2f°".format(Locale.US, d)
     private fun f1(v: Double) = "%.1f".format(Locale.US, v)

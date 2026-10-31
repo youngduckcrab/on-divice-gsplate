@@ -60,7 +60,7 @@ fun TrainScreen(onOpenModel: (File) -> Unit, vm: TrainViewModel = viewModel()) {
     }
     val context = LocalContext.current
     val importZip = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) vm.importZip(uri)
+        if (uri != null) vm.importZip(uri) else vm.importCancelled()
     }
     val exportPly = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/octet-stream"),
@@ -181,6 +181,7 @@ private fun DatasetCard(
                 }
                 TextButton(onClick = onOpenDownloads) { Text("데이터셋 받기") }
             }
+            if (vm.importMessage.isNotEmpty()) Text(vm.importMessage, style = MaterialTheme.typography.bodySmall)
         }
     }
 }
