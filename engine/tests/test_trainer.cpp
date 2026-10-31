@@ -218,6 +218,34 @@ void test_retune(gs::VkContext& ctx) {
   EXPECT(max_diff <= 1e-5 * max_abs, "gradients with retuning differ by %.3g", max_diff);
 }
 
+void test_bucket_refit(gs::VkContext& ctx) {
+  // Pair buffers sized for an early peak (here: an oversized first guess) can
+  // leave no room for bucket state; at the next retune they are sized to the
+  // recent steps and bucket is timed again.
+  using R = gs::TrainOptions::Reduction;
+  gs::Dataset ds = gs::make_test_dataset(kWidth, kHeight, 2, false, 3);
+  gs::SplatScene scene = gs::make_test_scene(120, 1, 9);
+  gs::TrainOptions o = gs::frozen_train_options(1, false);
+  o.iterations = 6;
+  o.reduction = R::SerialCut;
+  o.alternatives = {R::Bucket};
+  o.retune_first = 3;
+  o.retune_interval = 1000;
+  o.min_pair_capacity = 64;
+  o.initial_pair_guess = 400000;  // about 15 MB of bucket state
+  o.bucket_state_limit = 4 << 20;
+  gs::Trainer t(ctx, ds, scene, o);
+  t.steps(o.iterations);
+  EXPECT(t.retunes().size() == 1, "%zu retunes", t.retunes().size());
+  if (!t.retunes().empty()) {
+    for (const auto& [name, ms] : t.retunes()[0].ms) {
+      EXPECT(ms < 1e29, "%s not timed at step %u after refitting the pair buffers", name.c_str(),
+             t.retunes()[0].step);
+    }
+  }
+  EXPECT(t.stats().overflow_steps == 0, "%u overflow steps", t.stats().overflow_steps);
+}
+
 void test_batched_matches_single(gs::VkContext& ctx) {
   // Steps recorded kBatch to a submission (pair count read on the GPU) must
   // train exactly like steps run one at a time. Densification places new
@@ -524,6 +552,7 @@ int main() {
     test_bucket_long_lists(ctx);
     test_footprint(ctx);
     test_retune(ctx);
+    test_bucket_refit(ctx);
     test_batched_matches_single(ctx);
     test_pair_overflow_retry(ctx);
     test_probes(ctx);

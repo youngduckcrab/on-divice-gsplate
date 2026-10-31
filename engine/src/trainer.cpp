@@ -477,9 +477,26 @@ void Trainer::reserve_pairs(uint64_t expected) {
   // Bucket state: every tile's buckets after the first fit below n / 32 + tiles + 1.
   const uint64_t buckets = n / kBucketLanes + uint64_t(tiles_x_) * tiles_y_ + 1;
   const uint64_t state_bytes = buckets * kTileSize * kTileSize * 16;
-  bucket_fits_ = state_bytes <= ctx_.info().properties.limits.maxStorageBufferRange;
+  uint64_t limit = ctx_.info().properties.limits.maxStorageBufferRange;
+  if (options_.bucket_state_limit > 0) limit = std::min(limit, options_.bucket_state_limit);
+  bucket_fits_ = state_bytes <= limit;
   bucket_state_ = ctx_.create_buffer(bucket_fits_ ? state_bytes : 16, MemoryKind::Device);
   bucket_list_ = ctx_.create_buffer((buckets + 1) * 4, MemoryKind::Device);
+}
+
+void Trainer::refit_pairs() {
+  // The buffers only grow, sized for the most pairs any step had. Early on,
+  // while the initial gaussians are large, that can be several times what
+  // training settles at, and past what bucket state can cover; size them to
+  // the steps since the last retune instead, so bucket can run again.
+  const uint64_t recent = recent_pairs_max_;
+  recent_pairs_max_ = 0;
+  if (bucket_fits_ || recent == 0) return;
+  const uint64_t wanted = recent + recent / 8;
+  if (std::max<uint64_t>(wanted + wanted / 4, options_.min_pair_capacity) >= pair_capacity_) return;
+  max_pairs_seen_ = recent;
+  pair_capacity_ = 0;  // reallocate at the smaller size
+  reserve_pairs(max_pairs_seen_);
 }
 
 bool Trainer::select_backward(const std::string& name) {
@@ -607,6 +624,7 @@ bool Trainer::read_slot(uint32_t slot) {
   stats_.pairs = small[0];
   stats_.tile_mismatch = small[1];
   max_pairs_seen_ = std::max<uint64_t>(max_pairs_seen_, small[0]);
+  recent_pairs_max_ = std::max<uint64_t>(recent_pairs_max_, small[0]);
   const float* v = static_cast<const float*>(readback_losses_[slot].mapped());
   // Per tile (train_forward): |e|, e^2, SSIM, w |e|, w SSIM, w, head e^2, head pixels.
   for (double& s : last_losses_) s = 0.0;
@@ -634,7 +652,9 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
   if (target != nullptr) std::memcpy(targets_[0].mapped(), target, size_t(width_) * height_ * 4);
   for (;;) {
     // Before the first count, guess: a few tiles per gaussian.
-    reserve_pairs(max_pairs_seen_ > 0 ? max_pairs_seen_ : uint64_t(slots_) * 4);
+    reserve_pairs(max_pairs_seen_ > 0          ? max_pairs_seen_
+                  : options_.initial_pair_guess ? options_.initial_pair_guess
+                                                : uint64_t(slots_) * 4);
     write_frame(0, camera, background, masked_target, stats_.step, needs_bucket_state(train, retune), ssim);
 
     if (!profile && !retune) {
@@ -673,6 +693,7 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
     std::memcpy(&pairs, readback_smalls_[0].mapped(), 4);
     if (pairs > pair_capacity_) {
       max_pairs_seen_ = std::max<uint64_t>(max_pairs_seen_, pairs);
+      recent_pairs_max_ = std::max<uint64_t>(recent_pairs_max_, pairs);
       continue;
     }
     profile_ = PassTimes{};
@@ -785,6 +806,7 @@ uint32_t Trainer::steps(uint32_t count) {
   while (done < count && !finished()) {
     // Singly: the first step (no pair count yet) and retuning steps.
     if (max_pairs_seen_ == 0 || retune_due(stats_.step + 1)) {
+      if (retune_due(stats_.step + 1)) refit_pairs();
       step();
       ++done;
       continue;

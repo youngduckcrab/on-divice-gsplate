@@ -345,21 +345,47 @@ SplatScene initialize_gaussians(const Dataset& ds, const InitOptions& options, I
       hi[k] = std::max(hi[k], points[i * 3 + k]);
     }
   }
-  const float diag = std::sqrt((hi[0] - lo[0]) * (hi[0] - lo[0]) + (hi[1] - lo[1]) * (hi[1] - lo[1]) +
-                               (hi[2] - lo[2]) * (hi[2] - lo[2])) + 1e-6f;
-  auto occupied = [&](float voxel) {
-    std::unordered_map<uint64_t, uint32_t> cells;
-    cells.reserve(raw / 4 + 16);
-    for (size_t i = 0; i < raw; ++i) {
-      const int64_t x = int64_t(std::floor((points[i * 3 + 0] - lo[0]) / voxel));
-      const int64_t y = int64_t(std::floor((points[i * 3 + 1] - lo[1]) / voxel));
-      const int64_t z = int64_t(std::floor((points[i * 3 + 2] - lo[2]) / voxel));
-      cells.emplace(voxel_key(x, y, z), 0);
+  // What the points span without the strays (depth smeared off an edge,
+  // flyers), which can be metres away: it sizes the searches below and caps
+  // the initial scales.
+  float extent = 1e-6f;
+  {
+    std::vector<float> axis(raw);
+    float e2 = 0.0f;
+    for (int k = 0; k < 3; ++k) {
+      for (size_t i = 0; i < raw; ++i) axis[i] = points[i * 3 + k];
+      const size_t a = raw / 200, b = raw - 1 - raw / 200;
+      std::nth_element(axis.begin(), axis.begin() + a, axis.end());
+      const float low = axis[a];
+      std::nth_element(axis.begin(), axis.begin() + b, axis.end());
+      e2 += (axis[b] - low) * (axis[b] - low);
     }
-    return cells.size();
+    extent += std::sqrt(e2);
+  }
+  // Occupied cells of a grid, counted by sorting the cell keys.
+  std::vector<uint64_t> keys;
+  auto occupied = [&](const std::vector<float>& p, float cell) {
+    const size_t count = p.size() / 3;
+    keys.resize(count);
+    for (size_t i = 0; i < count; ++i) {
+      const int64_t x = int64_t(std::floor((p[i * 3 + 0] - lo[0]) / cell));
+      const int64_t y = int64_t(std::floor((p[i * 3 + 1] - lo[1]) / cell));
+      const int64_t z = int64_t(std::floor((p[i * 3 + 2] - lo[2]) / cell));
+      keys[i] = voxel_key(x, y, z);
+    }
+    std::sort(keys.begin(), keys.end());
+    return size_t(std::unique(keys.begin(), keys.end()) - keys.begin());
   };
-  // Merge points per voxel only when over budget; the voxel size is binary
-  // searched so the occupied voxel count lands just under the budget.
+  // The cell size whose occupied count lands just under `target`, searched in log space.
+  auto cell_for = [&](const std::vector<float>& p, size_t target) {
+    float small = extent * 1e-4f, large = extent * 0.1f;
+    for (int it = 0; it < 12; ++it) {
+      const float mid = std::sqrt(small * large);
+      (occupied(p, mid) > target ? small : large) = mid;
+    }
+    return large;
+  };
+  // Merge points per voxel only when over budget.
   float voxel = 0.0f;
   std::vector<float> merged;
   std::vector<float> merged_colors;
@@ -367,12 +393,7 @@ SplatScene initialize_gaussians(const Dataset& ds, const InitOptions& options, I
     merged = std::move(points);
     merged_colors = std::move(colors);
   } else {
-    float voxel_lo = diag * 1e-5f, voxel_hi = diag;
-    for (int it = 0; it < 16; ++it) {
-      const float mid = std::sqrt(voxel_lo * voxel_hi);
-      (occupied(mid) > options.max_gaussians ? voxel_lo : voxel_hi) = mid;
-    }
-    voxel = voxel_hi;
+    voxel = cell_for(points, options.max_gaussians);
 
     struct Cell {
       double p[3] = {0, 0, 0};
@@ -403,8 +424,8 @@ SplatScene initialize_gaussians(const Dataset& ds, const InitOptions& options, I
   const size_t n = merged.size() / 3;
 
   // Scale from the mean distance to the 3 nearest neighbours, searched in a
-  // grid sized from the expected spacing of points on a surface.
-  const float cell_size = std::max(2.0f * voxel, 2.0f * diag / std::sqrt(float(std::max<size_t>(n, 1))));
+  // grid of about two points' spacing (a few points per cell).
+  const float cell_size = 2.0f * (voxel > 0.0f ? voxel : cell_for(merged, std::max<size_t>(n / 2, 1)));
   std::unordered_map<uint64_t, std::vector<uint32_t>> grid;
   auto cell_of = [&](const float* p, int64_t out[3]) {
     for (int k = 0; k < 3; ++k) out[k] = int64_t(std::floor((p[k] - lo[k]) / cell_size));
@@ -450,7 +471,7 @@ SplatScene initialize_gaussians(const Dataset& ds, const InitOptions& options, I
       }
     }
     const float dist = found > 0 ? mean / found : cell_size;
-    const float scale = std::clamp(dist, 1e-4f * diag, 0.02f * diag);
+    const float scale = std::clamp(dist, 1e-4f * extent, 0.02f * extent);
     for (int k = 0; k < 3; ++k) {
       scene.positions[i * 3 + k] = p[k];
       scene.log_scales[i * 3 + k] = std::log(scale);

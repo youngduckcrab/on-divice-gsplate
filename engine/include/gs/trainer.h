@@ -87,6 +87,12 @@ struct TrainOptions {
   uint32_t retune_interval = 500;
   // Smallest pair buffer allocation; tests lower it to exercise overflow.
   uint32_t min_pair_capacity = 1 << 16;
+  // Upper bound on the bucket backward's state buffer (0: the device's
+  // binding limit); tests lower it to exercise the limit.
+  uint64_t bucket_state_limit = 0;
+  // Pairs to allocate for before the first step counts them (0: four per
+  // gaussian); tests raise it to start with oversized buffers.
+  uint64_t initial_pair_guess = 0;
   uint32_t seed = 1;
 };
 
@@ -251,6 +257,7 @@ class Trainer {
   void after_step();                              // runs them
   // Pair buffers for `expected` pairs plus headroom; grows, never shrinks.
   void reserve_pairs(uint64_t expected);
+  void refit_pairs();  // shrink the pair buffers to recent counts when bucket state no longer fits
   bool needs_bucket_state(bool train, bool retune) const;
   // The passes of one view, reading slot `slot`.
   void record_project(VkCommandBuffer cmd, uint32_t slot);
@@ -290,6 +297,7 @@ class Trainer {
   double last_losses_[8] = {};
   void set_view_stats();                       // l1, psnr, ssim, loss from last_losses_
   uint64_t max_pairs_seen_ = 0;
+  uint64_t recent_pairs_max_ = 0;  // since the last retune
   uint32_t last_slot_ = 0;  // slot of the last step, whose frame data densify() reuses
   VkDescriptorPool set_pool_ = VK_NULL_HANDLE;
   std::map<std::vector<uint64_t>, VkDescriptorSet> sets_;

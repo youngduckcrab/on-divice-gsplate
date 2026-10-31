@@ -108,11 +108,16 @@ def subject_setup(name: str, assets: str):
     return parts, spec
 
 
-def render_mesh_subject(name: str, assets: str, k: Intrinsics, frames: int, out: str):
+def render_mesh_subject(name: str, assets: str, k: Intrinsics, frames: int, out: str,
+                        radius: float | None = None, heights: tuple[float, float] | None = None):
     import mesh_capture as mc
 
     parts, spec = subject_setup(name, assets)
     spec.frames = frames
+    if radius is not None:
+        spec.radius = radius
+    if heights is not None:
+        spec.heights = heights
     poses, timestamps = handheld_orbit(spec)
     renderer = mc.MeshRenderer(parts, k)
     rng = np.random.default_rng(spec.seed + 100)
@@ -244,6 +249,8 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=720)
     parser.add_argument("--height", type=int, default=1280)
     parser.add_argument("--zip", action="store_true", help="also write <out>.zip")
+    parser.add_argument("--radius", type=float, help="orbit radius in metres (mesh subjects; default per subject)")
+    parser.add_argument("--heights", type=float, nargs=2, help="camera heights of the two laps (mesh subjects)")
     args = parser.parse_args()
 
     k = Intrinsics.portrait_phone(args.width, args.height)
@@ -257,7 +264,8 @@ def main() -> None:
         for sub in ["masks", "depth", "depth_confidence", "depth_gt"]:
             os.rmdir(os.path.join(args.out, sub))
     else:
-        records, spec = render_mesh_subject(args.subject, args.assets, k, args.frames, args.out)
+        records, spec = render_mesh_subject(args.subject, args.assets, k, args.frames, args.out, args.radius,
+                                            tuple(args.heights) if args.heights else None)
 
     transforms = {
         "camera_model": "OPENCV",
