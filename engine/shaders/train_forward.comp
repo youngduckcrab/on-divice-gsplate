@@ -23,11 +23,26 @@ layout(std430, binding = 10) writeonly buffer TileCount { uint tile_count[]; };
 // For the bucket backward pass (kFlagBucketState; see train_backward_bucket.comp):
 // each pixel's front colour and T at the start of every 32 splats after the
 // first, the buckets to process, and dL/dC . colour per pixel.
+// Bucket states fill bucket_state, then bucket_state2: limits.z buckets each
+// (two buffers reach twice the binding limit).
 layout(std430, binding = 11) writeonly buffer BucketState { vec4 bucket_state[]; };
 layout(std430, binding = 12) buffer BucketList { uint bucket_list[]; };  // count, then tile << 16 | bucket
 layout(std430, binding = 13) writeonly buffer PixelDot { float pixel_dot[]; };
 // kFlagSsim: render and target colour per pixel (2 per pixel) for train_ssim.
 layout(std430, binding = 14) writeonly buffer SsimInput { vec4 ssim_input[]; };
+layout(std430, binding = 15) writeonly buffer BucketState2 { vec4 bucket_state2[]; };
+
+// Pixel `lid`'s state at the start of bucket slot `index` (bucket_base + k - 1).
+// A slot past both buffers is not written: that step has more pairs than the
+// state covers (limits.w), so its update is skipped and the bucket list left out.
+void store_bucket_state(uint index, uint lid, vec4 value) {
+  uint per = frame.limits.z;
+  if (index < per) {
+    bucket_state[index * (kTile * kTile) + lid] = value;
+  } else if (index - per < per) {
+    bucket_state2[(index - per) * (kTile * kTile) + lid] = value;
+  }
+}
 
 const uint BATCH = 256u;
 shared vec4 s_g0[BATCH];  // centre xy, opacity, unused
@@ -78,7 +93,7 @@ void main() {
     for (uint j = 0u; !done && j < n; ++j) {
       ++contributor;
       if (buckets && (contributor & 31u) == 1u && contributor > 1u) {
-        bucket_state[(bucket_base + (contributor >> 5u) - 1u) * (kTile * kTile) + lid] = vec4(C, T);
+        store_bucket_state(bucket_base + (contributor >> 5u) - 1u, lid, vec4(C, T));
       }
       vec2 d = s_g0[j].xy - center;
       vec3 con = s_g1[j].xyz;
@@ -137,9 +152,10 @@ void main() {
     tile_loss[tile_id * 2u + 1u] = vec4(0.0, s_more[0].yzw);
     tile_count[tile_id] = s_count[0];
     uint len = range.y - range.x;
-    if (buckets && len > 0u) {
+    uint count = max(1u, (s_count[0] + 31u) / 32u);
+    // Only tiles whose states were all stored (the others belong to a step whose update is skipped).
+    if (buckets && len > 0u && (count == 1u || bucket_base + count - 2u < 2u * frame.limits.z)) {
       // At least one bucket, whose lanes also zero the pairs behind the last contributor.
-      uint count = max(1u, (s_count[0] + 31u) / 32u);
       uint first = atomicAdd(bucket_list[0], count);
       for (uint k = 0u; k < count; ++k) bucket_list[1u + first + k] = (tile_id << 16u) | k;
     }

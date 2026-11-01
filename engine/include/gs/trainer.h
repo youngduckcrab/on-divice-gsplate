@@ -137,8 +137,8 @@ struct TrainOptions {
   uint32_t retune_interval = 500;
   // Smallest pair buffer allocation; tests lower it to exercise overflow.
   uint32_t min_pair_capacity = 1 << 16;
-  // Upper bound on the bucket backward's state buffer (0: the device's
-  // binding limit); tests lower it to exercise the limit.
+  // Upper bound on each of the bucket backward's two state buffers (0: the
+  // device's binding limit); tests lower it to exercise the limit.
   uint64_t bucket_state_limit = 0;
   // Pairs to allocate for before the first step counts them (0: four per
   // gaussian); tests raise it to start with oversized buffers.
@@ -293,6 +293,8 @@ class Trainer {
   const std::string& reduction_note() const { return reduction_note_; }
   // Timings of the backward variants on training steps (TrainOptions::alternatives).
   const std::vector<RetuneResult>& retunes() const { return retunes_; }
+  // Testing: buckets in each of the two bucket state buffers, and the most pairs a step can have for them to cover it.
+  std::pair<uint64_t, uint64_t> bucket_state_size() const { return {bucket_per_buffer_, bucket_pairs_}; }
   // Testing: makes the named variant (one of those created) the active one.
   bool select_backward(const std::string& name);
   // Testing: the pose gradient of the latest pose update: dL/dd xyz, dL/dw xyz.
@@ -383,9 +385,10 @@ class Trainer {
   bool housekeeping_after(uint32_t step) const;  // densification or opacity reset after this step
   bool retune_due(uint32_t step) const;          // time the backward variants on this (1-based) step
   void after_step();                              // runs them
-  // Pair buffers for `expected` pairs plus headroom; grows, never shrinks.
+  // Pair buffers for `expected` pairs plus headroom (grows, never shrinks),
+  // and whether bucket state covers that many.
   void reserve_pairs(uint64_t expected);
-  void refit_pairs();  // shrink the pair buffers to recent counts when bucket state no longer fits
+  void refit_pairs();  // judge by the recent counts when bucket state does not cover the largest
   bool needs_bucket_state(bool train, bool retune) const;
   // The passes of one view, reading slot `slot`.
   void record_project(VkCommandBuffer cmd, uint32_t slot);
@@ -420,7 +423,10 @@ class Trainer {
   std::vector<Backward> backwards_;  // the requested variant, then the alternatives that compiled
   size_t active_ = 0;
   std::vector<RetuneResult> retunes_;
-  bool bucket_fits_ = true;  // bucket_state_ could be sized for the pair capacity
+  bool bucket_fits_ = true;       // the bucket state covers the largest recent step, with headroom
+  uint64_t bucket_per_buffer_ = 0;  // buckets in bucket_state_ and in bucket_state2_
+  uint64_t bucket_pairs_ = 0;       // the most pairs a step can have for them to cover it
+  uint64_t slot_limit_[kBatch] = {};  // per batch slot: the most pairs its update accepts
   // Of the last slot read: sum |e|, e^2, SSIM, w |e|, w SSIM, w, head e^2, head pixels.
   double last_losses_[8] = {};
   void set_view_stats();                       // l1, psnr, ssim, loss from last_losses_
@@ -453,7 +459,7 @@ class Trainer {
   Buffer keys_, values_, pair_gaussian_, pair_grads_;
   std::vector<Buffer> targets_;  // per batch slot
   Buffer pixel_grad_, pixel_count_, image_, ranges_buf_, tile_loss_, tile_count_;
-  Buffer bucket_state_, bucket_list_, pixel_dot_;
+  Buffer bucket_state_, bucket_state2_, bucket_list_, pixel_dot_;
   Buffer grad_sum_, sh_input_;
   Buffer ssim_input_, ssim_maps_;  // per pixel: render and target colour; SSIM gradient parts A, B, C
   Buffer dispatch_args_buf_;  // indirect group counts of the passes over pairs (train_dispatch_args)  // per slot: summed pair gradients; colour gradient and view direction

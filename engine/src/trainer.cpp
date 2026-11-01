@@ -80,7 +80,7 @@ constexpr uint32_t kBucketLanes = 32;   // splats per bucket (train_backward_buc
 constexpr uint32_t kBucketGroups = 8;   // buckets per workgroup
 constexpr uint32_t kScanBlock = 1024;
 constexpr uint32_t kPairGradBytes = 48;
-constexpr uint32_t kBackwardBindings = 12;  // the variants use up to 12 (bucket reads its state)
+constexpr uint32_t kBackwardBindings = 13;  // the variants use up to 13 (bucket reads its state, two buffers)
 
 struct ScanPush {
   uint32_t count;
@@ -175,7 +175,7 @@ Trainer::Trainer(VkContext& ctx, Dataset dataset, const SplatScene& initial, con
   emit_ = make("train_emit", shaders::train_emit, 9, 0);
   dispatch_args_ = make("train_dispatch_args", shaders::train_dispatch_args, 2, sizeof(uint32_t));
   ranges_ = make("train_ranges", shaders::train_ranges, 3, sizeof(uint32_t));
-  forward_ = make("train_forward", shaders::train_forward, 15, 0);
+  forward_ = make("train_forward", shaders::train_forward, 16, 0);
   ssim_ = make("train_ssim", shaders::train_ssim, 4, 0);
   ssim_grad_ = make("train_ssim_grad", shaders::train_ssim_grad, 5, 0);
   pair_sum_ = make("train_pair_sum", shaders::train_pair_sum, 6, 0);
@@ -481,6 +481,10 @@ void Trainer::write_frame(uint32_t slot, const Camera& camera, const float backg
   std::memcpy(&f.densify1[1], &seed, 4);
   f.densify1[2] = 1.6f;
   f.limits[0] = uint32_t(pair_capacity_);
+  // With bucket state, a step with more pairs than it covers must not train.
+  f.limits[2] = bucket_state ? uint32_t(bucket_per_buffer_) : 0;
+  f.limits[3] = uint32_t(bucket_state ? std::min(pair_capacity_, bucket_pairs_) : pair_capacity_);
+  slot_limit_[slot] = f.limits[3];
   f.loss[0] = lambda_at(step);
   f.loss[1] = 0.01f * 0.01f;  // SSIM constants for colours in [0, 1]
   f.loss[2] = 0.03f * 0.03f;
@@ -544,41 +548,53 @@ void Trainer::record_scan(VkCommandBuffer cmd, const Buffer& values, const Buffe
 void Trainer::reserve_pairs(uint64_t expected) {
   // Views differ in pair count, so keep headroom over the largest seen.
   const uint64_t wanted = expected + expected / 8;
-  if (wanted <= pair_capacity_) return;
-  if (expected > max_pairs_) {
-    throw std::runtime_error("타일-가우시안 쌍이 GPU 버퍼 한도를 넘음 (" + std::to_string(expected) + ")");
+  if (wanted > pair_capacity_) {
+    if (expected > max_pairs_) {
+      throw std::runtime_error("타일-가우시안 쌍이 GPU 버퍼 한도를 넘음 (" + std::to_string(expected) + ")");
+    }
+    const uint64_t n =
+        std::min<uint64_t>(max_pairs_, std::max<uint64_t>(wanted + wanted / 4, options_.min_pair_capacity));
+    reset_sets();  // the sets point at the buffers replaced below
+    keys_ = ctx_.create_buffer(n * 4, MemoryKind::Device);
+    values_ = ctx_.create_buffer(n * 4, MemoryKind::Device);
+    pair_gaussian_ = ctx_.create_buffer(n * 4, MemoryKind::Device);
+    pair_grads_ = ctx_.create_buffer(n * kPairGradBytes, MemoryKind::Device);
+    sort_->reserve(static_cast<uint32_t>(n));
+    pair_capacity_ = n;
+    // Bucket state: with p pairs, every tile's buckets after the first fit
+    // below p / 32 + tiles + 1. It goes in two buffers of up to the binding
+    // limit each, sized for the pairs the buffers hold (n) or as many as fit:
+    // sizing it for n alone (headroom included) put it past the limit at
+    // ~700k pairs on the phone, though the steps needed less.
+    const uint64_t tiles = uint64_t(tiles_x_) * tiles_y_;
+    const uint64_t bucket_bytes = uint64_t(kTileSize) * kTileSize * 16;
+    uint64_t limit = ctx_.info().properties.limits.maxStorageBufferRange;
+    if (options_.bucket_state_limit > 0) limit = std::min(limit, options_.bucket_state_limit);
+    const uint64_t per_buffer = std::min<uint64_t>(limit / bucket_bytes, (n / kBucketLanes + tiles + 2) / 2);
+    bucket_per_buffer_ = per_buffer;
+    bucket_pairs_ =
+        2 * per_buffer > tiles + 1 ? std::min<uint64_t>(n, (2 * per_buffer - tiles - 1) * kBucketLanes) : 0;
+    bucket_state_ = ctx_.create_buffer(std::max<uint64_t>(per_buffer * bucket_bytes, 16), MemoryKind::Device);
+    bucket_state2_ = ctx_.create_buffer(std::max<uint64_t>(per_buffer * bucket_bytes, 16), MemoryKind::Device);
+    bucket_list_ = ctx_.create_buffer((n / kBucketLanes + tiles + 2) * 4, MemoryKind::Device);
   }
-  const uint64_t n =
-      std::min<uint64_t>(max_pairs_, std::max<uint64_t>(wanted + wanted / 4, options_.min_pair_capacity));
-  reset_sets();  // the sets point at the buffers replaced below
-  keys_ = ctx_.create_buffer(n * 4, MemoryKind::Device);
-  values_ = ctx_.create_buffer(n * 4, MemoryKind::Device);
-  pair_gaussian_ = ctx_.create_buffer(n * 4, MemoryKind::Device);
-  pair_grads_ = ctx_.create_buffer(n * kPairGradBytes, MemoryKind::Device);
-  sort_->reserve(static_cast<uint32_t>(n));
-  pair_capacity_ = n;
-  // Bucket state: every tile's buckets after the first fit below n / 32 + tiles + 1.
-  const uint64_t buckets = n / kBucketLanes + uint64_t(tiles_x_) * tiles_y_ + 1;
-  const uint64_t state_bytes = buckets * kTileSize * kTileSize * 16;
-  uint64_t limit = ctx_.info().properties.limits.maxStorageBufferRange;
-  if (options_.bucket_state_limit > 0) limit = std::min(limit, options_.bucket_state_limit);
-  bucket_fits_ = state_bytes <= limit;
-  bucket_state_ = ctx_.create_buffer(bucket_fits_ ? state_bytes : 16, MemoryKind::Device);
-  bucket_list_ = ctx_.create_buffer((buckets + 1) * 4, MemoryKind::Device);
+  // A step with more pairs than the state covers is skipped and run again
+  // without bucket (write_frame, read_slot); with headroom that stays rare.
+  bucket_fits_ = bucket_pairs_ > 0 && wanted <= bucket_pairs_;
 }
 
 void Trainer::refit_pairs() {
-  // The buffers only grow, sized for the most pairs any step had. Early on,
-  // while the initial gaussians are large, that can be several times what
-  // training settles at, and past what bucket state can cover; size them to
-  // the steps since the last retune instead, so bucket can run again.
+  // The largest pair count so far can be an early peak (while the initial
+  // gaussians are large) past what bucket state covers. Judge by the steps
+  // since the last retune instead, and size the pair buffers to them.
   const uint64_t recent = recent_pairs_max_;
   recent_pairs_max_ = 0;
   if (bucket_fits_ || recent == 0) return;
-  const uint64_t wanted = recent + recent / 8;
-  if (std::max<uint64_t>(wanted + wanted / 4, options_.min_pair_capacity) >= pair_capacity_) return;
   max_pairs_seen_ = recent;
-  pair_capacity_ = 0;  // reallocate at the smaller size
+  const uint64_t wanted = recent + recent / 8;
+  if (std::max<uint64_t>(wanted + wanted / 4, options_.min_pair_capacity) < pair_capacity_) {
+    pair_capacity_ = 0;  // reallocate at the smaller size
+  }
   reserve_pairs(max_pairs_seen_);
 }
 
@@ -649,7 +665,7 @@ void Trainer::record_rasterize(VkCommandBuffer cmd, uint32_t slot) {
   kernel(cmd, forward_,
          {&frames_[slot], &projected_, &ranges_buf_, &values_, &pair_gaussian_, &targets_[slot], &pixel_grad_,
           &pixel_count_, &image_, &tile_loss_, &tile_count_, &bucket_state_, &bucket_list_, &pixel_dot_,
-          &ssim_input_},
+          &ssim_input_, &bucket_state2_},
          tiles_x_, tiles_y_);
   VkContext::barrier(cmd);
 }
@@ -677,7 +693,7 @@ void Trainer::record_backward(VkCommandBuffer cmd, uint32_t slot, const Backward
       b.bucket ? div_up(pair_capacity_ / kBucketLanes + tiles_x_ * tiles_y_ + 1, kBucketGroups) : tiles_x_;
   kernel(cmd, b.pipeline,
          {&frames_[slot], &projected_, &ranges_buf_, &values_, &pair_gaussian_, &pixel_grad_, &pixel_count_,
-          &pair_grads_, &tile_count_, &bucket_state_, &bucket_list_, &pixel_dot_},
+          &pair_grads_, &tile_count_, &bucket_state_, &bucket_list_, &pixel_dot_, &bucket_state2_},
          groups_x, b.bucket ? 1 : tiles_y_, b.push, sizeof(b.push));
   VkContext::barrier(cmd);
 }
@@ -721,7 +737,7 @@ bool Trainer::read_slot(uint32_t slot) {
   for (uint32_t t = 0; t < tiles_x_ * tiles_y_; ++t) {
     for (int k = 0; k < 8; ++k) last_losses_[k] += v[t * 8 + k];
   }
-  return small[0] > pair_capacity_;
+  return small[0] > slot_limit_[slot];
 }
 
 void Trainer::set_view_stats() {
@@ -782,7 +798,7 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
     });
     uint32_t pairs = 0;
     std::memcpy(&pairs, readback_smalls_[0].mapped(), 4);
-    if (pairs > pair_capacity_) {
+    if (pairs > slot_limit_[0]) {
       max_pairs_seen_ = std::max<uint64_t>(max_pairs_seen_, pairs);
       recent_pairs_max_ = std::max<uint64_t>(recent_pairs_max_, pairs);
       continue;

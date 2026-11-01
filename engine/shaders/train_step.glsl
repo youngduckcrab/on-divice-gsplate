@@ -234,7 +234,7 @@ void main() {
   MotionShare share = MotionShare(vec3(0.0), vec3(0.0), false);
   // More pairs than the buffers hold: some were dropped, so the gradients are
   // incomplete. Leave everything as it was; the trainer grows the buffers.
-  if (i < frame.model.x && totals[0] <= frame.limits.x) {
+  if (i < frame.model.x && totals[0] <= frame.limits.w) {
     step_gaussian(i, (flags & kFlagPoseOnly) != 0u, grad_d, grad_w, share);
   }
   uint l = gl_LocalInvocationID.x;

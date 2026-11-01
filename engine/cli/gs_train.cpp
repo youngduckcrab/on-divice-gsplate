@@ -9,6 +9,7 @@
 //            [--no-masks] [--preview <dir>] [--eval-every 1000] [--dssim 0.2 (0 = L1 only)] [--dssim-end L (ramp to L)] [--head-weight 3]
 //            [--refine-poses] [--pose-lr shift,turn] [--pose-from N] [--eval-pose-steps N] [--pose-out poses.json]
 //            [--refine-motion] [--motion-nodes 64] [--motion-lr shift,turn] [--motion-lr-final F] [--motion-from N]
+//            [--bucket-state-limit MB (each of the two bucket state buffers; phones: 128)]
 //            [--motion-reg decay,rigidity,smoothness,center] [--eval-rest <dataset_dir>] (held-out views of a twin
 //            dataset with the subject standing still: the model at rest against it) [--motion-out motion.json]
 #include <chrono>
@@ -112,6 +113,8 @@ int main(int argc, char** argv) {
         options.eval_pose_steps = std::atoi(next());
       } else if (arg == "--pose-out") {
         pose_out = next();
+      } else if (arg == "--bucket-state-limit") {
+        options.bucket_state_limit = uint64_t(std::atof(next()) * 1024 * 1024);
       } else if (arg == "--refine-motion") {
         options.refine_motion = true;
       } else if (arg == "--motion-nodes") {

@@ -35,6 +35,8 @@ layout(std430, binding = 8) readonly buffer TileCount { uint tile_count[]; };
 layout(std430, binding = 9) readonly buffer BucketState { vec4 bucket_state[]; };  // front colour, T
 layout(std430, binding = 10) readonly buffer BucketList { uint bucket_list[]; };
 layout(std430, binding = 11) readonly buffer PixelDot { float pixel_dot[]; };
+// Bucket states past limits.z buckets (train_forward's second buffer).
+layout(std430, binding = 12) readonly buffer BucketState2 { vec4 bucket_state2[]; };
 
 // Same layout as the other variants; unused here.
 layout(push_constant) uniform Push {
@@ -65,8 +67,11 @@ void load_pixel(uint t, uint k, uint p, uvec2 range, out vec4 a, out vec2 b) {
   uint count = pixel_count[pix_id];
   if (count <= k * kLanes) return;  // done before this bucket
   vec3 g = pixel_grad[pix_id].rgb;
-  vec4 front = k == 0u ? vec4(0.0, 0.0, 0.0, 1.0)
-                       : bucket_state[((range.x / kLanes + t) + k - 1u) * kPixels + p];
+  vec4 front = vec4(0.0, 0.0, 0.0, 1.0);
+  if (k > 0u) {
+    uint index = (range.x / kLanes + t) + k - 1u, per = frame.limits.z;
+    front = index < per ? bucket_state[index * kPixels + p] : bucket_state2[(index - per) * kPixels + p];
+  }
   a = vec4(front.w, pixel_dot[pix_id] - dot(g, front.rgb), g.rg);
   b = vec2(g.b, uintBitsToFloat(count));
 }

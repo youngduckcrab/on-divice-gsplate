@@ -218,32 +218,78 @@ void test_retune(gs::VkContext& ctx) {
   EXPECT(max_diff <= 1e-5 * max_abs, "gradients with retuning differ by %.3g", max_diff);
 }
 
-void test_bucket_refit(gs::VkContext& ctx) {
-  // Pair buffers sized for an early peak (here: an oversized first guess) can
-  // leave no room for bucket state; at the next retune they are sized to the
-  // recent steps and bucket is timed again.
+void test_bucket_state_limit(gs::VkContext& ctx) {
   using R = gs::TrainOptions::Reduction;
   gs::Dataset ds = gs::make_test_dataset(kWidth, kHeight, 2, false, 3);
   gs::SplatScene scene = gs::make_test_scene(120, 1, 9);
-  gs::TrainOptions o = gs::frozen_train_options(1, false);
-  o.iterations = 6;
-  o.reduction = R::SerialCut;
-  o.alternatives = {R::Bucket};
-  o.retune_first = 3;
-  o.retune_interval = 1000;
-  o.min_pair_capacity = 64;
-  o.initial_pair_guess = 400000;  // about 15 MB of bucket state
-  o.bucket_state_limit = 4 << 20;
-  gs::Trainer t(ctx, ds, scene, o);
-  t.steps(o.iterations);
-  EXPECT(t.retunes().size() == 1, "%zu retunes", t.retunes().size());
-  if (!t.retunes().empty()) {
-    for (const auto& [name, ms] : t.retunes()[0].ms) {
-      EXPECT(ms < 1e29, "%s not timed at step %u after refitting the pair buffers", name.c_str(),
-             t.retunes()[0].step);
+  {
+    // Pair buffers sized for a large peak (here: an oversized first guess,
+    // about 15 MB of state for every pair they hold) no longer keep bucket
+    // out: its state is sized to what fits (4 MB here) and covers the steps.
+    gs::TrainOptions o = gs::frozen_train_options(1, false);
+    o.iterations = 6;
+    o.reduction = R::SerialCut;
+    o.alternatives = {R::Bucket};
+    o.retune_first = 3;
+    o.retune_interval = 1000;
+    o.min_pair_capacity = 64;
+    o.initial_pair_guess = 400000;
+    o.bucket_state_limit = 4 << 20;
+    gs::Trainer t(ctx, ds, scene, o);
+    t.steps(o.iterations);
+    EXPECT(t.retunes().size() == 1, "%zu retunes", t.retunes().size());
+    if (!t.retunes().empty()) {
+      for (const auto& [name, ms] : t.retunes()[0].ms) {
+        EXPECT(ms < 1e29, "%s not timed at step %u with large pair buffers", name.c_str(), t.retunes()[0].step);
+      }
     }
+    EXPECT(t.stats().overflow_steps == 0, "%u overflow steps", t.stats().overflow_steps);
   }
-  EXPECT(t.stats().overflow_steps == 0, "%u overflow steps", t.stats().overflow_steps);
+  {
+    // A step with more pairs than the bucket state covers (here 2 x 7
+    // buckets: 32 pairs, the first guess 16) must not train on missing
+    // state: it is run again with another variant, so its gradients are
+    // serial_cut's exactly.
+    const float bg[3] = {0.2f, 0.3f, 0.4f};
+    gs::TrainOptions o = gs::frozen_train_options(1, false);
+    o.reduction = R::Bucket;
+    o.initial_pair_guess = 16;
+    o.bucket_state_limit = 7 * 16 * 16 * 16;
+    gs::Trainer small(ctx, ds, scene, o);
+    small.step_on(0, bg);
+    o.reduction = R::SerialCut;
+    o.bucket_state_limit = 0;
+    gs::Trainer serial(ctx, ds, scene, o);
+    serial.step_on(0, bg);
+    const gs::Trainer::Gradients a = small.first_step_gradients(), b = serial.first_step_gradients();
+    double diff = 0.0, largest = 0.0;
+    for (size_t i = 0; i < a.params.size(); ++i) {
+      diff = std::max(diff, double(std::fabs(a.params[i] - b.params[i])));
+      largest = std::max(largest, double(std::fabs(b.params[i])));
+    }
+    std::printf("  bucket state limit: %llu pairs, gradients vs serial_cut max diff %.3g (largest %.3g)\n",
+                (unsigned long long)small.stats().pairs, diff, largest);
+    EXPECT(small.stats().pairs > 32 && largest > 0.0 && diff == 0.0,
+           "step past the bucket state: %llu pairs, gradients differ by %.3g",
+           (unsigned long long)small.stats().pairs, diff);
+
+    // 2 x 12 buckets cover it: the later tiles' states go to the second
+    // buffer, and bucket's gradients match serial_cut's (to rounding).
+    o.reduction = R::Bucket;
+    o.bucket_state_limit = 12 * 16 * 16 * 16;
+    gs::Trainer split(ctx, ds, scene, o);
+    split.step_on(0, bg);
+    const gs::Trainer::Gradients c = split.first_step_gradients();
+    double diff2 = 0.0;
+    for (size_t i = 0; i < c.params.size(); ++i) diff2 = std::max(diff2, double(std::fabs(c.params[i] - b.params[i])));
+    const auto [per_buffer, covered] = split.bucket_state_size();
+    const uint64_t pairs = split.stats().pairs;
+    std::printf("  bucket state in two buffers: %llu buckets each, covers %llu pairs (step %llu), max diff %.3g\n",
+                (unsigned long long)per_buffer, (unsigned long long)covered, (unsigned long long)pairs, diff2);
+    EXPECT(per_buffer == 12 && pairs <= covered && pairs / 32 + 12 > per_buffer && diff2 <= 1e-5 * largest,
+           "bucket state across two buffers: %llu pairs of %llu covered, gradients differ by %.3g",
+           (unsigned long long)pairs, (unsigned long long)covered, diff2);
+  }
 }
 
 void test_pose_gradient(gs::VkContext& ctx, float lambda) {
@@ -887,7 +933,7 @@ int main() {
     test_bucket_long_lists(ctx);
     test_footprint(ctx);
     test_retune(ctx);
-    test_bucket_refit(ctx);
+    test_bucket_state_limit(ctx);
     test_pose_gradient(ctx, 0.0f);
     test_pose_gradient(ctx, 0.5f);
     test_pose_recovery(ctx);

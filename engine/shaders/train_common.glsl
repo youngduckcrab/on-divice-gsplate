@@ -27,7 +27,10 @@ struct FrameData {
   vec4 bias;        // 1 / (1 - beta1^t), 1 / (1 - beta2^t), unused, unused
   vec4 densify0;    // grad threshold, clone max scale, prune min opacity, prune max world scale
   vec4 densify1;    // prune max screen radius, random seed (uint bits), split scale divisor, unused
-  uvec4 limits;     // pair capacity (more pairs: the step is skipped), motion nodes (train_motion.glsl), unused
+  // Pair capacity (emission stops there), motion nodes (train_motion.glsl), bucket
+  // state per buffer in buckets (train_forward: two buffers), the most pairs
+  // this step's update accepts (more: the parameters stay as they were).
+  uvec4 limits;
   vec4 loss;        // D-SSIM weight lambda (loss = (1 - lambda) L1 + lambda (1 - SSIM)), C1, C2, unused
   vec4 head;        // head region in this view: centre x, y and radius (px; 0: none), loss weight
 };
