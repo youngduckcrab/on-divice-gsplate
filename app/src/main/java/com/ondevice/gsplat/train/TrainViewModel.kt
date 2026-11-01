@@ -295,6 +295,35 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         shareFile = null
     }
 
+    /**
+     * Copies [info] with its person masks redone in crops (DatasetStore.refineMasks)
+     * and selects the copy, to train and compare with the original.
+     */
+    fun refineMasks(info: DatasetInfo) {
+        if (!info.masks || !canExport(info)) return
+        exporting = true
+        viewModelScope.launch {
+            importMessage = "마스크 다시 만드는 중… (${info.name})"
+            status = importMessage
+            val made = withContext(Dispatchers.IO) {
+                runCatching {
+                    DatasetStore.refineMasks(getApplication(), info) { p ->
+                        importMessage = "마스크 다시 만드는 중… ${(p * 100).toInt()}% (${info.name})"
+                    }
+                }
+            }
+            exporting = false
+            made.onSuccess { d ->
+                refreshDatasets()
+                select(datasets.firstOrNull { it.dir == d.dir } ?: d)
+                status = "만들었어요: ${d.name} · 원래 스캔과 같은 설정으로 학습해서 비교해 보세요"
+            }.onFailure {
+                status = "마스크 다시 만들기 실패: ${it.message ?: it}"
+            }
+            importMessage = status
+        }
+    }
+
     private fun canExport(info: DatasetInfo): Boolean {
         if (running || phase == Phase.IMPORTING || exporting) return false
         if (!File(info.dir, "transforms.json").exists()) {

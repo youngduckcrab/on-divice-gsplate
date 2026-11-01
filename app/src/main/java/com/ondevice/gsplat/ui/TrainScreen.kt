@@ -118,6 +118,7 @@ fun TrainScreen(onOpenModel: (File) -> Unit, vm: TrainViewModel = viewModel()) {
                         exportWithVideo = what == ExportKind.ZIP_WITH_VIDEO
                         exportDataset.launch("${d.name}.zip")
                     }
+                    ExportKind.REFINE_MASKS -> vm.refineMasks(d)
                 }
             },
         )
@@ -218,7 +219,7 @@ private fun DatasetCard(
     }
 }
 
-private enum class ExportKind { SEND_ZIP, ZIP, ZIP_WITH_VIDEO, SEND_VIDEO, VIDEO }
+private enum class ExportKind { SEND_ZIP, ZIP, ZIP_WITH_VIDEO, SEND_VIDEO, VIDEO, REFINE_MASKS }
 
 @Composable
 private fun DatasetRow(d: DatasetInfo, selected: Boolean, vm: TrainViewModel, onExport: (DatasetInfo, ExportKind) -> Unit) {
@@ -243,7 +244,7 @@ private fun DatasetRow(d: DatasetInfo, selected: Boolean, vm: TrainViewModel, on
             )
         }
         Box {
-            TextButton(enabled = !vm.running && !vm.exporting, onClick = { menu = true }) { Text("내보내기") }
+            TextButton(enabled = !vm.running && !vm.exporting, onClick = { menu = true }) { Text("메뉴") }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                 val items = buildList {
                     add(ExportKind.SEND_ZIP to "데이터셋 zip 바로 보내기 (카톡·Quick Share·드라이브)")
@@ -253,6 +254,7 @@ private fun DatasetRow(d: DatasetInfo, selected: Boolean, vm: TrainViewModel, on
                         add(ExportKind.VIDEO to "촬영 영상 저장 (mp4)")
                         add(ExportKind.ZIP_WITH_VIDEO to "데이터셋 zip + 촬영 영상 저장 (큼)")
                     }
+                    if (d.masks) add(ExportKind.REFINE_MASKS to "마스크 다시 만들기 (정밀, 새 데이터셋으로 복사)")
                 }
                 for ((kind, label) in items) {
                     DropdownMenuItem(

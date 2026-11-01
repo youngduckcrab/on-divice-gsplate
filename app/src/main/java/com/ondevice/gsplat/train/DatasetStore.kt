@@ -22,6 +22,7 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipException
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+import kotlin.math.max
 import kotlin.math.min
 import org.json.JSONObject
 
@@ -301,6 +302,135 @@ object DatasetStore {
     }
 
     /** The image with its mask as alpha, turned upright, as lossy WebP (keeps alpha). */
+    /** Folder name of [info]'s copy with masks redone in crops ([refineMasks]). */
+    fun refinedName(info: DatasetInfo) = "${info.name}-정밀마스크"
+
+    /**
+     * Copies [info] (without its video and cutouts) as a new dataset whose
+     * masks are redone in crops around the person ([MaskRefiner]), each kept to
+     * within 4% of the image of the old mask (which already left out other
+     * people). The old dataset stays as it was, to compare. [onProgress] gets
+     * the fraction of frames done.
+     */
+    fun refineMasks(context: Context, info: DatasetInfo, onProgress: (Float) -> Unit): DatasetInfo {
+        val json = JSONObject(File(info.dir, "transforms.json").readText())
+        val frames = json.getJSONArray("frames")
+        val upright = json.optJSONObject("gsplat_lab")?.optInt("upright_degrees", 0) ?: 0
+        val target = File(root(context), refinedName(info))
+        val staging = File(root(context), ".refine-${System.currentTimeMillis()}")
+        staging.mkdirs()
+        try {
+            val maskPaths = (0 until frames.length()).mapNotNull { frames.getJSONObject(it).optString("mask_path").ifEmpty { null } }.toSet()
+            info.dir.walkTopDown().filter { it.isFile }.forEach { file ->
+                val rel = file.relativeTo(info.dir).invariantSeparatorsPath
+                if (rel == VIDEO || rel.startsWith("cutout/") || rel in maskPaths || rel == "transforms.json") return@forEach
+                file.copyTo(File(staging, rel), overwrite = true)
+            }
+            val opaque = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
+            MaskRefiner().use { refiner ->
+                for (i in 0 until frames.length()) {
+                    val frame = frames.getJSONObject(i)
+                    val maskRel = frame.optString("mask_path")
+                    val imageFile = File(info.dir, frame.getString("file_path"))
+                    val maskFile = File(info.dir, maskRel)
+                    val out = File(staging, maskRel)
+                    out.parentFile?.mkdirs()
+                    val image = BitmapFactory.decodeFile(imageFile.path, opaque)
+                    val oldMask = BitmapFactory.decodeFile(maskFile.path, opaque)
+                    if (image == null || oldMask == null) {
+                        if (maskFile.isFile) maskFile.copyTo(out, overwrite = true)
+                        image?.recycle()
+                        oldMask?.recycle()
+                        continue
+                    }
+                    val w = image.width
+                    val h = image.height
+                    val mw = oldMask.width
+                    val mh = oldMask.height
+                    val pixels = IntArray(w * h).also { image.getPixels(it, 0, w, 0, 0, w, h) }
+                    val grey = IntArray(mw * mh).also { oldMask.getPixels(it, 0, mw, 0, 0, mw, mh) }
+                    image.recycle()
+                    oldMask.recycle()
+                    val small = FloatArray(mw * mh) { ((grey[it] shr 16) and 0xff) / 255f }
+                    // Upright, at the photo's size: the segmenter wants people standing.
+                    val first = rotate(MaskRefiner.resize(small, mw, mh, w, h), w, h, upright)
+                    val photo = rotate(pixels, w, h, upright)
+                    val uw = if (upright % 180 == 0) w else h
+                    val uh = if (upright % 180 == 0) h else w
+                    val bitmap = Bitmap.createBitmap(photo, uw, uh, Bitmap.Config.ARGB_8888)
+                    val refined = try {
+                        refiner.refine(bitmap, first)
+                    } finally {
+                        bitmap.recycle()
+                    }
+                    keepNear(refined, first, uw, uh, (0.04f * min(uw, uh)).toInt().coerceAtLeast(4))
+                    val back = MaskRefiner.resize(rotate(refined, uw, uh, (360 - upright) % 360), w, h, mw, mh)
+                    val outPixels = IntArray(mw * mh) {
+                        val v = (back[it] * 255f + 0.5f).toInt().coerceIn(0, 255)
+                        (0xff shl 24) or (v shl 16) or (v shl 8) or v
+                    }
+                    val outBitmap = Bitmap.createBitmap(outPixels, mw, mh, Bitmap.Config.ARGB_8888)
+                    out.outputStream().use { outBitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                    outBitmap.recycle()
+                    onProgress((i + 1).toFloat() / frames.length())
+                }
+            }
+            json.optJSONObject("gsplat_lab")?.put("mask_source", "selfie in crops (${info.name})")
+            File(staging, "transforms.json").writeText(json.toString(1))
+            target.deleteRecursively()
+            if (!staging.renameTo(target)) throw IOException("새 데이터셋을 저장할 수 없음")
+        } finally {
+            staging.deleteRecursively()
+        }
+        return read(target) ?: throw IOException("새 데이터셋을 읽을 수 없음")
+    }
+
+    /** Rotates a row-major [w] x [h] image clockwise by [degrees] (a multiple of 90). */
+    private fun rotate(src: FloatArray, w: Int, h: Int, degrees: Int): FloatArray {
+        val out = FloatArray(src.size)
+        rotateIndices(w, h, degrees) { to, from -> out[to] = src[from] }
+        return out
+    }
+
+    private fun rotate(src: IntArray, w: Int, h: Int, degrees: Int): IntArray {
+        val out = IntArray(src.size)
+        rotateIndices(w, h, degrees) { to, from -> out[to] = src[from] }
+        return out
+    }
+
+    private inline fun rotateIndices(w: Int, h: Int, degrees: Int, copy: (Int, Int) -> Unit) {
+        when (((degrees % 360) + 360) % 360) {
+            90 -> for (y in 0 until w) for (x in 0 until h) copy(y * h + x, (h - 1 - x) * w + y)
+            180 -> for (y in 0 until h) for (x in 0 until w) copy(y * w + x, (h - 1 - y) * w + (w - 1 - x))
+            270 -> for (y in 0 until w) for (x in 0 until h) copy(y * h + x, x * w + (w - 1 - y))
+            else -> for (i in 0 until w * h) copy(i, i)
+        }
+    }
+
+    /** Zeroes [mask] farther than about [radius] px from [near]'s pixels over 1/2 (coarse grid). */
+    private fun keepNear(mask: FloatArray, near: FloatArray, w: Int, h: Int, radius: Int) {
+        val cell = max(4, radius / 2)
+        val gw = (w + cell - 1) / cell
+        val gh = (h + cell - 1) / cell
+        val occupied = BooleanArray(gw * gh)
+        for (y in 0 until h) for (x in 0 until w) if (near[y * w + x] > 0.5f) occupied[(y / cell) * gw + x / cell] = true
+        val reach = (radius + cell - 1) / cell
+        val grown = BooleanArray(gw * gh)
+        for (gy in 0 until gh) {
+            for (gx in 0 until gw) {
+                if (!occupied[gy * gw + gx]) continue
+                for (dy in -reach..reach) {
+                    for (dx in -reach..reach) {
+                        val yy = gy + dy
+                        val xx = gx + dx
+                        if (yy in 0 until gh && xx in 0 until gw) grown[yy * gw + xx] = true
+                    }
+                }
+            }
+        }
+        for (y in 0 until h) for (x in 0 until w) if (!grown[(y / cell) * gw + x / cell]) mask[y * w + x] = 0f
+    }
+
     private fun cutout(imageFile: File, maskFile: File, upright: Int): ByteArray? {
         val image = BitmapFactory.decodeFile(imageFile.path) ?: return null
         // Grey levels in R, G and B (not an ALPHA_8 bitmap, whose colour reads back as 0).
