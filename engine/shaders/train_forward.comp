@@ -15,8 +15,11 @@ layout(std430, binding = 5) readonly buffer Target { uint target[]; };  // RGBA8
 layout(std430, binding = 6) writeonly buffer PixelGrad { vec4 pixel_grad[]; };  // dL/dC rgb, final T
 layout(std430, binding = 7) writeonly buffer PixelCount { uint pixel_count[]; };  // pairs up to the last contributor
 layout(std430, binding = 8) writeonly buffer Image { uint image[]; };  // rendered RGBA8
-// 2 per tile: [0] sum |e|, sum e^2, (SSIM sum, train_ssim), sum w |e|;
+// 4 per tile: [0] sum |e|, sum e^2, (SSIM sum, train_ssim), sum w |e|;
 // [1] (sum w SSIM, train_ssim), sum w (per channel), head sum e^2, head pixels. w: pixel_weight.
+// [2], [3]: for the view's brightness gain, over pixels where photo and model
+// are both opaque: sum R^2 per channel and the pixel count, sum R P per
+// channel (R the model's colour, P the photo's as taken).
 layout(std430, binding = 9) writeonly buffer TileLoss { vec4 tile_loss[]; };
 // Per tile, the largest per-pixel count: pairs behind it contribute to no pixel.
 layout(std430, binding = 10) writeonly buffer TileCount { uint tile_count[]; };
@@ -119,7 +122,8 @@ void main() {
     vec3 bg = frame.background.rgb;
     vec3 out_color = C + T * bg;
     vec4 t = unpackUnorm4x8(target[pix_id]);
-    vec3 target_color = (frame.model.w & kFlagMaskedTarget) != 0u ? mix(bg, t.rgb, t.a) : t.rgb;
+    vec3 photo = t.rgb * frame.exposure.rgb;  // at the model's brightness
+    vec3 target_color = (frame.model.w & kFlagMaskedTarget) != 0u ? mix(bg, photo, t.a) : photo;
     vec3 e = out_color - target_color;
     // The L1 part; train_ssim_grad adds the D-SSIM part.
     float w = pixel_weight(frame.head, center);
@@ -135,6 +139,17 @@ void main() {
     loss = vec2(abs(e.r) + abs(e.g) + abs(e.b), dot(e, e));
     more = vec4(w * loss.x, 3.0 * w, in_head(frame.head, center) ? vec2(loss.y, 1.0) : vec2(0.0));
   }
+  // The splat batches are done with s_g0, s_g1: they collect the gain sums.
+  vec4 fit_rr = vec4(0.0), fit_rp = vec4(0.0);
+  if (inside) {
+    vec4 t = unpackUnorm4x8(target[pix_id]);
+    if (t.a > 0.95 && T < 0.05) {
+      fit_rr = vec4(C * C, 1.0);
+      fit_rp = vec4(C * t.rgb, 0.0);
+    }
+  }
+  s_g0[lid] = fit_rr;
+  s_g1[lid] = fit_rp;
   s_loss[lid] = loss;
   s_more[lid] = more;
   s_count[lid] = last;
@@ -144,12 +159,16 @@ void main() {
       s_loss[lid] += s_loss[lid + stride];
       s_more[lid] += s_more[lid + stride];
       s_count[lid] = max(s_count[lid], s_count[lid + stride]);
+      s_g0[lid] += s_g0[lid + stride];
+      s_g1[lid] += s_g1[lid + stride];
     }
     barrier();
   }
   if (lid == 0u) {
-    tile_loss[tile_id * 2u] = vec4(s_loss[0], 0.0, s_more[0].x);
-    tile_loss[tile_id * 2u + 1u] = vec4(0.0, s_more[0].yzw);
+    tile_loss[tile_id * 4u] = vec4(s_loss[0], 0.0, s_more[0].x);
+    tile_loss[tile_id * 4u + 1u] = vec4(0.0, s_more[0].yzw);
+    tile_loss[tile_id * 4u + 2u] = s_g0[0];
+    tile_loss[tile_id * 4u + 3u] = s_g1[0];
     tile_count[tile_id] = s_count[0];
     uint len = range.y - range.x;
     uint count = max(1u, (s_count[0] + 31u) / 32u);

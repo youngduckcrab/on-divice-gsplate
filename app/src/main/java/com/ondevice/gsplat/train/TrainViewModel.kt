@@ -62,6 +62,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
     var useMasks by mutableStateOf(true)
     var refinePoses by mutableStateOf(false)
     var refineMotion by mutableStateOf(false)
+    var refineExposure by mutableStateOf(false)
     var phase by mutableStateOf(Phase.IDLE)
         private set
     var importProgress by mutableStateOf(0f)
@@ -156,6 +157,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         useMasks = info?.masks == true
         refinePoses = info?.trackedPoses == true
         refineMotion = info?.trackedPoses == true && info?.masks == true
+        refineExposure = info?.trackedPoses == true
     }
 
     fun delete(info: DatasetInfo) {
@@ -310,6 +312,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
         val masked = useMasks && dataset.masks
         val poses = refinePoses
         val motion = refineMotion && masked
+        val exposure = refineExposure
         stopRequested = false
         prepared = null
         stats = null
@@ -336,7 +339,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
             val prep = nativeCall {
                 NativeTrainer.prepare(
                     dataset.dir.path, settings.width, settings.iterations, settings.maxGaussians, 3, masked, poses,
-                    motion,
+                    motion, exposure,
                 )
             }
             if (!prep.optBoolean("ok")) return@launch fail("준비 실패: ${prep.optString("error")}")
@@ -543,6 +546,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                         "SH 3 · 배경 제거 ${ox(prep.optBoolean("masked"))} · " +
                         "카메라 위치 보정 ${ox(prep.optBoolean("refine_poses"))} · " +
                         "움직임 보정 ${ox(prep.optBoolean("refine_motion"))} · " +
+                        "밝기·색 보정 ${ox(prep.optBoolean("refine_exposure"))} · " +
                         "손실 L1+D-SSIM (λ ${f1(prep.optDouble("lambda_start"))} → ${f1(prep.optDouble("lambda_end"))}) · " +
                         if (prep.optBoolean("head_found")) {
                             "머리 가중치 ${f1(prep.optDouble("head_weight"))}배 (반지름 " +
@@ -582,6 +586,12 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                     "카메라 위치 보정: ${s.optInt("pose_updates")}회 · 이동 평균 ${cm(s.optDouble("pose_shift_mean"))} " +
                         "(최대 ${cm(s.optDouble("pose_shift_max"))}) · 회전 평균 ${deg(s.optDouble("pose_turn_mean"))} " +
                         "(최대 ${deg(s.optDouble("pose_turn_max"))})",
+                )
+            }
+            if (s != null && s.optBoolean("refine_exposure") && s.optInt("exposure_updates") > 0) {
+                appendLine(
+                    "밝기·색 보정: ${s.optInt("exposure_updates")}회 · 사진별 밝기 ${f2(s.optDouble("exposure_low"))}~" +
+                        "${f2(s.optDouble("exposure_high"))}배 · 색조 차이 ${pct(s.optDouble("exposure_tint"))}",
                 )
             }
             if (s != null && s.optBoolean("refine_motion") && s.optInt("motion_updates") > 0) {
@@ -630,6 +640,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                             }) +
                             "평가 ${sec(e.optDouble("ms"))}",
                     )
+                    e.optJSONObject("diagnosis")?.let { d -> diagnosisLines(d).forEach { appendLine(it) } }
                 } else {
                     appendLine("평가 오류: ${e.optString("error")}")
                 }
@@ -714,6 +725,31 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
     private fun sec(ms: Double) = "%.1f s".format(Locale.US, ms / 1000.0)
 
     private fun mb(bytes: Long) = "%.0f MB".format(Locale.US, bytes / 1e6)
+    /** What still limits quality (gs::diagnose): per-view brightness, where the error is, blurry photos. */
+    private fun diagnosisLines(d: JSONObject): List<String> {
+        val lines = mutableListOf<String>()
+        if (d.optInt("gain_views") > 0) {
+            lines += "진단 · 사진별 밝기: ${f2(d.optDouble("gain_low"))}~${f2(d.optDouble("gain_high"))}배 " +
+                "(표준편차 ${pct(d.optDouble("gain_spread"))}) · 색조 차이 ${pct(d.optDouble("tint_spread"))} · " +
+                "사진마다 밝기·색을 맞추면 사람 안쪽 PSNR ${f2(d.optDouble("inside_psnr"))} → " +
+                "${f2(d.optDouble("inside_psnr_fitted"))} dB"
+        }
+        lines += "진단 · 오차 위치: 마스크 경계 ${pct(d.optDouble("share_edge"))} (화면의 ${pct(d.optDouble("edge_pixels"))}) · " +
+            "윤곽 불일치 ${pct(d.optDouble("share_outline"))} · 사람 안쪽 ${pct(d.optDouble("share_inside"))} " +
+            "(그중 머리 ${pct(d.optDouble("share_head"))}) · 배경 ${pct(d.optDouble("share_outside"))}"
+        val worst = d.optJSONArray("worst")
+        val worstText = if (worst == null) "" else (0 until worst.length()).joinToString(", ") { i ->
+            val v = worst.getJSONObject(i)
+            "#${v.optInt("frame")}${if (v.optBoolean("holdout")) "(검증)" else ""} ${f2(v.optDouble("psnr"))} dB " +
+                "(밝기 ${f2(v.optDouble("gain"))}배, 선명도 ${f2(v.optDouble("sharpness"))}배)"
+        }
+        lines += "진단 · 흐린 사진 ${pct(d.optDouble("blurry_fraction"))} · 가장 안 맞는 사진: $worstText · " +
+            "진단 ${sec(d.optDouble("ms"))}"
+        return lines
+    }
+
+    private fun f2(v: Double) = "%.2f".format(Locale.US, v)
+    private fun pct(v: Double) = "%.1f%%".format(Locale.US, v * 100)
     private fun cm(m: Double) = "%.1f cm".format(Locale.US, m * 100)
     private fun deg(d: Double) = "%.2f°".format(Locale.US, d)
     private fun f1(v: Double) = "%.1f".format(Locale.US, v)

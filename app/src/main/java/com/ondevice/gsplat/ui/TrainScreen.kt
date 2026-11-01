@@ -318,6 +318,21 @@ private fun SettingsCard(vm: TrainViewModel) {
                     onCheckedChange = { vm.refinePoses = it },
                 )
             }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("밝기·색 보정")
+                    Text(
+                        "폰 카메라가 방향마다 밝기·색을 바꾸는 것(자동 노출·화이트 밸런스)을 사진마다 맞춰서 학습. " +
+                            "직접 찍은 스캔은 기본으로 켜짐",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Switch(
+                    checked = vm.refineExposure,
+                    enabled = !vm.running,
+                    onCheckedChange = { vm.refineExposure = it },
+                )
+            }
             val motionPossible = vm.useMasks && hasMasks
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {

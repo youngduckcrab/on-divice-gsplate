@@ -33,6 +33,7 @@ struct FrameData {
   uvec4 limits;
   vec4 loss;        // D-SSIM weight lambda (loss = (1 - lambda) L1 + lambda (1 - SSIM)), C1, C2, unused
   vec4 head;        // head region in this view: centre x, y and radius (px; 0: none), loss weight
+  vec4 exposure;    // rgb: the photo's colour times this matches the model (1 / this view's gain), unused
 };
 
 // Loss weight of the pixel centred at `p`: `head.w` inside the head circle,

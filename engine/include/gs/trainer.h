@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -115,6 +116,20 @@ struct TrainOptions {
   float motion_smoothness = 1e-2f;
   float motion_center = 1e-2f;
 
+  // Exposure and white balance. A phone camera (ARCore cannot fix them)
+  // brightens and tints each photo as the view changes, and the model can
+  // only average the photos. Each training view gets a gain per colour
+  // channel; the photo divided by it is what the model is fitted to. The
+  // gain is solved in closed form from the same forward pass (least squares
+  // of the photo against the model's colour where both are opaque) and
+  // blended in at `exposure_rate`, from step `exposure_from`. Only ratios
+  // are fixed by the photos, so the gains are used divided by their
+  // geometric mean: the model is the average exposure. Views not measured yet
+  // (held-out ones) take the gains of the training views next to them.
+  bool refine_exposure = false;
+  uint32_t exposure_from = 300;
+  float exposure_rate = 0.3f;
+
   // Adaptive density control.
   uint32_t densify_from = 300;
   uint32_t densify_until = 2000;
@@ -193,6 +208,9 @@ struct TrainStats {
   double motion_shift_mean = 0.0, motion_shift_max = 0.0;  // dataset units
   double motion_turn_mean = 0.0, motion_turn_max = 0.0;    // degrees
   uint32_t motion_updates = 0;  // view updates
+  // Exposure: the training views' brightness gains (5th and 95th percentile) and colour spread.
+  double exposure_low = 1.0, exposure_high = 1.0, exposure_tint = 0.0;
+  uint32_t exposure_updates = 0;
   // Moving averages per training step: wall clock around the submit + wait,
   // GPU time from timestamps, and steps per submission.
   struct Timing {
@@ -310,6 +328,9 @@ class Trainer {
   void node_motion(size_t frame, uint32_t node, float turn[3], float shift[3]) const;
   // Testing: sets it.
   void set_node_motion(size_t frame, uint32_t node, const float turn[3], const float shift[3]);
+  // Exposure: view `frame`'s gain per colour channel (photo = gain x model);
+  // interpolated for views not trained on, 1 without refine_exposure.
+  void view_gain(size_t frame, float gain[3]) const;
   // Testing: the motion gradient of the latest motion update (image loss
   // only), 6 per node: dL/dshift xyz, dL/dturn xyz (world axes).
   const std::vector<double>& last_motion_gradient() const { return last_motion_grad_; }
@@ -344,9 +365,10 @@ class Trainer {
   // sets the learning-rate schedule, SH degree and seed.
   // `flags`: kFlagPoseGrad, kFlagPoseOnly, kFlagMotionGrad; with `motion`, the
   // gaussians follow it (kFlagMotion).
+  // `gain`: the view's exposure gains (the photo is divided by them); null: 1.
   void write_frame(uint32_t slot, const Camera& camera, const float background[3], bool masked_target,
                    uint32_t step, bool bucket_state, bool ssim, uint32_t flags = 0,
-                   const ViewMotion* motion = nullptr);
+                   const ViewMotion* motion = nullptr, const float* gain = nullptr);
   uint32_t sh_degree_at(uint32_t step) const;
   float lambda_at(uint32_t step) const;  // the D-SSIM weight of a step
   bool uses_ssim() const;                // any step has a D-SSIM part
@@ -355,7 +377,7 @@ class Trainer {
   // With `ssim`, also measures SSIM (training does whenever lambda_dssim > 0).
   void run_view(const Camera& camera, const uint8_t* target, const float background[3], bool masked_target,
                 bool train, bool profile = false, bool retune = false, bool ssim = false, uint32_t flags = 0,
-                const ViewMotion* motion = nullptr);
+                const ViewMotion* motion = nullptr, const float* gain = nullptr);
   std::vector<uint8_t> render_with(const Camera& camera, const float background[3], const ViewMotion* motion);
   bool refines_pose_at(uint32_t step) const;
   // Adam step on `frame`'s pose correction from the gradient slot `slot` left.
@@ -366,7 +388,7 @@ class Trainer {
   void update_pose_stats();
   static Camera with_fix(Camera camera, const PoseFix& fix);  // [R | t] -> [E R | E t + d]
   // The best correction of `camera` for held-out `frame` (moving only the camera).
-  PoseFix align_camera(const Camera& camera, const DatasetFrame& frame, const ViewMotion* motion);
+  PoseFix align_camera(const Camera& camera, const DatasetFrame& frame, const ViewMotion* motion, const float* gain);
   // Held-out views of `ds`: this trainer's own (poses and motions as trained) or another's (at rest).
   EvalResult evaluate_views(const Dataset& ds, bool own);
   // Subject motion.
@@ -380,6 +402,10 @@ class Trainer {
   void start_motion(size_t frame);  // before a training view's first motion update
   void update_motion(uint32_t slot, size_t frame);  // Adam step from slot `slot`'s gradient
   void update_motion_stats();
+  // Exposure.
+  bool refines_exposure_at(uint32_t step) const;
+  void update_exposure(uint32_t slot, size_t frame);  // from slot `slot`'s gain sums
+  void update_exposure_stats();
   void run_batch(uint32_t count);
   void next_view(size_t& frame, float background[3]);
   bool housekeeping_after(uint32_t step) const;  // densification or opacity reset after this step
@@ -429,6 +455,7 @@ class Trainer {
   uint64_t slot_limit_[kBatch] = {};  // per batch slot: the most pairs its update accepts
   // Of the last slot read: sum |e|, e^2, SSIM, w |e|, w SSIM, w, head e^2, head pixels.
   double last_losses_[8] = {};
+  double fit_[kBatch][7] = {};  // per batch slot: sum R^2 rgb, pixels, sum R P rgb (train_forward)
   void set_view_stats();                       // l1, psnr, ssim, loss from last_losses_
   uint64_t max_pairs_seen_ = 0;
   uint64_t recent_pairs_max_ = 0;  // since the last retune
@@ -481,6 +508,11 @@ class Trainer {
   std::vector<ViewMotion> motion_;                     // per dataset frame (empty without nodes)
   std::vector<uint32_t> motion_updates_;               // per dataset frame
   std::vector<size_t> train_before_, train_after_;     // nearest training views in capture order (npos: none)
+  // Exposure, per dataset frame: log of the photo / model gain per channel as
+  // measured (blended over updates); used centred (exposure_gain).
+  std::vector<std::array<double, 3>> gain_log_;
+  std::vector<uint32_t> gain_updates_;
+  std::array<float, 3> exposure_gain(size_t frame) const;  // centred; interpolated for views not measured yet
   std::vector<double> last_motion_grad_;
   uint32_t bound_at_ = 0;  // step of the last binding
   bool motion_grad_slot_[kBatch] = {};

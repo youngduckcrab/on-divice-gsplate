@@ -107,7 +107,7 @@ void main() {
   }
   if (lid == 0u) {
     uint t = tile.y * frame.image.z + tile.x;
-    tile_loss[t * 2u].z = s_sum[0].x;
-    tile_loss[t * 2u + 1u].x = s_sum[0].y;
+    tile_loss[t * 4u].z = s_sum[0].x;
+    tile_loss[t * 4u + 1u].x = s_sum[0].y;
   }
 }

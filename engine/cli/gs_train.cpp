@@ -9,6 +9,8 @@
 //            [--no-masks] [--preview <dir>] [--eval-every 1000] [--dssim 0.2 (0 = L1 only)] [--dssim-end L (ramp to L)] [--head-weight 3]
 //            [--refine-poses] [--pose-lr shift,turn] [--pose-from N] [--eval-pose-steps N] [--pose-out poses.json]
 //            [--refine-motion] [--motion-nodes 64] [--motion-lr shift,turn] [--motion-lr-final F] [--motion-from N]
+//            [--refine-exposure] (a brightness gain per view and colour channel)
+//            [--diagnose] (after training: per-view brightness, where the error is, blurry photos)
 //            [--bucket-state-limit MB (each of the two bucket state buffers; phones: 128)]
 //            [--motion-reg decay,rigidity,smoothness,center] [--eval-rest <dataset_dir>] (held-out views of a twin
 //            dataset with the subject standing still: the model at rest against it) [--motion-out motion.json]
@@ -21,6 +23,7 @@
 #include <vector>
 
 #include "gs/dataset.h"
+#include "gs/diagnose.h"
 #include "gs/offscreen.h"
 #include "gs/trainer.h"
 #include "gs/vk_context.h"
@@ -57,6 +60,7 @@ int main(int argc, char** argv) {
   float grad_threshold = -1.0f;
   std::string preview, pose_out, eval_rest, motion_out;
   int pose_from = -1, motion_from = -1;
+  bool diagnosis = false;
   gs::TrainOptions options;
   uint32_t iterations = options.iterations;
   for (int i = 3; i < argc; ++i) {
@@ -113,6 +117,10 @@ int main(int argc, char** argv) {
         options.eval_pose_steps = std::atoi(next());
       } else if (arg == "--pose-out") {
         pose_out = next();
+      } else if (arg == "--refine-exposure") {
+        options.refine_exposure = true;
+      } else if (arg == "--diagnose") {
+        diagnosis = true;
       } else if (arg == "--bucket-state-limit") {
         options.bucket_state_limit = uint64_t(std::atof(next()) * 1024 * 1024);
       } else if (arg == "--refine-motion") {
@@ -176,6 +184,7 @@ int main(int argc, char** argv) {
     options.sh_degree_interval = defaults.sh_degree_interval;
     options.pose_from = pose_from >= 0 ? uint32_t(pose_from) : defaults.pose_from;
     options.motion_from = motion_from >= 0 ? uint32_t(motion_from) : defaults.motion_from;
+    options.exposure_from = defaults.exposure_from;
     gs::Dataset rest;
     if (!eval_rest.empty()) rest = gs::load_dataset(eval_rest, width);
     if (reset_override >= 0) options.opacity_reset_interval = uint32_t(reset_override);
@@ -220,6 +229,10 @@ int main(int argc, char** argv) {
                       s.motion_nodes, s.motion_updates, 100.0 * s.motion_shift_mean, 100.0 * s.motion_shift_max,
                       s.motion_turn_mean, s.motion_turn_max);
         }
+        if (options.refine_exposure) {
+          std::printf("  exposure: %u updates, brightness gains %.3f..%.3f, tint spread %.3f\n", s.exposure_updates,
+                      s.exposure_low, s.exposure_high, s.exposure_tint);
+        }
         if (!rest.frames.empty()) {
           const gs::EvalResult r = trainer.evaluate_at_rest(rest);
           std::printf("  at rest (%s): held-out PSNR %.2f dB, SSIM %.4f over %u views; head PSNR %.2f dB over %u",
@@ -239,6 +252,25 @@ int main(int argc, char** argv) {
       }
     }
     const double train_s = std::chrono::duration<double>(clock::now() - t2).count();
+    if (diagnosis) {
+      const auto td = clock::now();
+      const gs::Diagnosis d = gs::diagnose(trainer);
+      std::printf("diagnosis (%u views, %.1f s): PSNR %.2f dB\n", d.views,
+                  std::chrono::duration<double>(clock::now() - td).count(), d.psnr);
+      std::printf("  brightness gain %.3f..%.3f (std %.3f), tint std %.3f over %u views; inside PSNR %.2f -> %.2f dB "
+                  "with a gain and offset per view\n",
+                  d.gain_low, d.gain_high, d.gain_spread, d.tint_spread, d.gain_views, d.inside_psnr,
+                  d.inside_psnr_fitted);
+      std::printf("  error: edge %.0f%% (%.1f%% of pixels), outline %.0f%%, inside %.0f%% (head %.0f%%), outside %.0f%%\n",
+                  100 * d.share_edge, 100 * d.edge_pixels, 100 * d.share_outline, 100 * d.share_inside,
+                  100 * d.share_head, 100 * d.share_outside);
+      std::printf("  blurry photos %.0f%%; worst:", 100 * d.blurry_fraction);
+      for (const gs::Diagnosis::View& v : d.worst) {
+        std::printf(" #%zu%s %.2f dB (gain %.3f, sharpness %.2f)", v.frame, v.holdout ? " held-out" : "", v.psnr, v.gain,
+                    v.sharpness);
+      }
+      std::printf("\n");
+    }
     for (const gs::RetuneResult& r : trainer.retunes()) {
       std::printf("backward timing at step %u:", r.step);
       for (const auto& [name, ms] : r.ms) std::printf("  %s %.1f", name.c_str(), ms);

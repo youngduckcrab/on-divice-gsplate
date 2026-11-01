@@ -9,8 +9,9 @@ object NativeTrainer {
     /**
      * Loads the dataset folder (transforms.json) at [width] px, initialises gaussians
      * and allocates the trainer. With [refinePoses] the camera poses are corrected
-     * while training, and with [refineMotion] the subject's small movements during
-     * the capture (needs [masked]). Returns dataset info, init stats and timings.
+     * while training, with [refineMotion] the subject's small movements during
+     * the capture (needs [masked]), and with [refineExposure] each photo's
+     * brightness and white balance. Returns dataset info, init stats and timings.
      */
     external fun prepare(
         datasetDir: String,
@@ -21,6 +22,7 @@ object NativeTrainer {
         masked: Boolean,
         refinePoses: Boolean,
         refineMotion: Boolean,
+        refineExposure: Boolean,
     ): String
 
     /** Runs up to [count] steps. With [profile], the first one reports GPU ms per pass. */

@@ -587,6 +587,50 @@ void test_motion_recovery(gs::VkContext& ctx) {
   EXPECT(before > 0.5 && after < 0.25 * before, "motion not recovered: %.2f -> %.2f px", before, after);
 }
 
+void test_exposure_recovery(gs::VkContext& ctx) {
+  // Views rendered from a scene, one darkened and tinted as a camera's
+  // exposure and white balance would; with the gaussians frozen, the trained
+  // views' gains must come out in that ratio (only ratios are fixed: their
+  // geometric mean is kept at 1).
+  constexpr uint32_t w = 128, h = 96;
+  gs::Dataset ds = gs::make_test_dataset(w, h, 3, false, 3);  // frame 0 held out
+  gs::SplatScene scene = gs::make_test_scene(300, 0, 9);
+  const float black[3] = {0.0f, 0.0f, 0.0f};
+  const float dim[3] = {0.8f, 0.85f, 0.9f};
+  gs::TrainOptions o = gs::frozen_train_options(0, false);
+  {
+    gs::Trainer renderer(ctx, ds, scene, o);
+    for (size_t f = 0; f < ds.frames.size(); ++f) {
+      ds.frames[f].rgba = renderer.render(gs::dataset_camera(ds, ds.frames[f]), black);
+      for (size_t p = 0; p < size_t(w) * h; ++p) {
+        if (f == 1) {
+          for (int c = 0; c < 3; ++c) {
+            uint8_t& v = ds.frames[f].rgba[p * 4 + c];
+            v = uint8_t(std::lround(v * dim[c]));
+          }
+        }
+        ds.frames[f].rgba[p * 4 + 3] = 255;
+      }
+    }
+  }
+  o.iterations = 100;
+  o.refine_exposure = true;
+  o.exposure_from = 0;
+  gs::Trainer t(ctx, ds, scene, o);
+  for (int s = 0; s < 30; ++s) t.step_on(1 + s % 2, black);
+  float g1[3], g2[3], g0[3];
+  t.view_gain(1, g1);
+  t.view_gain(2, g2);
+  t.view_gain(0, g0);  // held out, before every trained view: view 1's
+  double worst = 0.0;
+  for (int c = 0; c < 3; ++c) worst = std::max(worst, std::fabs(double(g1[c]) / g2[c] / dim[c] - 1.0));
+  std::printf("  exposure: gains %.3f %.3f %.3f / %.3f %.3f %.3f, ratio off by %.2f%%, held-out %.3f\n", g1[0], g1[1],
+              g1[2], g2[0], g2[1], g2[2], 100.0 * worst, g0[1]);
+  EXPECT(worst < 0.02, "exposure gains off by %.2f%%", 100.0 * worst);
+  EXPECT(std::fabs(std::log(double(g1[1])) + std::log(double(g2[1]))) < 1e-4, "gains not centred: %.4f %.4f", g1[1],
+         g2[1]);
+}
+
 void test_motion_batched(gs::VkContext& ctx) {
   // Batches with motion: each step's view gets its own motion slot and
   // gradient, and every step from motion_from updates its view once. (Not
@@ -940,6 +984,7 @@ int main() {
     test_motion_gradient(ctx);
     test_motion_recovery(ctx);
     test_motion_batched(ctx);
+    test_exposure_recovery(ctx);
     test_batched_matches_single(ctx);
     test_pair_overflow_retry(ctx);
     test_probes(ctx);

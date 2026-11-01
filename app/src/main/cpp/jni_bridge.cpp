@@ -19,6 +19,7 @@
 
 #include "gs/benchmarks.h"
 #include "gs/dataset.h"
+#include "gs/diagnose.h"
 #include "gs/device_probe.h"
 #include "gs/json.h"
 #include "gs/splat_renderer.h"
@@ -308,6 +309,11 @@ void write_stats(gs::JsonWriter& w, const gs::Trainer& t) {
   w.field("motion_shift_max", s.motion_shift_max);
   w.field("motion_turn_mean", s.motion_turn_mean);
   w.field("motion_turn_max", s.motion_turn_max);
+  w.field("refine_exposure", t.options().refine_exposure);
+  w.field("exposure_updates", s.exposure_updates);
+  w.field("exposure_low", s.exposure_low);
+  w.field("exposure_high", s.exposure_high);
+  w.field("exposure_tint", s.exposure_tint);
   w.key("timing").begin_object();
   w.field("wall", s.timing.wall_ms);
   w.field("gpu", s.timing.gpu_ms);
@@ -332,7 +338,8 @@ void write_stats(gs::JsonWriter& w, const gs::Trainer& t) {
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, jstring jdir, jint width,
                                                jint iterations, jint max_gaussians, jint sh_degree, jboolean masked,
-                                               jboolean refine_poses, jboolean refine_motion) {
+                                               jboolean refine_poses, jboolean refine_motion,
+                                               jboolean refine_exposure) {
   const std::string dir = from_jstring(env, jdir);
   std::lock_guard<std::mutex> lock(g_train_mutex);
   try {
@@ -371,6 +378,7 @@ Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, js
     options.refine_poses = refine_poses == JNI_TRUE;
     // The subject's motion needs nodes on the subject: only with its mask.
     options.refine_motion = refine_motion == JNI_TRUE && options.masked && ds.has_masks;
+    options.refine_exposure = refine_exposure == JNI_TRUE;
     const auto t1 = Clock::now();
     gs::InitOptions init;
     init.max_gaussians = std::min<uint32_t>(options.max_gaussians / 2, 150000);
@@ -530,6 +538,39 @@ Java_com_ondevice_gsplat_NativeTrainer_evaluate(JNIEnv* env, jobject /*this*/) {
     w.field("aligned", e.aligned);
     w.field("psnr_unaligned", e.psnr_unaligned);
     w.field("ms", ms_since(t0));
+    // What still limits quality: per-view brightness, where the error is, blurry photos.
+    const auto t1 = Clock::now();
+    const gs::Diagnosis d = gs::diagnose(*s.trainer);
+    w.key("diagnosis").begin_object();
+    w.field("views", d.views);
+    w.field("psnr", d.psnr);
+    w.field("gain_views", d.gain_views);
+    w.field("gain_low", d.gain_low);
+    w.field("gain_high", d.gain_high);
+    w.field("gain_spread", d.gain_spread);
+    w.field("tint_spread", d.tint_spread);
+    w.field("inside_psnr", d.inside_psnr);
+    w.field("inside_psnr_fitted", d.inside_psnr_fitted);
+    w.field("share_edge", d.share_edge);
+    w.field("share_outline", d.share_outline);
+    w.field("share_inside", d.share_inside);
+    w.field("share_head", d.share_head);
+    w.field("share_outside", d.share_outside);
+    w.field("edge_pixels", d.edge_pixels);
+    w.field("blurry_fraction", d.blurry_fraction);
+    w.key("worst").begin_array();
+    for (const gs::Diagnosis::View& v : d.worst) {
+      w.begin_object();
+      w.field("frame", v.frame);
+      w.field("holdout", v.holdout);
+      w.field("psnr", v.psnr);
+      w.field("gain", v.gain);
+      w.field("sharpness", v.sharpness);
+      w.end_object();
+    }
+    w.end_array();
+    w.field("ms", ms_since(t1));
+    w.end_object();
     w.end_object();
     return w.str();
   }));

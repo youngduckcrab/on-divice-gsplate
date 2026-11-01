@@ -134,6 +134,7 @@ add_library(gsengine STATIC
   src/splat_scene.cpp
   src/train_selftest.cpp
   src/trainer.cpp
+  src/diagnose.cpp
   src/vk_context.cpp
 )
 add_dependencies(gsengine gs_shaders)

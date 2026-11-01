@@ -59,6 +59,7 @@ struct Trainer::FrameData {
   uint32_t limits[4];
   float loss[4];
   float head[4];
+  float exposure[4];
 };
 
 namespace {
@@ -126,6 +127,7 @@ TrainOptions scaled_options(uint32_t iterations) {
   o.sh_degree_interval = std::max(1u, uint32_t(o.sh_degree_interval * scale));
   o.pose_from = uint32_t(o.pose_from * scale);
   o.motion_from = uint32_t(o.motion_from * scale);
+  o.exposure_from = uint32_t(o.exposure_from * scale);
   return o;
 }
 
@@ -292,10 +294,27 @@ Trainer::Trainer(VkContext& ctx, Dataset dataset, const SplatScene& initial, con
     frames_.push_back(ctx.create_buffer(sizeof(FrameData), MemoryKind::Upload));
     targets_.push_back(ctx.create_buffer(pixels * 4, MemoryKind::Upload));
     readback_smalls_.push_back(ctx.create_buffer(16, MemoryKind::Readback));
-    readback_losses_.push_back(ctx.create_buffer(tiles * 32, MemoryKind::Readback));
+    readback_losses_.push_back(ctx.create_buffer(tiles * 64, MemoryKind::Readback));
     pose_grads_.push_back(ctx.create_buffer(std::max<uint64_t>(div_up(cap, 128), 1) * 32, MemoryKind::Readback));
   }
   pose_fix_.resize(dataset_.frames.size());
+  // Each view's nearest training views in capture order (motion, exposure).
+  train_before_.assign(dataset_.frames.size(), kNone);
+  train_after_.assign(dataset_.frames.size(), kNone);
+  {
+    size_t last = kNone;
+    for (size_t f = 0; f < dataset_.frames.size(); ++f) {
+      train_before_[f] = last;
+      if (!dataset_.frames[f].holdout) last = f;
+    }
+    last = kNone;
+    for (size_t f = dataset_.frames.size(); f-- > 0;) {
+      train_after_[f] = last;
+      if (!dataset_.frames[f].holdout) last = f;
+    }
+  }
+  gain_log_.assign(dataset_.frames.size(), {0.0, 0.0, 0.0});
+  gain_updates_.assign(dataset_.frames.size(), 0);
   if (options_.refine_motion) place_nodes(initial);
   const uint64_t node_count = nodes_.size();
   for (uint32_t i = 0; i < kBatch; ++i) {
@@ -341,7 +360,7 @@ Trainer::Trainer(VkContext& ctx, Dataset dataset, const SplatScene& initial, con
   pixel_count_ = ctx.create_buffer(pixels * 4, MemoryKind::Device);
   image_ = ctx.create_buffer(pixels * 4, MemoryKind::Device);
   ranges_buf_ = ctx.create_buffer((tiles + 1) * 8, MemoryKind::Device);  // + the tile emit pads into
-  tile_loss_ = ctx.create_buffer(tiles * 32, MemoryKind::Device);
+  tile_loss_ = ctx.create_buffer(tiles * 64, MemoryKind::Device);
   tile_count_ = ctx.create_buffer(tiles * 4, MemoryKind::Device);
   pixel_dot_ = ctx.create_buffer(pixels * 4, MemoryKind::Device);
   ssim_input_ = ctx.create_buffer(pixels * 32, MemoryKind::Device);
@@ -401,8 +420,10 @@ uint32_t Trainer::sh_degree_at(uint32_t step) const {
 }
 
 void Trainer::write_frame(uint32_t slot, const Camera& camera, const float background[3], bool masked_target,
-                          uint32_t step, bool bucket_state, bool ssim, uint32_t flags, const ViewMotion* motion) {
+                          uint32_t step, bool bucket_state, bool ssim, uint32_t flags, const ViewMotion* motion,
+                          const float* gain) {
   FrameData f{};
+  for (int c = 0; c < 3; ++c) f.exposure[c] = gain != nullptr && gain[c] > 0.0f ? 1.0f / gain[c] : 1.0f;
   if (motion == nullptr || nodes_.empty()) {
     flags &= ~kFlagMotionGrad;
   } else {
@@ -732,10 +753,13 @@ bool Trainer::read_slot(uint32_t slot) {
   max_pairs_seen_ = std::max<uint64_t>(max_pairs_seen_, small[0]);
   recent_pairs_max_ = std::max<uint64_t>(recent_pairs_max_, small[0]);
   const float* v = static_cast<const float*>(readback_losses_[slot].mapped());
-  // Per tile (train_forward): |e|, e^2, SSIM, w |e|, w SSIM, w, head e^2, head pixels.
+  // Per tile (train_forward): |e|, e^2, SSIM, w |e|, w SSIM, w, head e^2, head
+  // pixels; then the exposure gain's sums R^2 rgb, pixels, R P rgb, unused.
   for (double& s : last_losses_) s = 0.0;
+  for (double& s : fit_[slot]) s = 0.0;
   for (uint32_t t = 0; t < tiles_x_ * tiles_y_; ++t) {
-    for (int k = 0; k < 8; ++k) last_losses_[k] += v[t * 8 + k];
+    for (int k = 0; k < 8; ++k) last_losses_[k] += v[t * 16 + k];
+    for (int k = 0; k < 7; ++k) fit_[slot][k] += v[t * 16 + 8 + k];
   }
   return small[0] > slot_limit_[slot];
 }
@@ -751,7 +775,8 @@ void Trainer::set_view_stats() {
 }
 
 void Trainer::run_view(const Camera& camera, const uint8_t* target, const float background[3], bool masked_target,
-                       bool train, bool profile, bool retune, bool ssim, uint32_t flags, const ViewMotion* motion) {
+                       bool train, bool profile, bool retune, bool ssim, uint32_t flags, const ViewMotion* motion,
+                       const float* gain) {
   stats_.sh_degree = int(sh_degree_at(stats_.step));
   const bool ssim_grad = train && uses_ssim();
   ssim = ssim || ssim_grad;
@@ -762,7 +787,7 @@ void Trainer::run_view(const Camera& camera, const uint8_t* target, const float 
                   : options_.initial_pair_guess ? options_.initial_pair_guess
                                                 : uint64_t(slots_) * 4);
     write_frame(0, camera, background, masked_target, stats_.step, needs_bucket_state(train, retune), ssim,
-                train ? flags : 0, motion);
+                train ? flags : 0, motion, gain);
 
     if (!profile && !retune) {
       // Everything in one submission; the passes read the pair count on the GPU.
@@ -901,9 +926,10 @@ void Trainer::step_on(size_t frame_index, const float background[3], bool profil
   const bool pose = refines_pose_at(stats_.step);
   const bool motion = refines_motion_at(stats_.step);
   if (motion) start_motion(frame_index);
+  const bool exposure = refines_exposure_at(stats_.step);
   run_view(camera_for(frame_index), frame.rgba.data(), background, options_.masked, true, profile,
            retune_due(stats_.step + 1), false, (pose ? kFlagPoseGrad : 0) | (motion ? kFlagMotionGrad : 0),
-           motion ? &motion_[frame_index] : nullptr);
+           motion ? &motion_[frame_index] : nullptr, exposure_gain(frame_index).data());
   if (pose) {
     update_pose(0, frame_index, 1.0f);
     update_pose_stats();
@@ -911,6 +937,10 @@ void Trainer::step_on(size_t frame_index, const float background[3], bool profil
   if (motion) {
     update_motion(0, frame_index);
     update_motion_stats();
+  }
+  if (exposure) {
+    update_exposure(0, frame_index);
+    update_exposure_stats();
   }
   last_slot_ = 0;
   set_view_stats();
@@ -959,6 +989,7 @@ void Trainer::run_batch(uint32_t count) {
   const bool ssim = uses_ssim();
   size_t frames[kBatch];
   bool pose[kBatch], motion[kBatch];
+  std::array<float, 3> gains[kBatch];
   for (uint32_t s = 0; s < count; ++s) {
     float bg[3];
     next_view(frames[s], bg);
@@ -968,7 +999,7 @@ void Trainer::run_batch(uint32_t count) {
     const DatasetFrame& f = dataset_.frames.at(frames[s]);
     write_frame(s, camera_for(frames[s]), bg, options_.masked, stats_.step + s, buckets, ssim,
                 (pose[s] ? kFlagPoseGrad : 0) | (motion[s] ? kFlagMotionGrad : 0),
-                motion[s] ? &motion_[frames[s]] : nullptr);
+                motion[s] ? &motion_[frames[s]] : nullptr, (gains[s] = exposure_gain(frames[s])).data());
     std::memcpy(targets_[s].mapped(), f.rgba.data(), size_t(width_) * height_ * 4);
   }
   const RunTiming time = ctx_.run([&](VkCommandBuffer cmd) {
@@ -982,7 +1013,7 @@ void Trainer::run_batch(uint32_t count) {
     }
     VkContext::barrier_to_host(cmd);
   });
-  bool moved = false, fidgeted = false;
+  bool moved = false, fidgeted = false, exposed = false;
   for (uint32_t s = 0; s < count; ++s) {
     // A step whose pairs did not fit left the model alone; later ones went on.
     const bool overflow = read_slot(s);
@@ -995,12 +1026,17 @@ void Trainer::run_batch(uint32_t count) {
       update_motion(s, frames[s]);
       fidgeted = true;
     }
+    if (refines_exposure_at(stats_.step) && !overflow) {
+      update_exposure(s, frames[s]);
+      exposed = true;
+    }
     set_view_stats();
     stats_.sh_degree = int(sh_degree_at(stats_.step));
     ++stats_.step;
   }
   if (moved) update_pose_stats();
   if (fidgeted) update_motion_stats();
+  if (exposed) update_exposure_stats();
   last_slot_ = count - 1;
   after_step();  // only the last step of a batch can have any
   // Moving averages as if each step had been timed alone.
@@ -1095,7 +1131,8 @@ EvalResult Trainer::evaluate_at_rest(const Dataset& other) {
   return evaluate_views(other, false);
 }
 
-Trainer::PoseFix Trainer::align_camera(const Camera& camera, const DatasetFrame& frame, const ViewMotion* motion) {
+Trainer::PoseFix Trainer::align_camera(const Camera& camera, const DatasetFrame& frame, const ViewMotion* motion,
+                                       const float* gain) {
   // The model was fitted to corrected poses: give each held-out view the
   // same chance, moving only its camera. Gradient descent whose step grows
   // after a step that lowered the loss and halves (from the best pose) after
@@ -1109,7 +1146,7 @@ Trainer::PoseFix Trainer::align_camera(const Camera& camera, const DatasetFrame&
   double length = options_.eval_pose_step * reach;
   for (uint32_t k = 0; k < options_.eval_pose_steps; ++k) {
     run_view(with_fix(camera, current), frame.rgba.data(), black, options_.masked, true, false, false, uses_ssim(),
-             kFlagPoseGrad | kFlagPoseOnly, motion);
+             kFlagPoseGrad | kFlagPoseOnly, motion, gain);
     const double lambda = lambda_at(stats_.step);
     const double loss = (1.0 - lambda) * last_losses_[3] + lambda * (last_losses_[5] - last_losses_[4]);
     if (loss < best_loss) {
@@ -1140,8 +1177,9 @@ EvalResult Trainer::evaluate_views(const Dataset& ds, bool own) {
   EvalResult result;
   const float black[3] = {0.0f, 0.0f, 0.0f};
   const double n = 3.0 * width_ * height_;
-  auto measure = [&](const Camera& camera, const DatasetFrame& frame, const ViewMotion* motion, double sums[5]) {
-    run_view(camera, frame.rgba.data(), black, options_.masked, false, false, false, true, 0, motion);
+  auto measure = [&](const Camera& camera, const DatasetFrame& frame, const ViewMotion* motion, const float* gain,
+                     double sums[5]) {
+    run_view(camera, frame.rgba.data(), black, options_.masked, false, false, false, true, 0, motion, gain);
     sums[0] += -10.0 * std::log10(std::max(last_losses_[1] / n, 1e-12));
     sums[1] += last_losses_[0] / n;
     sums[2] += last_losses_[2] / n;
@@ -1159,14 +1197,16 @@ EvalResult Trainer::evaluate_views(const Dataset& ds, bool own) {
     ViewMotion motion;
     if (moving) motion = view_motion(i);
     const ViewMotion* m = moving ? &motion : nullptr;
+    float gain[3] = {1.0f, 1.0f, 1.0f};
+    if (own) view_gain(i, gain);
     const Camera given = dataset_camera(ds, frame);
     PoseFix fix{};
     if (align) {
-      measure(given, frame, m, unaligned);
-      fix = align_camera(given, frame, m);
+      measure(given, frame, m, gain, unaligned);
+      fix = align_camera(given, frame, m, gain);
       if (own) pose_fix_[i] = fix;
     }
-    measure(with_fix(given, fix), frame, m, sums);
+    measure(with_fix(given, fix), frame, m, gain, sums);
     ++result.views;
   }
   if (result.views > 0) {
@@ -1365,18 +1405,6 @@ void Trainer::place_nodes(const SplatScene& initial) {
   node_spacing_ = radii[radii.size() / 2];
   motion_.assign(dataset_.frames.size(), ViewMotion(k_count));
   motion_updates_.assign(dataset_.frames.size(), 0);
-  train_before_.assign(dataset_.frames.size(), kNone);
-  train_after_.assign(dataset_.frames.size(), kNone);
-  size_t last = kNone;
-  for (size_t f = 0; f < dataset_.frames.size(); ++f) {
-    train_before_[f] = last;
-    if (!dataset_.frames[f].holdout) last = f;
-  }
-  last = kNone;
-  for (size_t f = dataset_.frames.size(); f-- > 0;) {
-    train_after_[f] = last;
-    if (!dataset_.frames[f].holdout) last = f;
-  }
   stats_.motion_nodes = uint32_t(k_count);
   log_info("trainer: %zu motion nodes, spacing %.3f", k_count, node_spacing_);
 }
@@ -1588,6 +1616,88 @@ Trainer::MotionBinding Trainer::motion_binding() {
     }
   }
   return b;
+}
+
+// --- Exposure --------------------------------------------------------------------
+
+bool Trainer::refines_exposure_at(uint32_t step) const {
+  return options_.refine_exposure && step >= options_.exposure_from;
+}
+
+void Trainer::update_exposure(uint32_t slot, size_t frame) {
+  // The gain per channel that best maps the model's colour to the photo as
+  // taken, where both are opaque (train_forward's sums): its log, blended in
+  // (the first measurement taken as is).
+  const double* f = fit_[slot];
+  if (f[3] < 500.0) return;  // too little of the subject in view
+  std::array<double, 3>& g = gain_log_.at(frame);
+  const double rate = gain_updates_[frame] == 0 ? 1.0 : std::clamp(double(options_.exposure_rate), 0.0, 1.0);
+  for (int c = 0; c < 3; ++c) {
+    if (!(f[c] > 1e-9)) continue;
+    const double fitted = std::log(std::clamp(f[4 + c] / f[c], 0.25, 4.0));
+    g[c] = (1.0 - rate) * g[c] + rate * fitted;
+  }
+  ++gain_updates_[frame];
+}
+
+std::array<float, 3> Trainer::exposure_gain(size_t frame) const {
+  std::array<float, 3> out = {1.0f, 1.0f, 1.0f};
+  if (frame >= gain_log_.size()) return out;
+  // Only the gains' ratios are fixed by the photos (a brighter model and
+  // darker gains fit as well): use them divided by their geometric mean, or
+  // the model's brightness and the gains chase each other.
+  double mean[3] = {0, 0, 0};
+  size_t views = 0;
+  for (size_t v : train_frames_) {
+    if (gain_updates_[v] == 0) continue;
+    for (int c = 0; c < 3; ++c) mean[c] += gain_log_[v][c];
+    ++views;
+  }
+  if (views == 0) return out;
+  for (double& m : mean) m /= double(views);
+  if (gain_updates_[frame] > 0) {
+    for (int c = 0; c < 3; ++c) out[c] = float(std::exp(gain_log_[frame][c] - mean[c]));
+    return out;
+  }
+  // Not measured: between the measured training views before and after it in the capture.
+  size_t a = train_before_[frame], b = train_after_[frame];
+  if (a != kNone && gain_updates_[a] == 0) a = kNone;
+  if (b != kNone && gain_updates_[b] == 0) b = kNone;
+  if (a == kNone && b == kNone) return out;
+  const double t = a == kNone ? 1.0 : b == kNone ? 0.0 : double(frame - a) / double(b - a);
+  for (int c = 0; c < 3; ++c) {
+    const double la = a == kNone ? 0.0 : gain_log_[a][c], lb = b == kNone ? 0.0 : gain_log_[b][c];
+    const double l = a == kNone ? lb : b == kNone ? la : la + (lb - la) * t;
+    out[c] = float(std::exp(l - mean[c]));
+  }
+  return out;
+}
+
+void Trainer::view_gain(size_t frame, float gain[3]) const {
+  const std::array<float, 3> g = exposure_gain(frame);
+  for (int c = 0; c < 3; ++c) gain[c] = g[c];
+}
+
+void Trainer::update_exposure_stats() {
+  std::vector<double> lum, tint;
+  uint32_t updates = 0;
+  for (size_t v : train_frames_) {
+    if (gain_updates_[v] == 0) continue;
+    updates += gain_updates_[v];
+    const std::array<float, 3> g = exposure_gain(v);
+    lum.push_back(0.299 * g[0] + 0.587 * g[1] + 0.114 * g[2]);
+    tint.push_back(0.5 * (double(g[0]) + g[2]) / std::max(double(g[1]), 1e-6));
+  }
+  stats_.exposure_updates = updates;
+  if (lum.empty()) return;
+  std::sort(lum.begin(), lum.end());
+  stats_.exposure_low = lum[size_t(0.05 * double(lum.size() - 1))];
+  stats_.exposure_high = lum[size_t(0.95 * double(lum.size() - 1) + 0.5)];
+  double mean = 0.0, sq = 0.0;
+  for (double x : tint) mean += x;
+  mean /= double(tint.size());
+  for (double x : tint) sq += (x - mean) * (x - mean);
+  stats_.exposure_tint = tint.size() > 1 ? std::sqrt(sq / double(tint.size() - 1)) : 0.0;
 }
 
 SplatScene Trainer::export_scene() {
