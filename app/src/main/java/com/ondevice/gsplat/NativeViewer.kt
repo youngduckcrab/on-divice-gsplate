@@ -36,6 +36,16 @@ object NativeViewer {
     /** Returns JSON with fps, GPU times, visible count, surface size and any render error. */
     external fun stats(): String
 
+    /**
+     * What is drawn behind the model: plain, studio, dark, park, checker, sunset, night (scenes with
+     * a floor and a shadow under the model, turning with it), photo (the picture behind) or
+     * panorama (a 360-degree picture around). False if the name is unknown.
+     */
+    external fun setBackdrop(name: String): Boolean
+
+    /** The picture for the photo and panorama backdrops, as ARGB_8888 pixels. */
+    external fun setBackdropPicture(argb: IntArray, width: Int, height: Int): Boolean
+
     // Face covering, for a model opened from a file (load JSON "face_cover": true).
 
     /**

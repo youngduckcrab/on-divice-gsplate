@@ -6,10 +6,16 @@
 //       one orbit view of the scene
 //   gs_render <scene> --views <cameras.txt> <out_dir>
 //       one image per line of cameras.txt, written as out_dir/view_00000.ppm, ...
+//   Either form takes --backdrop <name> (plain, studio, dark, park, checker,
+//   sunset, night, photo, panorama) and --picture <jpg|png> for the last two,
+//   drawn as the viewer draws them.
+//
+//       one image per line of cameras.txt, written as out_dir/view_00000.ppm, ...
 //       Each line: width height fx fy cx cy, then the 3x4 world-to-camera matrix
 //       (OpenCV convention: x right, y down, z forward) row by row.
 //
 // <scene> is a .ply/.spz file or synthetic:N.
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -21,11 +27,13 @@
 #include <string>
 #include <vector>
 
+#include "gs/background.h"
 #include "gs/camera.h"
 #include "gs/offscreen.h"
 #include "gs/splat_renderer.h"
 #include "gs/splat_scene.h"
 #include "gs/vk_context.h"
+#include "image_io.h"
 
 namespace {
 
@@ -49,18 +57,38 @@ gs::SplatScene load_scene(const std::string& input) {
   return scene;
 }
 
+struct Backdrop {
+  bool on = false;
+  gs::Backdrop kind = gs::Backdrop::Plain;
+  gs::Ground ground;
+  bool flip_y = false;
+  gs::Image8 picture;
+};
+
 std::vector<uint8_t> render(gs::VkContext& ctx, gs::GpuScene& gpu, const gs::Camera& camera,
                             std::unique_ptr<gs::OffscreenTarget>& target,
-                            std::unique_ptr<gs::SplatRenderer>& renderer, uint32_t* visible) {
+                            std::unique_ptr<gs::SplatRenderer>& renderer,
+                            std::unique_ptr<gs::BackgroundRenderer>& background, const Backdrop& backdrop,
+                            uint32_t* visible) {
   if (!target || target->width() != camera.width || target->height() != camera.height) {
     renderer.reset();
+    background.reset();
     target = std::make_unique<gs::OffscreenTarget>(ctx, camera.width, camera.height);
     renderer = std::make_unique<gs::SplatRenderer>(ctx, target->render_pass());
     renderer->attach(&gpu);
+    if (backdrop.on) {
+      background = std::make_unique<gs::BackgroundRenderer>(ctx, target->render_pass());
+      if (!backdrop.picture.data.empty()) {
+        background->set_picture(backdrop.picture.data.data(), backdrop.picture.width, backdrop.picture.height);
+      }
+    }
   }
   ctx.run([&](VkCommandBuffer cmd) {
     renderer->record_prepare(cmd, camera);
-    target->record(cmd, kClear, [&](VkCommandBuffer c) { renderer->record_draw(c, camera.width, camera.height); });
+    target->record(cmd, kClear, [&](VkCommandBuffer c) {
+      if (background) background->record(c, backdrop.kind, backdrop.ground, camera, backdrop.flip_y);
+      renderer->record_draw(c, camera.width, camera.height);
+    });
   });
   *visible = renderer->visible_count();
   return target->pixels();
@@ -116,14 +144,26 @@ int main(int argc, char** argv) {
     auto gpu = gs::upload_scene(ctx, scene);
     std::unique_ptr<gs::OffscreenTarget> target;
     std::unique_ptr<gs::SplatRenderer> renderer;
+    std::unique_ptr<gs::BackgroundRenderer> background;
     uint32_t visible = 0;
+    Backdrop backdrop;
+    for (int i = 3; i + 1 < argc; ++i) {
+      if (std::string(argv[i]) == "--backdrop") {
+        if (!gs::parse_backdrop(argv[i + 1], &backdrop.kind)) throw std::runtime_error("unknown backdrop");
+        backdrop.on = true;
+      } else if (std::string(argv[i]) == "--picture") {
+        backdrop.picture = gs::decode_image(gs::read_file(argv[i + 1]), 4);
+      }
+    }
+    backdrop.ground = gs::find_ground(scene);
+    backdrop.flip_y = scene.convention == gs::AxisConvention::RDF;
 
     if (mode == "--views") {
       if (argc < 5) throw std::runtime_error("--views needs <cameras.txt> <out_dir>");
       const std::vector<gs::Camera> cameras = read_cameras(argv[3]);
       const std::string out_dir = argv[4];
       for (size_t i = 0; i < cameras.size(); ++i) {
-        auto pixels = render(ctx, *gpu, cameras[i], target, renderer, &visible);
+        auto pixels = render(ctx, *gpu, cameras[i], target, renderer, background, backdrop, &visible);
         char name[32];
         std::snprintf(name, sizeof(name), "/view_%05zu.ppm", i);
         if (!gs::write_ppm(out_dir + name, pixels, cameras[i].width, cameras[i].height)) {
@@ -136,15 +176,16 @@ int main(int argc, char** argv) {
       return 0;
     }
 
-    const uint32_t width = argc > 3 ? std::atoi(argv[3]) : 800;
-    const uint32_t height = argc > 4 ? std::atoi(argv[4]) : 600;
+    auto positional = [&](int i) { return argc > i && (argv[i][0] != '-' || std::isdigit(static_cast<unsigned char>(argv[i][1]))); };
+    const uint32_t width = positional(3) ? std::atoi(argv[3]) : 800;
+    const uint32_t height = positional(4) ? std::atoi(argv[4]) : 600;
     gs::OrbitCamera orbit;
     orbit.reset(gs::compute_bounds(scene), scene.convention == gs::AxisConvention::RDF);
-    orbit.yaw = argc > 5 ? std::atof(argv[5]) * 3.14159265f / 180.0f : 0.0f;
-    orbit.pitch = argc > 6 ? std::atof(argv[6]) * 3.14159265f / 180.0f : 0.25f;
+    orbit.yaw = positional(5) ? std::atof(argv[5]) * 3.14159265f / 180.0f : 0.0f;
+    orbit.pitch = positional(6) ? std::atof(argv[6]) * 3.14159265f / 180.0f : 0.25f;
     const gs::Camera camera = orbit.camera(width, height);
     auto start = std::chrono::steady_clock::now();
-    auto pixels = render(ctx, *gpu, camera, target, renderer, &visible);
+    auto pixels = render(ctx, *gpu, camera, target, renderer, background, backdrop, &visible);
     std::printf("rendered %ux%u: %u visible, %.1f ms\n", width, height, visible,
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
     if (!gs::write_ppm(argv[2], pixels, width, height)) throw std::runtime_error("cannot write output");

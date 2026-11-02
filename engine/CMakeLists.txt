@@ -49,6 +49,8 @@ set(GS_SHADERS
   splat_preprocess.comp
   splat.vert
   splat.frag
+  background.vert
+  background.frag
   scan_local.comp
   scan_add.comp
   train_project.comp
@@ -117,6 +119,7 @@ add_custom_target(gs_shaders DEPENDS ${GS_SHADER_HEADERS})
 
 # --- Engine library -----------------------------------------------------------
 add_library(gsengine STATIC
+  src/background.cpp
   src/benchmarks.cpp
   src/camera.cpp
   src/capture.cpp
@@ -192,6 +195,7 @@ if(GS_BUILD_TESTS AND NOT ANDROID)
 
   add_executable(gs_render cli/gs_render.cpp)
   target_link_libraries(gs_render PRIVATE gsengine)
+  target_include_directories(gs_render PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
   add_executable(gs_face cli/gs_face.cpp)
   target_link_libraries(gs_face PRIVATE gsengine)

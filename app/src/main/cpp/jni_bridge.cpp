@@ -17,6 +17,7 @@
 #include <fstream>
 #include <optional>
 
+#include "gs/background.h"
 #include "gs/benchmarks.h"
 #include "gs/dataset.h"
 #include "gs/diagnose.h"
@@ -126,7 +127,7 @@ std::string load_scene(F&& make_scene, bool keep) {
     const auto t2 = Clock::now();
     const bool flip = scene.convention == gs::AxisConvention::RDF;
     const int gpu_degree = gpu->sh_degree;
-    v.set_scene(std::move(gpu), bounds, flip);
+    v.set_scene(std::move(gpu), bounds, flip, gs::find_ground(scene));
 
     gs::JsonWriter w;
     w.begin_object();
@@ -264,6 +265,43 @@ Java_com_ondevice_gsplat_NativeViewer_stats(JNIEnv* env, jobject /*this*/) {
   } catch (const std::exception& e) {
     return to_jstring(env, error_json(e.what()));
   }
+}
+
+// --- Backdrop (NativeViewer) ------------------------------------------------------
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_ondevice_gsplat_NativeViewer_setBackdrop(JNIEnv* env, jobject /*this*/, jstring jname) {
+  gs::Backdrop backdrop;
+  if (!gs::parse_backdrop(from_jstring(env, jname), &backdrop)) return JNI_FALSE;
+  bool ok = false;
+  with_viewer([&](Viewer& v) {
+    v.set_backdrop(backdrop);
+    ok = true;
+  });
+  return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_ondevice_gsplat_NativeViewer_setBackdropPicture(JNIEnv* env, jobject /*this*/, jintArray jargb, jint width,
+                                                         jint height) {
+  const jsize n = env->GetArrayLength(jargb);
+  if (width <= 0 || height <= 0 || n != width * height) return JNI_FALSE;
+  std::vector<jint> argb(static_cast<size_t>(n));
+  env->GetIntArrayRegion(jargb, 0, n, argb.data());
+  std::vector<uint8_t> rgba(static_cast<size_t>(n) * 4);
+  for (size_t i = 0; i < argb.size(); ++i) {
+    const uint32_t c = static_cast<uint32_t>(argb[i]);
+    rgba[i * 4 + 0] = uint8_t(c >> 16);
+    rgba[i * 4 + 1] = uint8_t(c >> 8);
+    rgba[i * 4 + 2] = uint8_t(c);
+    rgba[i * 4 + 3] = 255;
+  }
+  bool ok = false;
+  with_viewer([&](Viewer& v) {
+    v.set_picture(std::move(rgba), static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+    ok = true;
+  });
+  return ok ? JNI_TRUE : JNI_FALSE;
 }
 
 // --- Face covering (NativeViewer) --------------------------------------------------

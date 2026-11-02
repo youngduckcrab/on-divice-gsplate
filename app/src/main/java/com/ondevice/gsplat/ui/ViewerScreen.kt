@@ -51,6 +51,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ondevice.gsplat.NativeViewer
+import com.ondevice.gsplat.viewer.Backdrop
 import com.ondevice.gsplat.viewer.FaceCover
 import com.ondevice.gsplat.viewer.ViewerViewModel
 import java.io.File
@@ -76,6 +77,9 @@ fun ViewerScreen(
     }
     val openFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) vm.loadUri(uri)
+    }
+    val pickPhoto = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) vm.usePhoto(uri)
     }
     val saveFile = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
         if (uri != null) vm.saveShown(uri)
@@ -154,6 +158,7 @@ fun ViewerScreen(
                 )
             }
             if (vm.faceOpen) FacePanel(vm, onSave = { saveFile.launch(vm.coveredName()) })
+            if (vm.backdropOpen) BackdropPanel(vm, onPickPhoto = { pickPhoto.launch(arrayOf("image/*")) })
             ControlRow {
                 FilledTonalButton(enabled = !vm.loading, onClick = { vm.loadSynthetic(100_000) }) { Text("샘플 10만") }
                 FilledTonalButton(enabled = !vm.loading, onClick = { vm.loadSynthetic(500_000) }) { Text("샘플 50만") }
@@ -164,6 +169,9 @@ fun ViewerScreen(
                 }
             }
             ControlRow {
+                if (!vm.backdropOpen) {
+                    FilledTonalButton(enabled = !vm.loading, onClick = vm::openBackdropPanel) { Text("배경") }
+                }
                 if (vm.canCoverFace && !vm.faceOpen) {
                     FilledTonalButton(enabled = !vm.loading, onClick = vm::openFacePanel) { Text("얼굴 가리기") }
                 }
@@ -174,6 +182,32 @@ fun ViewerScreen(
                 }
                 OutlinedButton(onClick = vm::cycleResolution) { Text("해상도 ${(vm.resolutionScale * 100).toInt()}%") }
             }
+        }
+    }
+}
+
+/** What is behind the model: drawn scenes with a floor, or a picture from the phone. */
+@Composable
+private fun BackdropPanel(vm: ViewerViewModel, onPickPhoto: () -> Unit) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(horizontal = 10.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("배경", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+                TextButton(onClick = vm::closeBackdropPanel) { Text("닫기") }
+            }
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                for (choice in Backdrop.entries) {
+                    FilterChip(
+                        selected = vm.backdrop == choice,
+                        onClick = { if (choice == Backdrop.PHOTO) onPickPhoto() else vm.chooseBackdrop(choice) },
+                        label = { Text(choice.label) },
+                    )
+                }
+            }
+            Text(
+                vm.backdropStatus.ifEmpty { "내 사진: 가로·세로 2:1 사진(360° 파노라마)은 모델을 둘러싸고, 다른 사진은 뒤에 깔려요" },
+                style = MaterialTheme.typography.bodySmall,
+            )
         }
     }
 }

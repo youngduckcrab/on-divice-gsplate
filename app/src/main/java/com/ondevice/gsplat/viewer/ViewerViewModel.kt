@@ -33,6 +33,18 @@ enum class FaceCover(val id: String, val label: String) {
     SMILE("smile", "스마일"),
 }
 
+/** What is drawn behind the model (NativeViewer.setBackdrop names). */
+enum class Backdrop(val id: String, val label: String) {
+    PLAIN("plain", "기본"),
+    STUDIO("studio", "흰 스튜디오"),
+    DARK("dark", "어두운 무대"),
+    PARK("park", "하늘·잔디"),
+    CHECKER("checker", "체크 바닥"),
+    SUNSET("sunset", "노을"),
+    NIGHT("night", "밤하늘"),
+    PHOTO("photo", "내 사진"),
+}
+
 /**
  * What the viewer shows, for the life of the process. The native scene (and a
  * covered face) outlives this screen's view model, which is made again when the
@@ -83,12 +95,20 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
     var faceRaise by mutableFloatStateOf(0.0f)
     private var coverAgain = false
 
+    var backdrop by mutableStateOf(Backdrop.PLAIN)
+        private set
+    var backdropOpen by mutableStateOf(false)
+        private set
+    var backdropStatus by mutableStateOf("")
+        private set
+
     private val prefs = application.getSharedPreferences("viewer", android.content.Context.MODE_PRIVATE)
 
     /** Trained models (and covered ones saved here), kept in the app's own storage. */
     val modelsDir: File get() = File(getApplication<Application>().filesDir, "models").apply { mkdirs() }
 
     init {
+        if (loadError == null) restoreBackdrop()
         if (loadError == null) {
             val kept = ViewerSession.scene
             if (NativeViewer.sceneCount() > 0 && kept != null) {
@@ -199,7 +219,94 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
 
     fun resetView() = NativeViewer.resetView()
 
+    fun openBackdropPanel() {
+        backdropOpen = true
+        faceOpen = false
+    }
+
+    fun closeBackdropPanel() {
+        backdropOpen = false
+    }
+
+    /** A drawn backdrop; the photo one goes through [usePhoto]. */
+    fun chooseBackdrop(choice: Backdrop) {
+        if (choice == Backdrop.PHOTO) return
+        if (NativeViewer.setBackdrop(choice.id)) {
+            backdrop = choice
+            backdropStatus = ""
+            prefs.edit().putString("backdrop", choice.id).apply()
+        }
+    }
+
+    /**
+     * A picture from the phone as the backdrop: a 2:1 picture (a 360-degree panorama) goes all
+     * around the model, any other one behind it, filling the screen.
+     */
+    fun usePhoto(uri: Uri, remembered: Boolean = false) {
+        val resolver = getApplication<Application>().contentResolver
+        if (!remembered) {
+            runCatching { resolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+        }
+        viewModelScope.launch {
+            backdropStatus = "사진 불러오는 중…"
+            val result = withContext(Dispatchers.Default) { runCatching { decodeBackdrop(uri) } }
+            result.onSuccess { panorama ->
+                if (NativeViewer.setBackdrop(if (panorama) "panorama" else "photo")) {
+                    backdrop = Backdrop.PHOTO
+                    prefs.edit().putString("backdrop", Backdrop.PHOTO.id).putString("backdrop_photo", uri.toString()).apply()
+                    backdropStatus = if (panorama) {
+                        "360° 사진으로 둘렀어요 (모델과 함께 돌아가요)"
+                    } else {
+                        "사진을 뒤에 깔았어요 (모델을 돌려도 사진은 그대로예요)"
+                    }
+                }
+            }.onFailure {
+                backdropStatus = "사진을 쓸 수 없어요: ${it.message ?: it}"
+            }
+        }
+    }
+
+    /** Decodes [uri] (upright, as the gallery shows it) for the backdrop; true if it is a panorama. */
+    private fun decodeBackdrop(uri: Uri): Boolean {
+        val source = android.graphics.ImageDecoder.createSource(getApplication<Application>().contentResolver, uri)
+        var panorama = false
+        val bitmap = android.graphics.ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+            val w = info.size.width
+            val h = info.size.height
+            val aspect = w.toFloat() / h.coerceAtLeast(1)
+            panorama = aspect in 1.9f..2.1f
+            // Enough detail for a phone screen, small enough to upload quickly.
+            val limit = if (panorama) 4096 else 2048
+            val scale = minOf(1f, limit.toFloat() / maxOf(w, h))
+            decoder.setTargetSize((w * scale).toInt().coerceAtLeast(1), (h * scale).toInt().coerceAtLeast(1))
+            decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
+        }
+        val argb = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+        val width = argb.width
+        val height = argb.height
+        val pixels = IntArray(width * height)
+        argb.getPixels(pixels, 0, width, 0, 0, width, height)
+        if (argb !== bitmap) argb.recycle()
+        bitmap.recycle()
+        if (!NativeViewer.setBackdropPicture(pixels, width, height)) error("화면에 넘기지 못했어요")
+        return panorama
+    }
+
+    private fun restoreBackdrop() {
+        val id = prefs.getString("backdrop", null) ?: return
+        val choice = Backdrop.entries.firstOrNull { it.id == id } ?: return
+        if (choice != Backdrop.PHOTO) {
+            chooseBackdrop(choice)
+            return
+        }
+        val uri = prefs.getString("backdrop_photo", null)?.let(Uri::parse) ?: return
+        val readable = getApplication<Application>().contentResolver.persistedUriPermissions
+            .any { it.uri == uri && it.isReadPermission }
+        if (readable) usePhoto(uri, remembered = true)
+    }
+
     fun openFacePanel() {
+        backdropOpen = false
         faceOpen = true
         if (!facePlaced && !faceBusy) findFace(aroundCamera = false)
     }

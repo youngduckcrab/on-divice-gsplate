@@ -9,6 +9,7 @@
 #include <thread>
 #include <vector>
 
+#include "gs/background.h"
 #include "gs/camera.h"
 #include "gs/splat_renderer.h"
 #include "gs/vk_context.h"
@@ -26,8 +27,10 @@ class Viewer {
   void detach_window();
   void window_resized();
 
-  // Replaces the scene and resets the camera to frame it.
-  void set_scene(std::unique_ptr<gs::GpuScene> scene, const gs::SceneBounds& bounds, bool flip_y);
+  // Replaces the scene and resets the camera to frame it; `ground` places the
+  // backdrop's floor under it.
+  void set_scene(std::unique_ptr<gs::GpuScene> scene, const gs::SceneBounds& bounds, bool flip_y,
+                 const gs::Ground& ground);
   // Replaces the scene with an edited version of it, keeping the camera.
   void swap_scene(std::unique_ptr<gs::GpuScene> scene);
   uint32_t scene_count();
@@ -40,6 +43,10 @@ class Viewer {
   void reset_view();
   void set_flip_y(bool flip_y);
   void set_continuous(bool continuous);
+  // What is drawn behind the model, and the picture Photo / Panorama show
+  // (RGBA8, kept so a new window gets it again).
+  void set_backdrop(gs::Backdrop backdrop);
+  void set_picture(std::vector<uint8_t> rgba, uint32_t width, uint32_t height);
 
   std::string stats_json();
 
@@ -68,7 +75,7 @@ class Viewer {
   void create_swapchain();
   void destroy_swapchain();
   // Returns false when the swapchain is out of date.
-  bool draw_frame(const gs::OrbitCamera& orbit);
+  bool draw_frame(const gs::OrbitCamera& orbit, gs::Backdrop backdrop, const gs::Ground& ground);
   void read_timestamps(uint32_t frame);
 
   std::shared_ptr<gs::VkContext> ctx_;
@@ -87,6 +94,12 @@ class Viewer {
   std::unique_ptr<gs::GpuScene> pending_scene_;
   gs::OrbitCamera orbit_;
   gs::SceneBounds bounds_{{0.0f, 0.0f, 0.0f}, 1.0f};
+  gs::Ground ground_;
+  gs::Backdrop backdrop_ = gs::Backdrop::Plain;
+  std::shared_ptr<const std::vector<uint8_t>> picture_;
+  uint32_t picture_width_ = 0;
+  uint32_t picture_height_ = 0;
+  uint64_t picture_version_ = 0;
   Stats stats_;
 
   // Owned by the render thread while it runs.
@@ -106,4 +119,6 @@ class Viewer {
   bool frame_used_[2] = {false, false};
   uint32_t frame_index_ = 0;
   std::unique_ptr<gs::SplatRenderer> renderer_;
+  std::unique_ptr<gs::BackgroundRenderer> background_;
+  uint64_t picture_uploaded_ = 0;  // picture_version_ the background last got
 };

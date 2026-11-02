@@ -69,8 +69,10 @@ void Viewer::window_resized() {
   cv_.notify_all();
 }
 
-void Viewer::set_scene(std::unique_ptr<gs::GpuScene> scene, const gs::SceneBounds& bounds, bool flip_y) {
+void Viewer::set_scene(std::unique_ptr<gs::GpuScene> scene, const gs::SceneBounds& bounds, bool flip_y,
+                       const gs::Ground& ground) {
   std::lock_guard<std::mutex> lock(mutex_);
+  ground_ = ground;
   if (thread_running_) {
     pending_scene_ = std::move(scene);  // swapped in by the render thread once the GPU is idle
   } else {
@@ -144,6 +146,22 @@ void Viewer::set_continuous(bool continuous) {
   request_redraw();
 }
 
+void Viewer::set_backdrop(gs::Backdrop backdrop) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  backdrop_ = backdrop;
+  request_redraw();
+}
+
+void Viewer::set_picture(std::vector<uint8_t> rgba, uint32_t width, uint32_t height) {
+  auto picture = std::make_shared<const std::vector<uint8_t>>(std::move(rgba));
+  std::lock_guard<std::mutex> lock(mutex_);
+  picture_ = std::move(picture);
+  picture_width_ = width;
+  picture_height_ = height;
+  ++picture_version_;
+  request_redraw();
+}
+
 void Viewer::request_redraw() {
   redraw_ = true;
   cv_.notify_all();
@@ -186,6 +204,8 @@ void Viewer::render_loop() {
     create_frame_resources();
     create_swapchain();
     renderer_ = std::make_unique<gs::SplatRenderer>(*ctx_, render_pass_);
+    background_ = std::make_unique<gs::BackgroundRenderer>(*ctx_, render_pass_);
+    picture_uploaded_ = 0;  // a new background has only its placeholder
     {
       std::lock_guard<std::mutex> lock(mutex_);
       renderer_->attach(scene_.get());
@@ -195,6 +215,11 @@ void Viewer::render_loop() {
     int fps_frames = 0;
     while (true) {
       gs::OrbitCamera orbit;
+      gs::Backdrop backdrop = gs::Backdrop::Plain;
+      gs::Ground ground;
+      std::shared_ptr<const std::vector<uint8_t>> picture;
+      uint32_t picture_width = 0, picture_height = 0;
+      uint64_t picture_version = 0;
       std::unique_ptr<gs::GpuScene> incoming;
       bool resized = false;
       bool continuous = false;
@@ -208,6 +233,19 @@ void Viewer::render_loop() {
         redraw_ = false;
         continuous = continuous_;
         orbit = orbit_;
+        backdrop = backdrop_;
+        ground = ground_;
+        if (picture_version_ != picture_uploaded_ && picture_) {
+          picture = picture_;
+          picture_width = picture_width_;
+          picture_height = picture_height_;
+          picture_version = picture_version_;
+        }
+      }
+      if (picture) {
+        ctx_->queue_wait_idle();  // earlier frames may still read the old picture
+        background_->set_picture(picture->data(), picture_width, picture_height);
+        picture_uploaded_ = picture_version;
       }
 
       if (incoming) {
@@ -227,7 +265,7 @@ void Viewer::render_loop() {
         continue;
       }
 
-      if (!draw_frame(orbit)) {
+      if (!draw_frame(orbit, backdrop, ground)) {
         std::lock_guard<std::mutex> lock(mutex_);
         resized_ = true;
         redraw_ = true;
@@ -253,6 +291,7 @@ void Viewer::render_loop() {
 
   ctx_->queue_wait_idle();
   renderer_.reset();
+  background_.reset();
   destroy_swapchain();
   if (render_pass_ != VK_NULL_HANDLE) vkDestroyRenderPass(ctx_->device(), render_pass_, nullptr);
   render_pass_ = VK_NULL_HANDLE;
@@ -500,7 +539,7 @@ void Viewer::read_timestamps(uint32_t frame) {
   stats_.draw_ms = stats_.draw_ms == 0.0 ? draw : 0.8 * stats_.draw_ms + 0.2 * draw;
 }
 
-bool Viewer::draw_frame(const gs::OrbitCamera& orbit) {
+bool Viewer::draw_frame(const gs::OrbitCamera& orbit, gs::Backdrop backdrop, const gs::Ground& ground) {
   VkDevice device = ctx_->device();
   Frame& f = frames_[frame_index_];
   GS_VK_CHECK(vkWaitForFences(device, 1, &f.fence, VK_TRUE, UINT64_MAX));
@@ -543,6 +582,7 @@ bool Viewer::draw_frame(const gs::OrbitCamera& orbit) {
   pass.clearValueCount = 1;
   pass.pClearValues = &clear;
   vkCmdBeginRenderPass(f.cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
+  background_->record(f.cmd, backdrop, ground, camera, orbit.flip_y(), rotation_);
   renderer_->record_draw(f.cmd, width, height, rotation_);
   vkCmdEndRenderPass(f.cmd);
   if (query_pool_ != VK_NULL_HANDLE) {
