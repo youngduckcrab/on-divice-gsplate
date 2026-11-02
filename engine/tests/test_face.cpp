@@ -110,12 +110,22 @@ void project(const gs::OrthoView& v, V point, float xy[2]) {
   xy[1] = dot(rel, V{v.down[0], v.down[1], v.down[2]}) / v.pixel + 0.5f * float(v.height);
 }
 
-// A detector's report: the eyes and mouth in every view that sees the face.
-std::string landmarks_json(const Person& p, const gs::FaceViews& views) {
+// A detector's report: the eyes and mouth in every view that sees the face,
+// and with `fakes`, wider "faces" in the back of the head as detectors find
+// in hair.
+std::string landmarks_json(const Person& p, const gs::FaceViews& views, bool fakes = false) {
   std::string json = "[";
   for (size_t i = 0; i < views.views.size(); ++i) {
     const gs::OrthoView& v = views.views[i];
     const V towards = {-v.forward[0], -v.forward[1], -v.forward[2]};
+    if (fakes && dot(towards, p.facing) < -0.5f) {
+      const float c = 0.5f * float(v.width);
+      char buf[160];
+      std::snprintf(buf, sizeof(buf), "%s{\"view\":%zu,\"eyes\":[[%.1f,%.1f],[%.1f,%.1f]],\"mouth\":[%.1f,%.1f]}",
+                    json.size() > 1 ? "," : "", i, c - 26, c - 10, c + 26, c - 10, c, c + 30);
+      json += buf;
+      continue;
+    }
     if (dot(towards, p.facing) < std::cos(50.0f * kPi / 180.0f)) continue;
     float e0[2], e1[2], m[2];
     project(v, p.eyes[1], e0);  // detectors may report either eye first
@@ -197,6 +207,12 @@ void test_place(const Person& p, const gs::FaceViews& views, gs::FacePlacement* 
   EXPECT(dot(r, sub(p.eyes[1], p.eyes[0])) > 0.0f, "right points to the viewer's left");
   EXPECT(std::abs(face.eye_distance - 0.063f) < 0.006f, "eye distance %.1f mm", 1000 * face.eye_distance);
   *placed = face;
+
+  // Wider false detections in the back of the head do not win over the face several views agree on.
+  const gs::FacePlacement despite = gs::place_face(p.scene, views, gs::parse_face_landmarks(landmarks_json(p, views, true)));
+  const V dc = {despite.center[0], despite.center[1], despite.center[2]};
+  EXPECT(despite.found && len(sub(dc, mid)) < 0.006f, "with false detections the centre is off by %.1f mm",
+         1000 * len(sub(dc, mid)));
 
   const float facing[3] = {p.facing.x, p.facing.y, p.facing.z};
   const gs::FacePlacement guess = gs::guess_face(p.scene, views, facing);

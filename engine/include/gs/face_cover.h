@@ -75,15 +75,17 @@ std::vector<FaceLandmarks> parse_face_landmarks(std::string_view json);
 struct FacePlacement {
   bool found = false;
   bool detected = false;  // from landmarks; otherwise guessed from the head's shape
-  int views_used = 0;
+  int views_used = 0;      // detections averaged
+  int views_agreeing = 0;  // detections that put the face in the same place
   float center[3] = {0, 0, 0};
   float right[3] = {1, 0, 0};
   float up[3] = {0, 1, 0};
   float forward[3] = {0, 0, 1};
   float eye_distance = 0;
 };
-// The most frontal detections (widest eye distance), each eye and the mouth
-// put on the model's surface through the view's depth, averaged.
+// Each detection's eyes and mouth put on the model's surface through its
+// picture's depth; the detection most others agree with (in 3D) picks the
+// face, and the most frontal of those (widest eye distance) are averaged.
 FacePlacement place_face(const SplatScene& scene, const FaceViews& views, const std::vector<FaceLandmarks>& faces);
 // Without a detection: the face looks along `facing` (horizontal part used),
 // eyes at the usual height and spacing for the head's size.

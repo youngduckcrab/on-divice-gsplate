@@ -90,8 +90,8 @@ int main(int argc, char** argv) {
       face = gs::place_face(scene, views, faces);
     }
     if (!face.found) throw std::runtime_error("face not placed");
-    std::printf("face %s from %d view(s): centre (%.3f %.3f %.3f) forward (%.2f %.2f %.2f) up (%.2f %.2f %.2f), eyes %.1f mm apart\n",
-                face.detected ? "detected" : "guessed", face.views_used, face.center[0], face.center[1], face.center[2],
+    std::printf("face %s from %d view(s) (%d agree): centre (%.3f %.3f %.3f) forward (%.2f %.2f %.2f) up (%.2f %.2f %.2f), eyes %.1f mm apart\n",
+                face.detected ? "detected" : "guessed", face.views_used, face.views_agreeing, face.center[0], face.center[1], face.center[2],
                 face.forward[0], face.forward[1], face.forward[2], face.up[0], face.up[1], face.up[2],
                 face.eye_distance * 1000.0f);
 

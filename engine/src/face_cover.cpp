@@ -523,11 +523,13 @@ constexpr float kOvalH = 1.72f;  // half height
 
 float oval(float a, float b) { return std::sqrt((a / kOvalA) * (a / kOvalA) + ((b - kOvalB) / kOvalH) * ((b - kOvalB) / kOvalH)); }
 
-// Whether the face (or hair) is at (a, b) seen from the front: covers stay
-// within the head's outline instead of standing out past it.
+// Whether the face (or hair over it) is at (a, b) seen from the front, rather
+// than nothing, the ears and sides of the head, or the neck under the chin,
+// which lie well behind the face: covers stay on the face.
 bool on_face(const FaceField& field, float a, float b) {
-  const float alpha = field.sample(field.alpha, a, b);
-  return alpha >= 0.5f;
+  if (field.sample(field.alpha, a, b) < 0.5f) return false;
+  const float c = field.sample(field.height, a, b);
+  return !std::isnan(c) && c > -0.9f;
 }
 
 void skin_tone(const FaceField& field, float rgb[3]) {
@@ -613,7 +615,7 @@ void blur_face(const FaceField& field, Layer& layer) {
         if (edge <= 0.0f) return 0.0f;
         const int fi = std::clamp(int(g.fi(a) + 0.5f), 0, g.w - 1), fj = std::clamp(int(g.fj(b) + 0.5f), 0, g.h - 1);
         const size_t p = size_t(fj) * g.w + fi;
-        if (field.alpha[p] < 0.5f || std::isnan(soft[p * 3])) return 0.0f;
+        if (!on_face(field, a, b) || std::isnan(soft[p * 3])) return 0.0f;
         for (int c = 0; c < 3; ++c) rgb[c] = soft[p * 3 + c];
         return edge;
       },
@@ -636,8 +638,10 @@ bool in_almond(float a, float b, float ca, float cb, float ha, float hb) {
 }
 
 void mask(const FaceField& field, Layer& layer) {
-  // Spread wide and smoothed: a mask is a smooth shell over the face, not a cast of it.
-  const std::vector<float> shell = shell_over(field, 0.3f, 0.15f, 0.06f);
+  // Spread and smoothed: a mask is a smooth shell over the face, not a cast of
+  // it. Less spread brings back the face's own bumps; more turns the nose
+  // into a beak.
+  const std::vector<float> shell = shell_over(field, 0.2f, 0.2f, 0.06f);
   const float ivory[3] = {0.95f, 0.93f, 0.88f};
   const float rim[3] = {0.80f, 0.78f, 0.74f};
   const float hole[3] = {0.03f, 0.03f, 0.035f};
@@ -1085,49 +1089,69 @@ FacePlacement place_face(const SplatScene& scene, const FaceViews& views, const 
   (void)scene;
   FacePlacement out;
   if (!views.head.found) return out;
-  auto eye_px = [](const FaceLandmarks& f) {
-    return std::hypot(f.eyes[0][0] - f.eyes[1][0], f.eyes[0][1] - f.eyes[1][1]);
+  // Every detection's eyes (and mouth) on the model, through its picture's depth.
+  struct Lifted {
+    Vec3 left, right, mouth;
+    bool has_mouth = false;
+    float px = 0;  // eye distance in the picture: wider is more frontal
+    Vec3 mid() const { return (left + right) * 0.5f; }
+    float spacing() const { return length(right - left); }
   };
-  float widest = 0;
+  std::vector<Lifted> lifted;
   for (const FaceLandmarks& f : faces) {
-    if (f.view >= 0 && f.view < int(views.views.size())) widest = std::max(widest, eye_px(f));
-  }
-  if (widest <= 2.0f) return out;
-  Vec3 left, right, mouth;
-  int used = 0, mouths = 0;
-  for (const FaceLandmarks& f : faces) {
-    if (f.view < 0 || f.view >= int(views.views.size()) || eye_px(f) < 0.8f * widest) continue;
+    if (f.view < 0 || f.view >= int(views.views.size())) continue;
     const OrthoView& v = views.views[size_t(f.view)];
     const int reach = int(0.04f * float(v.width)) + 3;
+    auto lift = [&](const float* xy, Vec3* out3) {
+      const float d = v.depth_near(xy[0], xy[1], reach);
+      if (std::isnan(d)) return false;
+      float p[3];
+      v.point(xy[0], xy[1], d, p);
+      *out3 = Vec3(p);
+      return true;
+    };
+    Lifted l;
+    l.px = std::hypot(f.eyes[0][0] - f.eyes[1][0], f.eyes[0][1] - f.eyes[1][1]);
     // Image left first: facing the person, that is the viewer's left.
-    const int l = f.eyes[0][0] <= f.eyes[1][0] ? 0 : 1;
-    Vec3 eye3[2];
-    bool ok = true;
-    for (int k = 0; k < 2; ++k) {
-      const float* e = f.eyes[k == 0 ? l : 1 - l];
-      const float d = v.depth_near(e[0], e[1], reach);
-      if (std::isnan(d)) {
-        ok = false;
-        break;
-      }
-      float p[3];
-      v.point(e[0], e[1], d, p);
-      eye3[k] = Vec3(p);
+    const int first = f.eyes[0][0] <= f.eyes[1][0] ? 0 : 1;
+    if (l.px <= 2.0f || !lift(f.eyes[first], &l.left) || !lift(f.eyes[1 - first], &l.right)) continue;
+    l.has_mouth = f.has_mouth && lift(f.mouth, &l.mouth);
+    lifted.push_back(l);
+  }
+  // Detectors also see faces in hair and the backs of heads, but only the real
+  // face is found in the same place from several directions: take the
+  // detection most others agree with (ties: the most frontal).
+  auto agree = [](const Lifted& a, const Lifted& b) {
+    const float e = std::max(a.spacing(), b.spacing());
+    return length(a.mid() - b.mid()) < 0.35f * e && std::abs(a.spacing() - b.spacing()) < 0.35f * e;
+  };
+  int best = -1, best_support = 0;
+  for (size_t i = 0; i < lifted.size(); ++i) {
+    int support = 0;
+    for (const Lifted& other : lifted) support += agree(lifted[i], other) ? 1 : 0;
+    if (support > best_support || (support == best_support && lifted[i].px > lifted[size_t(best)].px)) {
+      best = int(i);
+      best_support = support;
     }
-    if (!ok) continue;
-    left = left + eye3[0];
-    right = right + eye3[1];
+  }
+  if (best < 0) return out;
+  // Average the most frontal of those that agree.
+  float widest = 0;
+  for (const Lifted& l : lifted) {
+    if (agree(lifted[size_t(best)], l)) widest = std::max(widest, l.px);
+  }
+  Vec3 left, right, mouth;
+  int used = 0, mouths = 0;
+  for (const Lifted& l : lifted) {
+    if (!agree(lifted[size_t(best)], l) || l.px < 0.8f * widest) continue;
+    left = left + l.left;
+    right = right + l.right;
     ++used;
-    if (f.has_mouth) {
-      float d = v.depth_near(f.mouth[0], f.mouth[1], reach);
-      if (std::isnan(d)) continue;
-      float p[3];
-      v.point(f.mouth[0], f.mouth[1], d, p);
-      mouth = mouth + Vec3(p);
+    if (l.has_mouth) {
+      mouth = mouth + l.mouth;
       ++mouths;
     }
   }
-  if (used == 0) return out;
   left = left * (1.0f / float(used));
   right = right * (1.0f / float(used));
   const Vec3 across = right - left;
@@ -1154,6 +1178,7 @@ FacePlacement place_face(const SplatScene& scene, const FaceViews& views, const 
   out.found = true;
   out.detected = true;
   out.views_used = used;
+  out.views_agreeing = best_support;
   return out;
 }
 

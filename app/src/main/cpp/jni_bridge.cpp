@@ -342,6 +342,7 @@ Java_com_ondevice_gsplat_NativeViewer_placeFace(JNIEnv* env, jobject /*this*/, j
     w.field("detected", face.detected);
     w.field("detections", static_cast<uint32_t>(faces.size()));
     w.field("views_used", face.views_used);
+    w.field("views_agreeing", face.views_agreeing);
     w.field("eye_mm", face.eye_distance * 1000.0f);
     w.end_object();
     return w.str();
