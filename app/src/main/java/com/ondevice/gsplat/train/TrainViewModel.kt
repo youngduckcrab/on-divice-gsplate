@@ -63,6 +63,13 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
     var refinePoses by mutableStateOf(false)
     var refineMotion by mutableStateOf(false)
     var refineExposure by mutableStateOf(false)
+    /** The dataset being looked at (photos, cutouts, video), if any. */
+    var browsing by mutableStateOf<DatasetInfo?>(null)
+        private set
+
+    fun browse(info: DatasetInfo?) {
+        browsing = info
+    }
     var phase by mutableStateOf(Phase.IDLE)
         private set
     var importProgress by mutableStateOf(0f)

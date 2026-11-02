@@ -96,6 +96,10 @@ fun TrainScreen(onOpenModel: (File) -> Unit, vm: TrainViewModel = viewModel()) {
             context.startActivity(Intent.createChooser(send, "보내기"))
         }
     }
+    vm.browsing?.let { d ->
+        DatasetViewer(d, onClose = { vm.browse(null) })
+        return
+    }
 
     Column(
         Modifier
@@ -119,6 +123,7 @@ fun TrainScreen(onOpenModel: (File) -> Unit, vm: TrainViewModel = viewModel()) {
                         exportDataset.launch("${d.name}.zip")
                     }
                     ExportKind.REFINE_MASKS -> vm.refineMasks(d)
+                    ExportKind.BROWSE -> vm.browse(d)
                 }
             },
         )
@@ -219,7 +224,7 @@ private fun DatasetCard(
     }
 }
 
-private enum class ExportKind { SEND_ZIP, ZIP, ZIP_WITH_VIDEO, SEND_VIDEO, VIDEO, REFINE_MASKS }
+private enum class ExportKind { BROWSE, SEND_ZIP, ZIP, ZIP_WITH_VIDEO, SEND_VIDEO, VIDEO, REFINE_MASKS }
 
 @Composable
 private fun DatasetRow(d: DatasetInfo, selected: Boolean, vm: TrainViewModel, onExport: (DatasetInfo, ExportKind) -> Unit) {
@@ -247,6 +252,7 @@ private fun DatasetRow(d: DatasetInfo, selected: Boolean, vm: TrainViewModel, on
             TextButton(enabled = !vm.running && !vm.exporting, onClick = { menu = true }) { Text("메뉴") }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                 val items = buildList {
+                    add(ExportKind.BROWSE to if (d.video) "사진·누끼·영상 보기" else "사진·누끼 보기")
                     add(ExportKind.SEND_ZIP to "데이터셋 zip 바로 보내기 (카톡·Quick Share·드라이브)")
                     add(ExportKind.ZIP to "데이터셋 zip 저장 (사진·누끼·깊이·위치)")
                     if (d.video) {
