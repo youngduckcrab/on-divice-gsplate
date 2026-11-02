@@ -99,7 +99,13 @@ def build():
 
     # The room.
     cx, cy, w, d = (X0 + X1) / 2, (Y0 + Y1) / 2, X1 - X0, Y1 - Y0
-    panel("floor", (cx, cy, 0), (w, d, 0), "+z", concrete)
+    # The floor, with a hole where the paper lies on it (hidden there, it
+    # would show through between the paper's splats).
+    px, py0, py1 = 1.36, -0.4, 2.6
+    panel("floor", (cx, (Y0 + py0) / 2, 0), (w, py0 - Y0, 0), "+z", concrete)
+    panel("floor", (cx, (py1 + Y1) / 2, 0), (w, Y1 - py1, 0), "+z", concrete)
+    panel("floor", ((X0 - px) / 2, (py0 + py1) / 2, 0), (-px - X0, py1 - py0, 0), "+z", concrete)
+    panel("floor", ((px + X1) / 2, (py0 + py1) / 2, 0), (X1 - px, py1 - py0, 0), "+z", concrete)
     panel("ceiling", (cx, cy, H), (w, d, 0), "-z", ceiling)
     panel("wall -x", (X0, cy, H / 2), (0, d, H), "+x", charcoal)
     panel("wall +x", (X1, cy, H / 2), (0, d, H), "-x", charcoal)
@@ -123,7 +129,7 @@ def build():
     box("print", (X1 - 0.04, -2.3, 1.75), (0.01, 1.6, 1.0), painting(9.1, prints[0]))
 
     # The paper backdrop: hanging from a roll, sweeping onto the floor.
-    width, back, top, bend, front = 2.72, 2.6, 2.85, 0.6, -0.4
+    width, back, top, bend, front = 2 * px, py1, 2.85, 0.6, py0
     profile = []
     for i in range(12):
         z = top - (top - bend) * i / 12
