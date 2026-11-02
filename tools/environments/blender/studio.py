@@ -319,7 +319,7 @@ os.makedirs(OUT, exist_ok=True)
 build()
 light()
 if MODE == "bake":
-    kit.bake_and_export(os.path.join(OUT, "studio.ply"), int(os.environ.get("BAKE_SAMPLES", "64")), spacing_for,
+    kit.bake_and_export(os.path.join(OUT, "studio.ply"), int(os.environ.get("BAKE_SAMPLES", "128")), spacing_for,
                         median_grey=0.3, expose=lambda o: o.name.startswith("paper"))
 else:
     kit.preview(OUT, VIEWS, exposure=-1.0, samples=32)

@@ -25,6 +25,10 @@
 ## 직접 만든 장면 (Blender)
 `tools/environments/blender/`의 스크립트가 Blender(파이썬 모듈 `bpy`)로 방을 짓고, Cycles로 빛(해·하늘·조명, 직접광과 반사광)을 계산해 표면마다 굽고(bake), 표면을 2~3 cm 간격의 납작한 가우시안으로 바꿉니다 (`place_kit.py`). 빛은 미리 계산해 색에 넣었으므로 폰에서는 다른 장소와 똑같이 그리기만 합니다.
 
+- 빛과 표면 색을 따로 굽고, 잡음이 있는 빛만 이웃 몇 칸과 평균해 매끈하게 합니다
+- 방의 벽·바닥·천장은 안쪽 면만 만들고, 빛이 전혀 닿지 않는 면(가구 밑면, 겹친 면)은 뺍니다 — 보이지 않는 면이 가우시안 사이로 비쳐 얼룩이 생기기 때문
+- 노출은 기준 표면(거실: 벽, 스튜디오: 배경지)에 맞추고, 창밖처럼 훨씬 밝은 바깥은 사진가가 하듯 어둡게 눌러(0.2배) 하얗게 날아가지 않게 합니다
+
 | 앱의 이름 | 스크립트 | 들어간 것 |
 |---|---|---|
 | CG 거실 | `living_room.py` | 큰 창으로 해가 드는 거실: 소파, 의자 둘, 푸프, 러그, 커피 테이블과 꽃병, 책장, 사이드보드와 그림, 스탠드, 펜던트 조명, 화분, 창밖 잔디·생울타리·나무 |
@@ -50,7 +54,9 @@ pip install bpy==5.0.1 numpy
 # 위 에셋 .glb 파일을 한 폴더에 받아 두고
 python tools/environments/blender/living_room.py <에셋 폴더> <출력 폴더> preview   # 미리보기 3장
 python tools/environments/blender/living_room.py <에셋 폴더> <출력 폴더> bake      # living_room.ply
+python tools/environments/blender/studio.py <에셋 폴더> <출력 폴더> bake           # studio.ply
 gs_place <출력 폴더>/living_room.ply app/src/main/assets/environments/living_room.gsenv
+gs_place <출력 폴더>/studio.ply app/src/main/assets/environments/studio.gsenv
 ```
-(4코어 CPU에서 굽기에 거실 약 30분, 스튜디오 약 15분)
+(4코어 CPU에서 굽기에 거실 약 25분, 스튜디오 약 15분. 굽기 전에 모든 물체를 하나로 합쳐 굽습니다 — 물체 수백 개를 따로 구우면 준비 시간이 샘플링보다 훨씬 깁니다)
 

@@ -402,7 +402,7 @@ os.makedirs(OUT, exist_ok=True)
 build()
 light()
 if MODE == "bake":
-    kit.bake_and_export(os.path.join(OUT, "living_room.ply"), int(os.environ.get("BAKE_SAMPLES", "64")), spacing_for,
+    kit.bake_and_export(os.path.join(OUT, "living_room.ply"), int(os.environ.get("BAKE_SAMPLES", "96")), spacing_for,
                         median_grey=0.5, expose=lambda o: o.name.startswith("wall"),
                         gain_for=lambda o: 0.2 if o.name.startswith(("lawn", "garden")) else 1.0)
 else:
