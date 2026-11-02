@@ -91,8 +91,9 @@ FacePlacement place_face(const SplatScene& scene, const FaceViews& views, const 
 // eyes at the usual height and spacing for the head's size.
 FacePlacement guess_face(const SplatScene& scene, const FaceViews& views, const float facing[3]);
 
-enum class FaceStyle { Mosaic, Blur, Sunglasses, Mask, Smile };
-bool parse_face_style(std::string_view name, FaceStyle* style);  // "mosaic", "blur", "sunglasses", "mask", "smile"
+enum class FaceStyle { Mosaic, Blur, Sunglasses, Mask, Smile, Eyes };
+// "mosaic", "blur", "sunglasses", "mask", "smile", "eyes" (only the eyes blurred)
+bool parse_face_style(std::string_view name, FaceStyle* style);
 
 struct FaceCoverOptions {
   FaceStyle style = FaceStyle::Mosaic;
@@ -106,8 +107,9 @@ struct FaceCoverStats {
 };
 
 // A copy of `scene` with the face covered: the cover is a layer of small flat
-// splats following the face's surface (mosaic, blur, mask, smile) or a pair of
-// sunglasses in front of it. Under the full-face styles the face's own splats
+// splats following the face's surface (mosaic, blur, mask, smile), a pair of
+// sunglasses in front of it, or (eyes) a blur of the face's own splats over
+// the eyes, adding none. Under the full-face styles the face's own splats
 // take the cover's colour and lose their view-dependent colour, so the face
 // does not come back from another angle or by deleting the cover.
 SplatScene cover_face(const SplatScene& scene, const FacePlacement& face, const FaceCoverOptions& options,

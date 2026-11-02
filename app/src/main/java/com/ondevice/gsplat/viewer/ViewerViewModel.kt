@@ -27,6 +27,7 @@ enum class FaceCover(val id: String, val label: String) {
     NONE("none", "원본"),
     MOSAIC("mosaic", "모자이크"),
     BLUR("blur", "흐림"),
+    EYES("eyes", "눈 흐림"),
     SUNGLASSES("sunglasses", "선글라스"),
     MASK("mask", "가면"),
     SMILE("smile", "스마일"),
@@ -188,6 +189,8 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
                 faceStatus = when {
                     !result.optBoolean("ok") -> "가리기 실패: ${result.optString("error")}"
                     cover == FaceCover.NONE -> "원본을 보여 주고 있어요"
+                    result.optInt("added") == 0 -> "${cover.label} · 가우시안 ${result.optInt("recoloured")}개 흐리게 · " +
+                        "${result.optDouble("ms").toInt()} ms"
                     else -> "${cover.label} · 가우시안 ${result.optInt("added")}개 추가, " +
                         "${result.optInt("recoloured")}개 색 바꿈 · ${result.optDouble("ms").toInt()} ms"
                 }

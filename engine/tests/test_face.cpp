@@ -231,13 +231,15 @@ void test_styles(const Person& p, const gs::FacePlacement& face) {
   const V bridge = mul(add(p.eyes[0], p.eyes[1]), 0.5f);
   const float* eye_before = pixel(before, p.eyes[0]);
   EXPECT(eye_before[0] < 0.2f, "the eye should be dark before covering (%.2f)", eye_before[0]);
-  const char* names[] = {"mosaic", "blur", "sunglasses", "mask", "smile"};
+  const char* names[] = {"mosaic", "blur", "sunglasses", "mask", "smile", "eyes"};
   for (const char* name : names) {
     gs::FaceCoverOptions options;
     EXPECT(gs::parse_face_style(name, &options.style), "style %s", name);
     gs::FaceCoverStats stats;
     const gs::SplatScene covered = gs::cover_face(p.scene, face, options, &stats);
-    EXPECT(stats.added > 300 && covered.count == p.scene.count + stats.added, "%s added %u", name, stats.added);
+    const bool adds = std::string(name) != "eyes";  // only the eyes: the face's own splats, blurred
+    EXPECT((adds ? stats.added > 300 : stats.added == 0) && covered.count == p.scene.count + stats.added,
+           "%s added %u", name, stats.added);
     const gs::OrthoView after = look(covered, p, false);
     const float* eye = pixel(after, p.eyes[0]);
     const std::string style = name;
@@ -277,6 +279,13 @@ void test_styles(const Person& p, const gs::FacePlacement& face) {
     EXPECT(diff < 0.002, "%s changed the back of the head by %.4f", name, diff);
     if (style == "mosaic" || style == "blur") {
       EXPECT(eye[0] > 0.3f, "%s still shows a dark eye (%.2f)", name, eye[0]);
+    } else if (style == "eyes") {
+      EXPECT(eye[0] > 0.3f, "eyes still show a dark eye (%.2f)", eye[0]);
+      // The rest of the face stays as it was.
+      const float* m0 = pixel(before, p.mouth);
+      const float* m1 = pixel(after, p.mouth);
+      EXPECT(std::abs(m0[0] - m1[0]) + std::abs(m0[1] - m1[1]) < 0.02f, "eyes changed the mouth: %.2f -> %.2f", m0[0],
+             m1[0]);
     } else if (style == "mask") {
       const float* c = pixel(after, cheek);
       EXPECT(c[0] > 0.55f && c[1] > 0.55f && c[2] > 0.5f, "mask cheek %.2f %.2f %.2f", c[0], c[1], c[2]);

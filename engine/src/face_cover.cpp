@@ -843,6 +843,49 @@ uint32_t sunglasses(const SplatScene& scene, const FaceField& field, const Frame
   return added;
 }
 
+// Only the eyes, blurred: no new splats. The face's own splats in a band over
+// the eyes take the colour of a heavily blurred picture of the face, fading
+// into their own colour at the band's edge, so the rest of the face (and its
+// shape) stays as it was. Inside the band they lose their view-dependent
+// colour too.
+uint32_t blur_eyes(SplatScene& scene, const FaceField& field, const Frame& fr) {
+  constexpr float kHalfA = 1.02f, kHalfB = 0.3f, kCentreB = 0.02f;
+  const Grid& g = field.g;
+  const std::vector<float> soft = blur(field.rgb, field.alpha, 3, g.w, g.h, 0.25f / g.step);
+  std::vector<float> channel[3];
+  for (int c = 0; c < 3; ++c) {
+    channel[c].resize(g.size());
+    for (size_t p = 0; p < g.size(); ++p) channel[c][p] = soft[p * 3 + c];
+  }
+  const int coeffs = sh_rest_coeffs(scene.sh_degree);
+  uint32_t count = 0;
+  float l[3];
+  for (uint32_t i = 0; i < scene.count; ++i) {
+    fr.local(&scene.positions[size_t(i) * 3], l);
+    // A rounded bar over both eyes, soft over its outer quarter.
+    const float x = l[0] / kHalfA, y = (l[1] - kCentreB) / kHalfB;
+    const float r = std::pow(std::pow(std::abs(x), 4.0f) + std::pow(std::abs(y), 4.0f), 0.25f);
+    const float w = 1.0f - smoothstep(0.75f, 1.0f, r);
+    if (w <= 0.0f) continue;
+    const float surface = field.sample(field.height, l[0], l[1]);
+    if (std::isnan(surface) || l[2] < surface - 0.5f) continue;
+    float rgb[3];
+    bool ok = true;
+    for (int c = 0; c < 3 && ok; ++c) {
+      rgb[c] = field.sample(channel[c], l[0], l[1]);
+      ok = !std::isnan(rgb[c]);
+    }
+    if (!ok) continue;
+    for (int c = 0; c < 3; ++c) {
+      float& dc = scene.sh_dc[size_t(i) * 3 + c];
+      dc = mix(dc, (rgb[c] - 0.5f) / kShC0, w);
+    }
+    for (int k = 0; k < coeffs * 3; ++k) scene.sh_rest[size_t(i) * coeffs * 3 + k] *= w >= 0.999f ? 0.0f : 1.0f - w;
+    ++count;
+  }
+  return count;
+}
+
 }  // namespace
 
 // --- Pictures ------------------------------------------------------------------------
@@ -1228,7 +1271,7 @@ FacePlacement guess_face(const SplatScene& scene, const FaceViews& views, const 
 bool parse_face_style(std::string_view name, FaceStyle* style) {
   static constexpr std::pair<std::string_view, FaceStyle> kNames[] = {
       {"mosaic", FaceStyle::Mosaic}, {"blur", FaceStyle::Blur},   {"sunglasses", FaceStyle::Sunglasses},
-      {"mask", FaceStyle::Mask},     {"smile", FaceStyle::Smile},
+      {"mask", FaceStyle::Mask},     {"smile", FaceStyle::Smile},   {"eyes", FaceStyle::Eyes},
   };
   for (const auto& [n, s] : kNames) {
     if (n == name) {
@@ -1254,6 +1297,8 @@ SplatScene cover_face(const SplatScene& scene, const FacePlacement& face, const 
   const FaceField field = face_field(scene, fr);
   if (options.style == FaceStyle::Sunglasses) {
     local.added = sunglasses(scene, field, fr, out);
+  } else if (options.style == FaceStyle::Eyes) {
+    local.recoloured = blur_eyes(out, field, fr);
   } else {
     Layer layer;
     layer.init(-2.0f, 2.2f, 4.0f, 5.0f, 1.0f / 32.0f);
@@ -1271,6 +1316,7 @@ SplatScene cover_face(const SplatScene& scene, const FacePlacement& face, const 
         smile(field, layer);
         break;
       case FaceStyle::Sunglasses:
+      case FaceStyle::Eyes:
         break;
     }
     local.recoloured = recolour_under(out, layer, field, fr, 0.5f);

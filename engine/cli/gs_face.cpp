@@ -2,7 +2,7 @@
 //
 //   gs_face <scene> views <out_dir> [--count 12] [--size 384]
 //       pictures of the head from around it (view_00.jpg, ...) for a face detector
-//   gs_face <scene> cover <landmarks.json> <out.ply> [--style mosaic|blur|sunglasses|mask|smile]
+//   gs_face <scene> cover <landmarks.json> <out.ply> [--style mosaic|blur|eyes|sunglasses|mask|smile]
 //           [--size 1] [--raise 0] [--count 12] [--view-size 384] [--guess <view>]
 //       places the face from the detector's landmarks (the format parse_face_landmarks
 //       reads, in the pixels of the views above), or with --guess facing the camera of
@@ -101,7 +101,7 @@ int main(int argc, char** argv) {
     const std::string style = option(argc, argv, "--style", "mosaic");
     std::vector<std::string> styles;
     if (style == "all") {
-      styles = {"mosaic", "blur", "sunglasses", "mask", "smile"};
+      styles = {"mosaic", "blur", "eyes", "sunglasses", "mask", "smile"};
     } else {
       styles = {style};
     }

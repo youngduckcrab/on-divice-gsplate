@@ -55,8 +55,8 @@ object NativeViewer {
     external fun placeFace(landmarks: String, guess: Boolean): String
 
     /**
-     * Shows the model with its face covered: [style] is mosaic, blur, sunglasses, mask, smile or
-     * none (the original); [size] scales the cover, [raise] moves it up in eye distances.
+     * Shows the model with its face covered: [style] is mosaic, blur, eyes (only the eyes blurred),
+     * sunglasses, mask, smile or none (the original); [size] scales the cover, [raise] moves it up in eye distances.
      * Returns JSON {ok, count, added, recoloured, ms}.
      */
     external fun coverFace(style: String, size: Float, raise: Float): String
