@@ -249,11 +249,12 @@ Camera dataset_camera(const Dataset& ds, const DatasetFrame& f) {
   return cam;
 }
 
-HeadRegion estimate_head(const Dataset& ds, const SplatScene& subject) {
+HeadRegion estimate_head(const Dataset& ds, const SplatScene& subject) { return estimate_head(subject, ds.world_up); }
+
+HeadRegion estimate_head(const SplatScene& subject, const float up[3]) {
   HeadRegion head;
   const size_t n = subject.count;
   if (n < 200) return head;
-  const float* up = ds.world_up;
   std::vector<float> heights(n);
   for (size_t i = 0; i < n; ++i) {
     const float* p = &subject.positions[i * 3];

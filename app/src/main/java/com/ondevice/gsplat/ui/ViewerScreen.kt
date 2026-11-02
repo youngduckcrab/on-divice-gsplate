@@ -17,12 +17,17 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Card
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -41,6 +46,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ondevice.gsplat.NativeViewer
+import com.ondevice.gsplat.viewer.FaceCover
 import com.ondevice.gsplat.viewer.ViewerViewModel
 import java.io.File
 import java.util.Locale
@@ -65,6 +71,9 @@ fun ViewerScreen(
     }
     val openFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) vm.loadUri(uri)
+    }
+    val saveFile = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+        if (uri != null) vm.saveShown(uri)
     }
     val scale by rememberUpdatedState(vm.resolutionScale)
     var surfaceView by remember { mutableStateOf<SurfaceView?>(null) }
@@ -137,6 +146,7 @@ fun ViewerScreen(
                         .padding(horizontal = 8.dp, vertical = 4.dp),
                 )
             }
+            if (vm.faceOpen) FacePanel(vm, onSave = { saveFile.launch(vm.coveredName()) })
             ControlRow {
                 FilledTonalButton(enabled = !vm.loading, onClick = { vm.loadSynthetic(100_000) }) { Text("샘플 10만") }
                 FilledTonalButton(enabled = !vm.loading, onClick = { vm.loadSynthetic(500_000) }) { Text("샘플 50만") }
@@ -146,6 +156,9 @@ fun ViewerScreen(
                 }
             }
             ControlRow {
+                if (vm.canCoverFace && !vm.faceOpen) {
+                    FilledTonalButton(enabled = !vm.loading, onClick = vm::openFacePanel) { Text("얼굴 가리기") }
+                }
                 OutlinedButton(onClick = vm::toggleFlip) { Text(if (vm.flipY) "상하 반전 켬" else "상하 반전 끔") }
                 OutlinedButton(onClick = vm::resetView) { Text("시점 초기화") }
                 OutlinedButton(onClick = vm::toggleContinuous) {
@@ -154,6 +167,55 @@ fun ViewerScreen(
                 OutlinedButton(onClick = vm::cycleResolution) { Text("해상도 ${(vm.resolutionScale * 100).toInt()}%") }
             }
         }
+    }
+}
+
+/** Covering the model's face: a style, its size and height, finding the face again, saving. */
+@Composable
+private fun FacePanel(vm: ViewerViewModel, onSave: () -> Unit) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(horizontal = 10.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("얼굴 가리기", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+                TextButton(onClick = vm::closeFacePanel) { Text("닫기") }
+            }
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                for (cover in FaceCover.entries) {
+                    FilterChip(
+                        selected = vm.faceCover == cover,
+                        onClick = { vm.chooseCover(cover) },
+                        label = { Text(cover.label) },
+                    )
+                }
+            }
+            CoverSlider("크기", vm.faceSize, 0.7f..1.5f, onChange = { vm.faceSize = it }, onDone = vm::applyCover)
+            CoverSlider("위아래", vm.faceRaise, -0.6f..0.6f, onChange = { vm.faceRaise = it }, onDone = vm::applyCover)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(enabled = !vm.faceBusy, onClick = { vm.findFace(aroundCamera = true) }) { Text("이 방향이 얼굴") }
+                OutlinedButton(enabled = !vm.faceBusy, onClick = onSave) { Text("PLY로 저장") }
+            }
+            if (vm.faceStatus.isNotEmpty()) Text(vm.faceStatus, style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+@Composable
+private fun CoverSlider(
+    label: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    onChange: (Float) -> Unit,
+    onDone: () -> Unit,
+) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(label, style = MaterialTheme.typography.bodySmall, modifier = Modifier.width(48.dp))
+        Slider(
+            value = value,
+            onValueChange = onChange,
+            onValueChangeFinished = onDone,
+            valueRange = range,
+            modifier = Modifier.weight(1f),
+        )
     }
 }
 

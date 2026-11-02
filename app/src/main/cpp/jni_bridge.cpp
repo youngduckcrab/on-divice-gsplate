@@ -21,6 +21,7 @@
 #include "gs/dataset.h"
 #include "gs/diagnose.h"
 #include "gs/device_probe.h"
+#include "gs/face_cover.h"
 #include "gs/json.h"
 #include "gs/splat_renderer.h"
 #include "gs/splat_scene.h"
@@ -36,6 +37,19 @@ namespace {
 std::mutex g_mutex;
 std::shared_ptr<gs::VkContext> g_context;
 std::unique_ptr<Viewer> g_viewer;
+
+// The viewer's model as loaded from a file, kept on the CPU for covering its
+// face, and where that stands. Taken after g_mutex, never while holding it.
+struct FaceSession {
+  std::shared_ptr<const gs::SplatScene> original;
+  std::optional<gs::FaceViews> views;
+  bool views_around_camera = false;
+  gs::FacePlacement face;
+  std::shared_ptr<const gs::SplatScene> shown;  // on screen: covered, or the original
+};
+std::mutex g_face_mutex;
+FaceSession g_face;
+constexpr uint32_t kFaceKeepLimit = 2000000;  // splats kept on the CPU at most
 
 std::string error_json(const std::string& message) {
   gs::JsonWriter w;
@@ -92,9 +106,10 @@ std::vector<uint8_t> read_fd(int fd) {
   return data;
 }
 
-// Parses (via `make_scene`), uploads and hands a scene to the viewer.
+// Parses (via `make_scene`), uploads and hands a scene to the viewer. A scene
+// from a file (`keep`) stays on the CPU too, for covering its face.
 template <typename F>
-std::string load_scene(F&& make_scene) {
+std::string load_scene(F&& make_scene, bool keep) {
   using Clock = std::chrono::steady_clock;
   try {
     Viewer& v = viewer();
@@ -124,7 +139,15 @@ std::string load_scene(F&& make_scene) {
     w.field("flip_y", flip);
     w.field("load_ms", std::chrono::duration<double, std::milli>(t1 - t0).count());
     w.field("upload_ms", std::chrono::duration<double, std::milli>(t2 - t1).count());
+    const bool kept = keep && scene.count <= kFaceKeepLimit;
+    w.field("face_cover", kept);
     w.end_object();
+    {
+      std::lock_guard<std::mutex> lock(g_face_mutex);
+      g_face = FaceSession{};
+      if (kept) g_face.original = std::make_shared<const gs::SplatScene>(std::move(scene));
+      g_face.shown = g_face.original;
+    }
     return w.str();
   } catch (const std::exception& e) {
     return error_json(e.what());
@@ -184,7 +207,7 @@ Java_com_ondevice_gsplat_NativeViewer_resized(JNIEnv*, jobject) {
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_ondevice_gsplat_NativeViewer_loadSynthetic(JNIEnv* env, jobject /*this*/, jint count) {
-  return to_jstring(env, load_scene([&] { return gs::make_synthetic_scene(static_cast<uint32_t>(count)); }));
+  return to_jstring(env, load_scene([&] { return gs::make_synthetic_scene(static_cast<uint32_t>(count)); }, false));
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -192,7 +215,7 @@ Java_com_ondevice_gsplat_NativeViewer_loadFile(JNIEnv* env, jobject /*this*/, ji
   return to_jstring(env, load_scene([&] {
     std::vector<uint8_t> bytes = read_fd(fd);
     return gs::load_splat_file(bytes.data(), bytes.size());
-  }));
+  }, true));
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -241,6 +264,149 @@ Java_com_ondevice_gsplat_NativeViewer_stats(JNIEnv* env, jobject /*this*/) {
   } catch (const std::exception& e) {
     return to_jstring(env, error_json(e.what()));
   }
+}
+
+// --- Face covering (NativeViewer) --------------------------------------------------
+// The app renders the head from around it (faceViews), runs a face detector
+// on the pictures, hands the landmarks back (placeFace) and picks a cover
+// (coverFace); the covered model replaces the shown one and can be saved.
+
+namespace {
+
+template <typename F>
+std::string face_call(F&& f) {
+  try {
+    std::lock_guard<std::mutex> lock(g_face_mutex);
+    if (!g_face.original) return error_json("파일에서 연 모델에서만 쓸 수 있어요");
+    return f();
+  } catch (const std::exception& e) {
+    return error_json(e.what());
+  }
+}
+
+}  // namespace
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ondevice_gsplat_NativeViewer_faceViews(JNIEnv* env, jobject /*this*/, jboolean around, jint size) {
+  return to_jstring(env, face_call([&] {
+    float forward[3], up[3];
+    viewer().view_axes(forward, up);
+    const uint32_t side = static_cast<uint32_t>(std::clamp(static_cast<int>(size), 128, 1024));
+    g_face.views = gs::render_face_views(*g_face.original, up, 12, side, around == JNI_TRUE ? forward : nullptr);
+    g_face.views_around_camera = around == JNI_TRUE;
+    gs::JsonWriter w;
+    w.begin_object();
+    w.field("ok", true);
+    w.field("head", g_face.views->head.found);
+    w.field("views", static_cast<uint32_t>(g_face.views->views.size()));
+    w.field("size", side);
+    w.end_object();
+    return w.str();
+  }));
+}
+
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_ondevice_gsplat_NativeViewer_faceViewPixels(JNIEnv* env, jobject /*this*/, jint index) {
+  std::lock_guard<std::mutex> lock(g_face_mutex);
+  if (!g_face.views || index < 0 || static_cast<size_t>(index) >= g_face.views->views.size()) return nullptr;
+  const gs::OrthoView& v = g_face.views->views[static_cast<size_t>(index)];
+  const std::vector<uint8_t> rgb = v.rgb8();
+  const size_t n = size_t(v.width) * v.height;
+  std::vector<jint> argb(n);
+  for (size_t p = 0; p < n; ++p) {
+    argb[p] = static_cast<jint>(0xff000000u | uint32_t(rgb[p * 3]) << 16 | uint32_t(rgb[p * 3 + 1]) << 8 | rgb[p * 3 + 2]);
+  }
+  jintArray out = env->NewIntArray(static_cast<jsize>(n));
+  if (out != nullptr) env->SetIntArrayRegion(out, 0, static_cast<jsize>(n), argb.data());
+  return out;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ondevice_gsplat_NativeViewer_placeFace(JNIEnv* env, jobject /*this*/, jstring jlandmarks, jboolean guess) {
+  const std::string landmarks = from_jstring(env, jlandmarks);
+  return to_jstring(env, face_call([&] {
+    if (!g_face.views || !g_face.views->head.found) return error_json("머리를 찾지 못했어요");
+    const std::vector<gs::FaceLandmarks> faces = gs::parse_face_landmarks(landmarks);
+    gs::FacePlacement face = gs::place_face(*g_face.original, *g_face.views, faces);
+    if (!face.found && guess == JNI_TRUE && g_face.views_around_camera && !g_face.views->views.empty()) {
+      // Facing the camera of the middle view: the one looking along the viewer's camera.
+      const gs::OrthoView& v = g_face.views->views.front();
+      const float facing[3] = {-v.forward[0], -v.forward[1], -v.forward[2]};
+      face = gs::guess_face(*g_face.original, *g_face.views, facing);
+    }
+    if (face.found) g_face.face = face;
+    gs::JsonWriter w;
+    w.begin_object();
+    w.field("ok", true);
+    w.field("found", face.found);
+    w.field("detected", face.detected);
+    w.field("detections", static_cast<uint32_t>(faces.size()));
+    w.field("views_used", face.views_used);
+    w.field("eye_mm", face.eye_distance * 1000.0f);
+    w.end_object();
+    return w.str();
+  }));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ondevice_gsplat_NativeViewer_coverFace(JNIEnv* env, jobject /*this*/, jstring jstyle, jfloat size,
+                                                jfloat raise) {
+  const std::string style = from_jstring(env, jstyle);
+  return to_jstring(env, face_call([&] {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::shared_ptr<const gs::SplatScene> scene = g_face.original;
+    gs::FaceCoverStats stats;
+    if (style != "none") {
+      if (!g_face.face.found) return error_json("얼굴 위치를 먼저 찾아 주세요");
+      gs::FaceCoverOptions options;
+      if (!gs::parse_face_style(style, &options.style)) return error_json("알 수 없는 가리기 방식: " + style);
+      options.size = size;
+      options.raise = raise;
+      scene = std::make_shared<const gs::SplatScene>(gs::cover_face(*g_face.original, g_face.face, options, &stats));
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    std::shared_ptr<gs::VkContext> ctx;
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      ctx = context_locked();
+    }
+    viewer().swap_scene(gs::upload_scene(*ctx, *scene));
+    g_face.shown = scene;
+    gs::JsonWriter w;
+    w.begin_object();
+    w.field("ok", true);
+    w.field("count", scene->count);
+    w.field("added", stats.added);
+    w.field("recoloured", stats.recoloured);
+    w.field("cover_ms", std::chrono::duration<double, std::milli>(t1 - t0).count());
+    w.field("ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    w.end_object();
+    return w.str();
+  }));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ondevice_gsplat_NativeViewer_saveShown(JNIEnv* env, jobject /*this*/, jint fd) {
+  return to_jstring(env, face_call([&] {
+    gs::SplatScene scene = *g_face.shown;
+    gs::convert_convention(scene, gs::AxisConvention::RDF);  // the .ply layout
+    const std::vector<uint8_t> ply = gs::save_ply(scene);
+    size_t written = 0;
+    while (written < ply.size()) {
+      const ssize_t n = write(fd, ply.data() + written, ply.size() - written);
+      if (n <= 0) break;
+      written += static_cast<size_t>(n);
+    }
+    close(fd);
+    if (written != ply.size()) return error_json("파일을 쓸 수 없음");
+    gs::JsonWriter w;
+    w.begin_object();
+    w.field("ok", true);
+    w.field("count", scene.count);
+    w.field("bytes", static_cast<uint64_t>(ply.size()));
+    w.end_object();
+    return w.str();
+  }));
 }
 
 // --- NativeTrainer -----------------------------------------------------------------

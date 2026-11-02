@@ -80,5 +80,6 @@ struct HeadRegion {
   float subject_height = 0;  // extent of the points along world up
 };
 HeadRegion estimate_head(const Dataset& dataset, const SplatScene& subject);
+HeadRegion estimate_head(const SplatScene& subject, const float up[3]);
 
 }  // namespace gs

@@ -28,7 +28,11 @@ class Viewer {
 
   // Replaces the scene and resets the camera to frame it.
   void set_scene(std::unique_ptr<gs::GpuScene> scene, const gs::SceneBounds& bounds, bool flip_y);
+  // Replaces the scene with an edited version of it, keeping the camera.
+  void swap_scene(std::unique_ptr<gs::GpuScene> scene);
   uint32_t scene_count();
+  // The direction the camera looks and the way up the scene is shown, in scene coordinates.
+  void view_axes(float forward[3], float up[3]);
 
   void orbit(float dx_px, float dy_px);
   void pan(float dx_px, float dy_px);

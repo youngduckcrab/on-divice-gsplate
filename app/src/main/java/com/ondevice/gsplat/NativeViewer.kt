@@ -35,4 +35,32 @@ object NativeViewer {
 
     /** Returns JSON with fps, GPU times, visible count, surface size and any render error. */
     external fun stats(): String
+
+    // Face covering, for a model opened from a file (load JSON "face_cover": true).
+
+    /**
+     * Pictures of the model's head for a face detector: twelve around it, or with [aroundCamera]
+     * three near the direction the camera looks. Returns JSON {ok, head, views, size}.
+     */
+    external fun faceViews(aroundCamera: Boolean, size: Int): String
+
+    /** Picture [index] of [faceViews] as ARGB_8888 pixels (size x size), or null. */
+    external fun faceViewPixels(index: Int): IntArray?
+
+    /**
+     * Places the face from a detector's landmarks in those pictures, a JSON array of
+     * {"view": i, "eyes": [[x, y], [x, y]], "mouth": [x, y]}; with [guess], a face that was not
+     * detected is assumed to look at the camera. Returns JSON {ok, found, detected, views_used, eye_mm}.
+     */
+    external fun placeFace(landmarks: String, guess: Boolean): String
+
+    /**
+     * Shows the model with its face covered: [style] is mosaic, blur, sunglasses, mask, smile or
+     * none (the original); [size] scales the cover, [raise] moves it up in eye distances.
+     * Returns JSON {ok, count, added, recoloured, ms}.
+     */
+    external fun coverFace(style: String, size: Float, raise: Float): String
+
+    /** Writes the model as shown as a .ply to [fd] (taken over). Returns JSON {ok, count, bytes}. */
+    external fun saveShown(fd: Int): String
 }

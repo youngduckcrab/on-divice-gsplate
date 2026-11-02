@@ -81,6 +81,27 @@ void Viewer::set_scene(std::unique_ptr<gs::GpuScene> scene, const gs::SceneBound
   request_redraw();
 }
 
+void Viewer::swap_scene(std::unique_ptr<gs::GpuScene> scene) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (thread_running_) {
+    pending_scene_ = std::move(scene);
+  } else {
+    scene_ = std::move(scene);
+  }
+  request_redraw();
+}
+
+void Viewer::view_axes(float forward[3], float up[3]) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const gs::Camera cam = orbit_.camera(std::max(stats_.width, 1u), std::max(stats_.height, 1u));
+  // The third row of scene -> camera is the viewing direction.
+  for (int k = 0; k < 3; ++k) forward[k] = cam.rotation[6 + k];
+  // Display up is +y; the flip shows the scene turned half a turn about x.
+  up[0] = 0.0f;
+  up[1] = orbit_.flip_y() ? -1.0f : 1.0f;
+  up[2] = 0.0f;
+}
+
 uint32_t Viewer::scene_count() {
   std::lock_guard<std::mutex> lock(mutex_);
   if (pending_scene_) return pending_scene_->count;

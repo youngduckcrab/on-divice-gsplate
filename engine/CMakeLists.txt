@@ -135,6 +135,7 @@ add_library(gsengine STATIC
   src/train_selftest.cpp
   src/trainer.cpp
   src/diagnose.cpp
+  src/face_cover.cpp
   src/vk_context.cpp
 )
 add_dependencies(gsengine gs_shaders)
@@ -171,6 +172,10 @@ if(GS_BUILD_TESTS AND NOT ANDROID)
   target_link_libraries(gs_capture_tests PRIVATE gsengine)
   add_test(NAME gs_capture_tests COMMAND gs_capture_tests)
 
+  add_executable(gs_face_tests tests/test_face.cpp)
+  target_link_libraries(gs_face_tests PRIVATE gsengine)
+  add_test(NAME gs_face_tests COMMAND gs_face_tests)
+
   add_executable(gs_trainer_tests tests/test_trainer.cpp)
   target_link_libraries(gs_trainer_tests PRIVATE gsengine)
   add_test(NAME gs_trainer_tests COMMAND gs_trainer_tests)
@@ -187,4 +192,7 @@ if(GS_BUILD_TESTS AND NOT ANDROID)
 
   add_executable(gs_render cli/gs_render.cpp)
   target_link_libraries(gs_render PRIVATE gsengine)
+
+  add_executable(gs_face cli/gs_face.cpp)
+  target_link_libraries(gs_face PRIVATE gsengine)
 endif()
