@@ -1,5 +1,75 @@
 [
  {
+  "id": "cg_living",
+  "title": "CG 거실",
+  "author": "직접 제작(Blender) · 가구: Khronos glTF 샘플, Wayfair 외",
+  "link": "https://github.com/KhronosGroup/glTF-Sample-Assets",
+  "license": "가구 CC BY 4.0 / CC0",
+  "scale": 1.0,
+  "sky": [
+   [
+    0.5,
+    0.68,
+    0.92
+   ],
+   [
+    0.85,
+    0.9,
+    0.96
+   ]
+  ],
+  "spots": [
+   {
+    "id": "cg_living_sofa",
+    "label": "CG 거실 · 소파 앞",
+    "category": "indoor",
+    "x": 0.3,
+    "z": 0.0,
+    "yaw": 180
+   },
+   {
+    "id": "cg_living_window",
+    "label": "CG 거실 · 창가",
+    "category": "indoor",
+    "x": -0.35,
+    "z": 1.75,
+    "yaw": 0
+   }
+  ],
+  "file": "living_room.gsenv"
+ },
+ {
+  "id": "cg_studio",
+  "title": "사진 스튜디오",
+  "author": "직접 제작(Blender) · 소파: Khronos glTF 샘플",
+  "link": "https://github.com/KhronosGroup/glTF-Sample-Assets",
+  "license": "소파 CC BY 4.0",
+  "scale": 1.0,
+  "sky": [
+   [
+    0.04,
+    0.04,
+    0.05
+   ],
+   [
+    0.07,
+    0.07,
+    0.08
+   ]
+  ],
+  "spots": [
+   {
+    "id": "cg_studio_paper",
+    "label": "사진 스튜디오",
+    "category": "indoor",
+    "x": 0.0,
+    "z": 1.0,
+    "yaw": 0
+   }
+  ],
+  "file": "studio.gsenv"
+ },
+ {
   "id": "apartment",
   "title": "SA3D_R&D_XP47",
   "author": "Stephane Agullo (https://sa3d.fr)",
