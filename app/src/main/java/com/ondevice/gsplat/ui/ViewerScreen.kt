@@ -17,9 +17,14 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
@@ -75,6 +80,8 @@ fun ViewerScreen(
     val saveFile = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
         if (uri != null) vm.saveShown(uri)
     }
+    var showModels by remember { mutableStateOf(false) }
+    if (showModels) ModelList(vm, onDismiss = { showModels = false })
     val scale by rememberUpdatedState(vm.resolutionScale)
     var surfaceView by remember { mutableStateOf<SurfaceView?>(null) }
 
@@ -151,6 +158,7 @@ fun ViewerScreen(
                 FilledTonalButton(enabled = !vm.loading, onClick = { vm.loadSynthetic(100_000) }) { Text("샘플 10만") }
                 FilledTonalButton(enabled = !vm.loading, onClick = { vm.loadSynthetic(500_000) }) { Text("샘플 50만") }
                 FilledTonalButton(enabled = !vm.loading, onClick = { vm.loadSynthetic(1_000_000) }) { Text("샘플 100만") }
+                FilledTonalButton(enabled = !vm.loading, onClick = { showModels = true }) { Text("내 모델") }
                 FilledTonalButton(enabled = !vm.loading, onClick = { openFile.launch(arrayOf("*/*")) }) {
                     Text("파일 열기")
                 }
@@ -190,13 +198,74 @@ private fun FacePanel(vm: ViewerViewModel, onSave: () -> Unit) {
             }
             CoverSlider("크기", vm.faceSize, 0.7f..1.5f, onChange = { vm.faceSize = it }, onDone = vm::applyCover)
             CoverSlider("위아래", vm.faceRaise, -0.6f..0.6f, onChange = { vm.faceRaise = it }, onDone = vm::applyCover)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(enabled = !vm.faceBusy, onClick = { vm.findFace(aroundCamera = true) }) { Text("이 방향이 얼굴") }
-                OutlinedButton(enabled = !vm.faceBusy, onClick = onSave) { Text("PLY로 저장") }
+                OutlinedButton(enabled = !vm.faceBusy, onClick = vm::saveToModels) { Text("내 모델에 저장") }
+                OutlinedButton(enabled = !vm.faceBusy, onClick = onSave) { Text("파일로 내보내기") }
             }
             if (vm.faceStatus.isNotEmpty()) Text(vm.faceStatus, style = MaterialTheme.typography.bodySmall)
         }
     }
+}
+
+/** Models kept in the app (trained ones, and covered ones saved there): open or delete. */
+@Composable
+private fun ModelList(vm: ViewerViewModel, onDismiss: () -> Unit) {
+    var files by remember { mutableStateOf(vm.modelFiles()) }
+    var deleting by remember { mutableStateOf<File?>(null) }
+    deleting?.let { file ->
+        AlertDialog(
+            onDismissRequest = { deleting = null },
+            title = { Text("모델 삭제") },
+            text = { Text("${file.name}을(를) 지울까요? 되돌릴 수 없어요.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.deleteModel(file)
+                    files = vm.modelFiles()
+                    deleting = null
+                }) { Text("삭제") }
+            },
+            dismissButton = { TextButton(onClick = { deleting = null }) { Text("취소") } },
+        )
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("내 모델") },
+        text = {
+            if (files.isEmpty()) {
+                Text("아직 없어요. 학습을 마치면 여기에 저장돼요.")
+            } else {
+                LazyColumn(Modifier.heightIn(max = 420.dp)) {
+                    items(files, key = { it.path }) { file ->
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    vm.loadModel(file)
+                                    onDismiss()
+                                }
+                                .padding(vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(file.name, style = MaterialTheme.typography.bodyMedium)
+                                Text(
+                                    "%.1f MB · %s".format(
+                                        Locale.US,
+                                        file.length() / 1e6,
+                                        java.text.SimpleDateFormat("M/d HH:mm", Locale.US).format(java.util.Date(file.lastModified())),
+                                    ),
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            TextButton(onClick = { deleting = file }) { Text("삭제") }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("닫기") } },
+    )
 }
 
 @Composable

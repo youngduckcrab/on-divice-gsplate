@@ -33,6 +33,19 @@ enum class FaceCover(val id: String, val label: String) {
     SMILE("smile", "스마일"),
 }
 
+/**
+ * What the viewer shows, for the life of the process. The native scene (and a
+ * covered face) outlives this screen's view model, which is made again when the
+ * app is reopened while its process is still alive.
+ */
+private object ViewerSession {
+    var scene: JSONObject? = null
+    var facePlaced = false
+    var faceCover = FaceCover.NONE
+    var faceSize = 1.0f
+    var faceRaise = 0.0f
+}
+
 class ViewerViewModel(application: Application) : AndroidViewModel(application) {
     val loadError: String? = NativeBridge.loadError
 
@@ -70,9 +83,21 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
     var faceRaise by mutableFloatStateOf(0.0f)
     private var coverAgain = false
 
+    private val prefs = application.getSharedPreferences("viewer", android.content.Context.MODE_PRIVATE)
+
+    /** Trained models (and covered ones saved here), kept in the app's own storage. */
+    val modelsDir: File get() = File(getApplication<Application>().filesDir, "models").apply { mkdirs() }
+
     init {
-        // Start with something on screen; the scene survives tab switches and folding.
-        if (loadError == null && NativeViewer.sceneCount() == 0) loadSynthetic(100_000)
+        if (loadError == null) {
+            val kept = ViewerSession.scene
+            if (NativeViewer.sceneCount() > 0 && kept != null) {
+                restore(kept)
+            } else if (NativeViewer.sceneCount() == 0 && !reopenLast()) {
+                // Start with something on screen; the scene survives tab switches and folding.
+                loadSynthetic(100_000)
+            }
+        }
     }
 
     fun loadSynthetic(count: Int) = load("합성 샘플 ${count / 1000}k") { NativeViewer.loadSynthetic(count) }
@@ -80,7 +105,9 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
     fun loadUri(uri: Uri) {
         val resolver = getApplication<Application>().contentResolver
         val name = displayName(resolver, uri) ?: "파일"
-        load(name) {
+        // Keep the right to read it, so it can be opened again after the app restarts.
+        runCatching { resolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+        load(name, remember = "uri:$uri") {
             val pfd = resolver.openFileDescriptor(uri, "r")
                 ?: return@load JSONObject().put("ok", false).put("error", "파일을 열 수 없음").toString()
             pfd.use { NativeViewer.loadFile(it.detachFd()) }
@@ -91,12 +118,65 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
     fun loadModel(file: File) {
         viewModelScope.launch {
             snapshotFlow { loading }.first { !it }
-            load(file.name) {
+            load(file.name, remember = "file:${file.path}") {
                 ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use {
                     NativeViewer.loadFile(it.detachFd())
                 }
             }
         }
+    }
+
+    /** The models in app storage, newest first. */
+    fun modelFiles(): List<File> =
+        modelsDir.listFiles { f -> f.isFile && (f.name.endsWith(".ply") || f.name.endsWith(".spz")) }
+            ?.sortedByDescending { it.lastModified() }
+            .orEmpty()
+
+    fun deleteModel(file: File) {
+        file.delete()
+        if (prefs.getString("last_model", null) == "file:${file.path}") prefs.edit().remove("last_model").apply()
+    }
+
+    /** Opens the model the viewer last showed from a file, if it is still there. */
+    private fun reopenLast(): Boolean {
+        val last = prefs.getString("last_model", null) ?: return false
+        if (last.startsWith("file:")) {
+            val file = File(last.removePrefix("file:"))
+            if (!file.isFile) return false
+            loadModel(file)
+            return true
+        }
+        if (last.startsWith("uri:")) {
+            val uri = Uri.parse(last.removePrefix("uri:"))
+            val readable = getApplication<Application>().contentResolver.persistedUriPermissions
+                .any { it.uri == uri && it.isReadPermission }
+            if (!readable) return false
+            loadUri(uri)
+            return true
+        }
+        return false
+    }
+
+    /** Picks up what the native viewer still shows after this view model was made again. */
+    private fun restore(kept: JSONObject) {
+        scene = kept
+        canCoverFace = kept.optBoolean("face_cover")
+        runCatching { JSONObject(NativeViewer.stats()) }.getOrNull()?.let {
+            flipY = it.optBoolean("flip_y")
+            continuous = it.optBoolean("continuous")
+        }
+        facePlaced = ViewerSession.facePlaced
+        faceCover = ViewerSession.faceCover
+        faceSize = ViewerSession.faceSize
+        faceRaise = ViewerSession.faceRaise
+        if (faceCover != FaceCover.NONE) faceStatus = "${faceCover.label} 적용 중인 모델이에요"
+    }
+
+    private fun rememberFace() {
+        ViewerSession.facePlaced = facePlaced
+        ViewerSession.faceCover = faceCover
+        ViewerSession.faceSize = faceSize
+        ViewerSession.faceRaise = faceRaise
     }
 
     fun toggleFlip() {
@@ -152,6 +232,7 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
                 return@launch
             }
             facePlaced = true
+            rememberFace()
             faceStatus = if (result.optBoolean("detected")) {
                 "얼굴을 찾았어요 (그림 ${result.optInt("views_used")}장, 눈 사이 ${result.optDouble("eye_mm").toInt()} mm)"
             } else {
@@ -186,6 +267,7 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
                     runCatching { JSONObject(NativeViewer.coverFace(cover.id, faceSize, faceRaise)) }
                         .getOrElse { JSONObject().put("ok", false).put("error", it.message ?: it.toString()) }
                 }
+                if (result.optBoolean("ok")) rememberFace()
                 faceStatus = when {
                     !result.optBoolean("ok") -> "가리기 실패: ${result.optString("error")}"
                     cover == FaceCover.NONE -> "원본을 보여 주고 있어요"
@@ -203,6 +285,30 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
     fun coveredName(): String {
         val base = scene?.optString("label").orEmpty().substringBeforeLast('.').ifEmpty { "model" }
         return if (faceCover == FaceCover.NONE) "$base.ply" else "$base-${faceCover.label}.ply"
+    }
+
+    /** Saves what is shown into app storage, where [modelFiles] lists it. */
+    fun saveToModels() {
+        val name = coveredName().removeSuffix(".ply")
+        var file = File(modelsDir, "$name.ply")
+        var n = 2
+        while (file.exists()) file = File(modelsDir, "$name-${n++}.ply")
+        viewModelScope.launch {
+            faceStatus = "저장 중…"
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val mode = ParcelFileDescriptor.MODE_WRITE_ONLY or ParcelFileDescriptor.MODE_CREATE or
+                        ParcelFileDescriptor.MODE_TRUNCATE
+                    JSONObject(NativeViewer.saveShown(ParcelFileDescriptor.open(file, mode).detachFd()))
+                }.getOrElse { JSONObject().put("ok", false).put("error", it.message ?: it.toString()) }
+            }
+            faceStatus = if (result.optBoolean("ok")) {
+                "내 모델에 저장했어요: ${file.name}"
+            } else {
+                file.delete()
+                "저장 실패: ${result.optString("error")}"
+            }
+        }
     }
 
     fun saveShown(uri: Uri) {
@@ -244,7 +350,8 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
         stats = runCatching { JSONObject(NativeViewer.stats()) }.getOrNull()
     }
 
-    private fun load(label: String, call: () -> String) {
+    /** Loads a scene; [remember] ("file:..." or "uri:...") is reopened when the app starts again. */
+    private fun load(label: String, remember: String? = null, call: () -> String) {
         if (loading || loadError != null) return
         viewModelScope.launch {
             loading = true
@@ -265,6 +372,9 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
                 faceSize = 1.0f
                 faceRaise = 0.0f
                 faceStatus = ""
+                ViewerSession.scene = scene
+                rememberFace()
+                if (remember != null) prefs.edit().putString("last_model", remember).apply()
             } else {
                 status = "불러오기 실패: ${result.optString("error")}"
             }
