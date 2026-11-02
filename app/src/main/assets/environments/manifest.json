@@ -1,0 +1,72 @@
+[
+ {
+  "id": "apartment",
+  "title": "SA3D_R&D_XP47",
+  "author": "Stephane Agullo (https://sa3d.fr)",
+  "link": "https://superspl.at/view?id=cdcec084",
+  "license": "CC BY 4.0",
+  "scale": 1.0,
+  "sky": [
+   [
+    0.62,
+    0.74,
+    0.9
+   ],
+   [
+    0.86,
+    0.9,
+    0.95
+   ]
+  ],
+  "spots": [
+   {
+    "id": "apartment_living",
+    "label": "아파트 거실",
+    "category": "indoor",
+    "x": -9.6,
+    "z": -4.3,
+    "yaw": 180
+   },
+   {
+    "id": "apartment_courtyard",
+    "label": "아파트 안뜰",
+    "category": "outdoor",
+    "x": -4.4,
+    "z": -4.4,
+    "yaw": 270
+   }
+  ],
+  "file": "apartment.gsenv"
+ },
+ {
+  "id": "hall",
+  "title": "Knock Community Hall",
+  "author": "scbenoit (https://superspl.at/user?id=scbenoit)",
+  "link": "https://superspl.at/scene/0ff2e6dc",
+  "license": "CC BY 4.0",
+  "scale": 1.0,
+  "sky": [
+   [
+    0.4,
+    0.6,
+    0.88
+   ],
+   [
+    0.78,
+    0.86,
+    0.94
+   ]
+  ],
+  "spots": [
+   {
+    "id": "hall_lawn",
+    "label": "마을회관 잔디밭",
+    "category": "outdoor",
+    "x": -0.5,
+    "z": 4.6,
+    "yaw": 180
+   }
+  ],
+  "file": "hall.gsenv"
+ }
+]

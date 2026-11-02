@@ -6,11 +6,10 @@
 //       one orbit view of the scene
 //   gs_render <scene> --views <cameras.txt> <out_dir>
 //       one image per line of cameras.txt, written as out_dir/view_00000.ppm, ...
-//   Either form takes --backdrop <name> (plain, studio, photo, panorama) and
-//   --picture <jpg|png> for the last two, or --env <manifest.json>:<id> for
-//   one of the app's photo backdrops (tools/backdrops); --relight <0..1>
-//   lights the model by the backdrop as the viewer does (default 1 with a
-//   backdrop), --blur <levels> sets how much the backdrop blurs.
+//   Either form takes --place <manifest.json>:<spot id> to put the model into
+//   one of the app's 3D places (tools/environments) as the viewer does, with
+//   --yaw <degrees> to turn the place and --relight <0..1> for how much the
+//   model takes its light (default 1).
 //
 //       one image per line of cameras.txt, written as out_dir/view_00000.ppm, ...
 //       Each line: width height fx fy cx cy, then the 3x4 world-to-camera matrix
@@ -31,6 +30,7 @@
 
 #include "gs/background.h"
 #include "gs/camera.h"
+#include "gs/environment.h"
 #include "gs/json_parse.h"
 #include "gs/offscreen.h"
 #include "gs/splat_renderer.h"
@@ -65,39 +65,49 @@ struct Backdrop {
   gs::BackdropView view;
   bool flip_y = false;
   float relight = 1.0f;
-  gs::Image8 picture;
 };
 
-// One of the app's photo backdrops, from its manifest.
-void load_env(const std::string& spec, Backdrop& b) {
+// Puts `scene` into one of the app's places: the staged scene replaces it.
+void stage_place(const std::string& spec, float yaw, gs::SplatScene& scene, Backdrop& b) {
   const size_t colon = spec.rfind(':');
-  if (colon == std::string::npos) throw std::runtime_error("--env needs <manifest.json>:<id>");
+  if (colon == std::string::npos) throw std::runtime_error("--place needs <manifest.json>:<spot id>");
   const std::string path = spec.substr(0, colon), id = spec.substr(colon + 1);
   const std::vector<uint8_t> text = gs::read_file(path);
   const gs::JsonValue root = gs::parse_json(std::string_view(reinterpret_cast<const char*>(text.data()), text.size()));
-  for (const gs::JsonValue& e : root.array) {
-    if (e.string_or("id", "") != id) continue;
-    const std::string dir = path.substr(0, path.find_last_of('/') + 1);
-    b.picture = gs::decode_image(gs::read_file(dir + e.string_or("file", "")), 4);
-    b.view.kind = gs::Backdrop::Panorama;
-    b.view.yaw_deg = float(e.number_or("yaw", 0));
-    b.view.camera_height = float(e.number_or("camera_height", 1.6));
-    b.view.radius = float(e.number_or("radius", 20));
-    gs::EnvLight& l = b.view.light;
-    const gs::JsonValue* sh = e.find("sh");
-    const gs::JsonValue* key = e.find("key");
-    for (int k = 0; k < 27 && sh != nullptr && k < int(sh->array.size()); ++k) l.sh[k] = float(sh->array[k].number);
-    for (int k = 0; k < 3 && key != nullptr && k < int(key->array.size()); ++k) l.key[k] = float(key->array[k].number);
-    l.key_share = float(e.number_or("key_share", 0));
-    const gs::JsonValue* color = e.find("key_color");
-    for (int k = 0; k < 3 && color != nullptr && k < int(color->array.size()); ++k) {
-      l.key_color[k] = float(color->array[k].number);
+  for (const gs::JsonValue& env : root.array) {
+    const gs::JsonValue* spots = env.find("spots");
+    for (const gs::JsonValue& spot : spots ? spots->array : std::vector<gs::JsonValue>{}) {
+      if (spot.string_or("id", "") != id) continue;
+      const std::string dir = path.substr(0, path.find_last_of('/') + 1);
+      const std::vector<uint8_t> bytes = gs::read_file(dir + env.string_or("file", ""));
+      const gs::SplatScene place = gs::read_gsenv(bytes.data(), bytes.size());
+      gs::Spot s;
+      s.x = float(spot.number_or("x", 0));
+      s.z = float(spot.number_or("z", 0));
+      s.yaw_deg = float(spot.number_or("yaw", 0)) + yaw;
+      s.scale = float(env.number_or("scale", 1));
+      if (const gs::JsonValue* sky = env.find("sky"); sky && sky->array.size() == 2) {
+        for (int r = 0; r < 2; ++r) {
+          for (int c = 0; c < 3; ++c) s.sky[r][c] = float(sky->array[size_t(r)].array[size_t(c)].number);
+        }
+      }
+      gs::Staging staged = gs::stage(scene, place, s);
+      std::printf("placed at %s: floor %.3f, %u + %u splats\n", id.c_str(), staged.floor, staged.model_count,
+                  staged.scene.count - staged.model_count);
+      b.on = true;
+      b.view.kind = gs::Backdrop::Sky;
+      for (int c = 0; c < 3; ++c) {
+        b.view.zenith[c] = s.sky[0][c];
+        b.view.horizon[c] = s.sky[1][c];
+      }
+      b.view.light = staged.light;
+      b.view.relight_count = staged.model_count;
+      b.view.ground = gs::find_ground(scene);
+      scene = std::move(staged.scene);
+      return;
     }
-    l.on = true;
-    b.on = true;
-    return;
   }
-  throw std::runtime_error("no backdrop " + id + " in " + path);
+  throw std::runtime_error("no spot " + id + " in " + path);
 }
 
 std::vector<uint8_t> render(gs::VkContext& ctx, gs::GpuScene& gpu, const gs::Camera& camera,
@@ -107,7 +117,7 @@ std::vector<uint8_t> render(gs::VkContext& ctx, gs::GpuScene& gpu, const gs::Cam
                             uint32_t* visible) {
   if (renderer && backdrop.on) {
     renderer->set_lighting(gs::splat_lighting(backdrop.view.light, backdrop.view.ground, backdrop.flip_y,
-                                              backdrop.relight));
+                                              backdrop.relight, backdrop.view.relight_count));
   }
   if (!target || target->width() != camera.width || target->height() != camera.height) {
     renderer.reset();
@@ -117,11 +127,8 @@ std::vector<uint8_t> render(gs::VkContext& ctx, gs::GpuScene& gpu, const gs::Cam
     renderer->attach(&gpu);
     if (backdrop.on) {
       renderer->set_lighting(gs::splat_lighting(backdrop.view.light, backdrop.view.ground, backdrop.flip_y,
-                                                backdrop.relight));
+                                                backdrop.relight, backdrop.view.relight_count));
       background = std::make_unique<gs::BackgroundRenderer>(ctx, target->render_pass());
-      if (!backdrop.picture.data.empty()) {
-        background->set_picture(backdrop.picture.data.data(), backdrop.picture.width, backdrop.picture.height);
-      }
     }
   }
   ctx.run([&](VkCommandBuffer cmd) {
@@ -181,39 +188,24 @@ int main(int argc, char** argv) {
   try {
     const std::string mode = argv[2];
     gs::SplatScene scene = load_scene(argv[1]);
+    Backdrop backdrop;
+    backdrop.flip_y = scene.convention == gs::AxisConvention::RDF;
+    const gs::SceneBounds model_bounds = gs::compute_bounds(scene);
+    std::string place;
+    float yaw = 0.0f;
+    for (int i = 3; i + 1 < argc; ++i) {
+      const std::string arg = argv[i];
+      if (arg == "--place") place = argv[i + 1];
+      if (arg == "--yaw") yaw = float(std::atof(argv[i + 1]));
+      if (arg == "--relight") backdrop.relight = float(std::atof(argv[i + 1]));
+    }
+    if (!place.empty()) stage_place(place, yaw, scene, backdrop);
     gs::VkContext ctx;
     auto gpu = gs::upload_scene(ctx, scene);
     std::unique_ptr<gs::OffscreenTarget> target;
     std::unique_ptr<gs::SplatRenderer> renderer;
     std::unique_ptr<gs::BackgroundRenderer> background;
     uint32_t visible = 0;
-    Backdrop backdrop;
-    for (int i = 3; i + 1 < argc; ++i) {
-      const std::string arg = argv[i];
-      if (arg == "--backdrop") {
-        if (!gs::parse_backdrop(argv[i + 1], &backdrop.view.kind)) throw std::runtime_error("unknown backdrop");
-        backdrop.on = true;
-      } else if (arg == "--picture") {
-        backdrop.picture = gs::decode_image(gs::read_file(argv[i + 1]), 4);
-      } else if (arg == "--env") {
-        load_env(argv[i + 1], backdrop);
-      } else if (arg == "--relight") {
-        backdrop.relight = float(std::atof(argv[i + 1]));
-      } else if (arg == "--blur") {
-        backdrop.view.blur = float(std::atof(argv[i + 1]));
-      }
-    }
-    if (backdrop.on && !backdrop.view.light.on) {
-      if (backdrop.view.kind == gs::Backdrop::Studio) {
-        backdrop.view.light = gs::studio_light();
-      } else if (!backdrop.picture.data.empty()) {
-        backdrop.view.light = gs::light_from_picture(backdrop.picture.data.data(), backdrop.picture.width,
-                                                     backdrop.picture.height,
-                                                     backdrop.view.kind == gs::Backdrop::Panorama, backdrop.view.yaw_deg);
-      }
-    }
-    backdrop.view.ground = gs::find_ground(scene);
-    backdrop.flip_y = scene.convention == gs::AxisConvention::RDF;
 
     if (mode == "--views") {
       if (argc < 5) throw std::runtime_error("--views needs <cameras.txt> <out_dir>");
@@ -237,7 +229,7 @@ int main(int argc, char** argv) {
     const uint32_t width = positional(3) ? std::atoi(argv[3]) : 800;
     const uint32_t height = positional(4) ? std::atoi(argv[4]) : 600;
     gs::OrbitCamera orbit;
-    orbit.reset(gs::compute_bounds(scene), scene.convention == gs::AxisConvention::RDF);
+    orbit.reset(model_bounds, scene.convention == gs::AxisConvention::RDF);
     orbit.yaw = positional(5) ? std::atof(argv[5]) * 3.14159265f / 180.0f : 0.0f;
     orbit.pitch = positional(6) ? std::atof(argv[6]) * 3.14159265f / 180.0f : 0.25f;
     const gs::Camera camera = orbit.camera(width, height);

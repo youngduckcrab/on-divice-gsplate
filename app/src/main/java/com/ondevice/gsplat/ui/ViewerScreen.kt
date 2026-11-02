@@ -77,14 +77,15 @@ fun ViewerScreen(
     val openFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) vm.loadUri(uri)
     }
-    val pickPhoto = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) vm.usePhoto(uri)
-    }
     val saveFile = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
         if (uri != null) vm.saveShown(uri)
     }
     var showModels by remember { mutableStateOf(false) }
-    if (showModels) ModelList(vm, onDismiss = { showModels = false })
+    var pickPlace by remember { mutableStateOf(false) }
+    if (showModels) ModelList(vm, title = "내 모델", onPick = vm::loadModel, onDismiss = { showModels = false })
+    if (pickPlace) {
+        ModelList(vm, title = "장소로 쓸 모델", onPick = vm::useModelAsPlace, onDismiss = { pickPlace = false })
+    }
     val scale by rememberUpdatedState(vm.resolutionScale)
     var surfaceView by remember { mutableStateOf<SurfaceView?>(null) }
 
@@ -157,7 +158,7 @@ fun ViewerScreen(
                 )
             }
             if (vm.faceOpen) FacePanel(vm, onSave = { saveFile.launch(vm.coveredName()) })
-            if (vm.backdropOpen) BackdropPanel(vm, onPickPhoto = { pickPhoto.launch(arrayOf("image/*")) })
+            if (vm.placeOpen) PlacePanel(vm, onPickModel = { pickPlace = true })
             ControlRow {
                 FilledTonalButton(enabled = !vm.loading, onClick = { vm.loadSynthetic(100_000) }) { Text("샘플 10만") }
                 FilledTonalButton(enabled = !vm.loading, onClick = { vm.loadSynthetic(500_000) }) { Text("샘플 50만") }
@@ -168,8 +169,8 @@ fun ViewerScreen(
                 }
             }
             ControlRow {
-                if (!vm.backdropOpen) {
-                    FilledTonalButton(enabled = !vm.loading, onClick = vm::openBackdropPanel) { Text("배경") }
+                if (vm.canCoverFace && !vm.placeOpen) {
+                    FilledTonalButton(enabled = !vm.loading, onClick = vm::openPlacePanel) { Text("장소") }
                 }
                 if (vm.canCoverFace && !vm.faceOpen) {
                     FilledTonalButton(enabled = !vm.loading, onClick = vm::openFacePanel) { Text("얼굴 가리기") }
@@ -185,35 +186,49 @@ fun ViewerScreen(
     }
 }
 
-/** What is behind the model: photo scenes indoors and out, plain ones, or a photo from the phone. */
+/**
+ * The 3D place the model stands in: captured rooms and gardens (sorted with the model, so it is
+ * among the furniture, not in front of a picture), or one of the user's own models.
+ */
 @Composable
-private fun BackdropPanel(vm: ViewerViewModel, onPickPhoto: () -> Unit) {
+private fun PlacePanel(vm: ViewerViewModel, onPickModel: () -> Unit) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(horizontal = 10.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("배경", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
-                TextButton(onClick = vm::closeBackdropPanel) { Text("닫기") }
+                Text("장소", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+                TextButton(onClick = vm::closePlacePanel) { Text("닫기") }
             }
             for ((category, title) in listOf("indoor" to "실내", "outdoor" to "야외", "other" to "기타")) {
-                val choices = vm.backdrops.filter { it.category == category }
-                if (choices.isEmpty()) continue
+                val choices = vm.places.filter { it.category == category }
+                if (choices.isEmpty() && category != "other") continue
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(title, style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(32.dp))
                     Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         for (choice in choices) {
                             FilterChip(
-                                selected = vm.backdrop == choice.id,
-                                onClick = { if (choice.id == "photo") onPickPhoto() else vm.chooseBackdrop(choice) },
+                                selected = vm.place == choice.id,
+                                enabled = !vm.placeBusy,
+                                onClick = { vm.choosePlace(choice) },
                                 label = { Text(choice.label) },
+                            )
+                        }
+                        if (category == "other") {
+                            FilterChip(
+                                selected = vm.place == ViewerViewModel.MODEL_PLACE,
+                                enabled = !vm.placeBusy,
+                                onClick = onPickModel,
+                                label = { Text("내 모델에서…") },
                             )
                         }
                     }
                 }
             }
+            CoverSlider("방향", vm.placeTurn, -180f..180f, onChange = { vm.placeTurn = it }, onDone = vm::turnPlace)
             CoverSlider("조명", vm.relight, 0f..1f, onChange = vm::changeRelight, onDone = vm::saveRelight)
+            val credit = vm.places.firstOrNull { it.id == vm.place }?.credit.orEmpty()
             Text(
-                vm.backdropStatus.ifEmpty {
-                    "조명: 모델에 배경의 빛(색·방향·밝기)을 얼마나 입힐지 · 내 사진: 2:1 사진(360°)은 둘러싸고, 다른 사진은 뒤에 깔려요"
+                listOf(vm.placeStatus, credit).filter { it.isNotEmpty() }.joinToString("\n").ifEmpty {
+                    "방향: 장소를 모델 둘레로 돌려요 · 조명: 장소의 빛을 모델에 얼마나 입힐지"
                 },
                 style = MaterialTheme.typography.bodySmall,
             )
@@ -253,7 +268,7 @@ private fun FacePanel(vm: ViewerViewModel, onSave: () -> Unit) {
 
 /** Models kept in the app (trained ones, and covered ones saved there): open or delete. */
 @Composable
-private fun ModelList(vm: ViewerViewModel, onDismiss: () -> Unit) {
+private fun ModelList(vm: ViewerViewModel, title: String, onPick: (File) -> Unit, onDismiss: () -> Unit) {
     var files by remember { mutableStateOf(vm.modelFiles()) }
     var deleting by remember { mutableStateOf<File?>(null) }
     deleting?.let { file ->
@@ -273,7 +288,7 @@ private fun ModelList(vm: ViewerViewModel, onDismiss: () -> Unit) {
     }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("내 모델") },
+        title = { Text(title) },
         text = {
             if (files.isEmpty()) {
                 Text("아직 없어요. 학습을 마치면 여기에 저장돼요.")
@@ -284,7 +299,7 @@ private fun ModelList(vm: ViewerViewModel, onDismiss: () -> Unit) {
                             Modifier
                                 .fillMaxWidth()
                                 .clickable {
-                                    vm.loadModel(file)
+                                    onPick(file)
                                     onDismiss()
                                 }
                                 .padding(vertical = 6.dp),

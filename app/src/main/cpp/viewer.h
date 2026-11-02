@@ -43,11 +43,9 @@ class Viewer {
   void reset_view();
   void set_flip_y(bool flip_y);
   void set_continuous(bool continuous);
-  // What is drawn behind the model (its ground is filled in from the scene),
-  // and the picture Photo / Panorama show (RGBA8, kept so a new window gets
-  // it again). With `light_from_picture` the light comes from that picture.
-  void set_backdrop(gs::BackdropView view, bool light_from_picture);
-  void set_picture(std::vector<uint8_t> rgba, uint32_t width, uint32_t height);
+  // What shows where no splat is, and the light the model takes (its ground
+  // is filled in from the scene set last).
+  void set_backdrop(const gs::BackdropView& view);
   // How much the model takes the backdrop's light: 0 as captured, 1 fully.
   void set_relight(float strength);
 
@@ -100,10 +98,6 @@ class Viewer {
   gs::Ground ground_;
   gs::BackdropView backdrop_;
   float relight_ = 1.0f;
-  std::shared_ptr<const std::vector<uint8_t>> picture_;
-  uint32_t picture_width_ = 0;
-  uint32_t picture_height_ = 0;
-  uint64_t picture_version_ = 0;
   Stats stats_;
 
   // Owned by the render thread while it runs.
@@ -124,5 +118,4 @@ class Viewer {
   uint32_t frame_index_ = 0;
   std::unique_ptr<gs::SplatRenderer> renderer_;
   std::unique_ptr<gs::BackgroundRenderer> background_;
-  uint64_t picture_uploaded_ = 0;  // picture_version_ the background last got
 };

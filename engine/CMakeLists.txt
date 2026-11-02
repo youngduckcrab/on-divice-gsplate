@@ -138,6 +138,7 @@ add_library(gsengine STATIC
   src/train_selftest.cpp
   src/trainer.cpp
   src/diagnose.cpp
+  src/environment.cpp
   src/face_cover.cpp
   src/vk_context.cpp
 )
@@ -174,6 +175,10 @@ if(GS_BUILD_TESTS AND NOT ANDROID)
   add_executable(gs_capture_tests tests/test_capture.cpp)
   target_link_libraries(gs_capture_tests PRIVATE gsengine)
   add_test(NAME gs_capture_tests COMMAND gs_capture_tests)
+
+  add_executable(gs_environment_tests tests/test_environment.cpp)
+  target_link_libraries(gs_environment_tests PRIVATE gsengine)
+  add_test(NAME gs_environment_tests COMMAND gs_environment_tests)
 
   add_executable(gs_face_tests tests/test_face.cpp)
   target_link_libraries(gs_face_tests PRIVATE gsengine)

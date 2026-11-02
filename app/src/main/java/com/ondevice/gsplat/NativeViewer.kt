@@ -36,19 +36,27 @@ object NativeViewer {
     /** Returns JSON with fps, GPU times, visible count, surface size and any render error. */
     external fun stats(): String
 
+    // 3D places, for a model opened from a file (load JSON "face_cover": true).
+
     /**
-     * What is drawn behind the model: plain, studio (white, with a floor and a shadow), photo (the
-     * picture behind, fixed) or panorama (a 360-degree picture around, its floor under the model).
-     * [settings] is a photo scene's manifest entry (assets/backdrops/manifest.json: placement and
-     * light); without one, a photo's light is measured from the picture. False if unknown.
+     * Puts the model into a captured 3D place (a .gsenv from assets/environments; null keeps the
+     * one loaded before) at a spot: [settings] {"x", "z", "yaw", "scale", "sky", "turn"}. The
+     * place is drawn with the model, sorted together, so it stands among the furniture.
+     * Returns JSON {ok, count, place, floor, ms}.
      */
-    external fun setBackdrop(name: String, settings: String?): Boolean
+    external fun setPlace(data: ByteArray?, settings: String?): String
 
-    /** How much the model takes the backdrop's light: 0 as captured, 1 fully. */
+    /** Uses a model file (.ply/.spz, [fd] taken over) as the place, the model at its middle. */
+    external fun setPlaceFile(fd: Int, settings: String?): String
+
+    /** Turns the place around the model by [degrees] on top of the spot's own turn. */
+    external fun turnPlace(degrees: Float): String
+
+    /** Shows the model on its own again; [forget] also drops the loaded place. */
+    external fun clearPlace(forget: Boolean): String
+
+    /** How much the model takes the place's light: 0 as captured, 1 fully. */
     external fun setRelight(strength: Float)
-
-    /** The picture for the photo and panorama backdrops, as ARGB_8888 pixels. */
-    external fun setBackdropPicture(argb: IntArray, width: Int, height: Int): Boolean
 
     // Face covering, for a model opened from a file (load JSON "face_cover": true).
 

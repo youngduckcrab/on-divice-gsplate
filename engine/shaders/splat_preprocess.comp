@@ -31,6 +31,8 @@ layout(std430, binding = 6) readonly buffer Lighting {
   vec4 display;   // x: sign taking scene y and z to display
   vec4 key;       // main light direction (display)
   vec4 rim;       // rim light colour (rgb)
+  uvec4 limit;    // x: relight only splats below this index (0: all)
+  vec4 cut;       // feet height (scene y), radius, on (> 0): see-through cut for a place
 } light;
 
 layout(push_constant) uniform Params {
@@ -162,7 +164,21 @@ void main() {
   uvec4 out1 = uvec4(0u);  // zero alpha marks a culled splat
   uint key = 0xffffu;
 
-  if (t.z > kNear && opacity >= kMinAlpha) {
+  // A place's splats between the camera and the model are cut away (the floor stays).
+  bool cut_away = false;
+  if (light.cut.z > 0.0 && light.limit.x != 0u && i >= light.limit.x) {
+    const vec3 seg = light.centre.xyz - pc.cam_pos.xyz;
+    const float len2 = max(dot(seg, seg), 1e-6);
+    const vec3 rel = p - pc.cam_pos.xyz;
+    const float along = dot(rel, seg) / len2;
+    const float stop = 1.0 - 0.45 / sqrt(len2);  // leave what is right around the model
+    const float height = (p.y - light.cut.x) * light.display.x;
+    if (along > 0.0 && along < stop && height > 0.06) {
+      cut_away = length(rel - seg * along) < light.cut.y;
+    }
+  }
+
+  if (t.z > kNear && opacity >= kMinAlpha && !cut_away) {
     float fx = pc.intrinsics.x, fy = pc.intrinsics.y;
     float cx = pc.intrinsics.z, cy = pc.intrinsics.w;
     float width = float(pc.info.x), height = float(pc.info.y);
@@ -213,7 +229,7 @@ void main() {
         uint coeffs = degree == 0u ? 0u : (degree + 1u) * (degree + 1u) - 1u;
         uint stride = (coeffs * 3u + 1u) / 2u;
         vec3 color = eval_sh(s.sh_dc.xyz, degree, i * stride, normalize(p - pc.cam_pos.xyz));
-        if (light.centre.w > 0.0) {
+        if (light.centre.w > 0.0 && (light.limit.x == 0u || i < light.limit.x)) {
           color = relight(color, p, R, s.scale.xyz, normalize(pc.cam_pos.xyz - p),
                           normalize(pc.cam_pos.xyz - light.centre.xyz));
         }

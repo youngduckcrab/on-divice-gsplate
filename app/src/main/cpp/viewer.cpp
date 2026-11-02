@@ -146,21 +146,7 @@ void Viewer::set_continuous(bool continuous) {
   request_redraw();
 }
 
-void Viewer::set_backdrop(gs::BackdropView view, bool light_from_picture) {
-  if (light_from_picture) {
-    std::shared_ptr<const std::vector<uint8_t>> picture;
-    uint32_t width = 0, height = 0;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      picture = picture_;
-      width = picture_width_;
-      height = picture_height_;
-    }
-    if (picture) {
-      view.light = gs::light_from_picture(picture->data(), width, height, view.kind == gs::Backdrop::Panorama,
-                                          view.yaw_deg);
-    }
-  }
+void Viewer::set_backdrop(const gs::BackdropView& view) {
   std::lock_guard<std::mutex> lock(mutex_);
   backdrop_ = view;
   request_redraw();
@@ -169,16 +155,6 @@ void Viewer::set_backdrop(gs::BackdropView view, bool light_from_picture) {
 void Viewer::set_relight(float strength) {
   std::lock_guard<std::mutex> lock(mutex_);
   relight_ = strength;
-  request_redraw();
-}
-
-void Viewer::set_picture(std::vector<uint8_t> rgba, uint32_t width, uint32_t height) {
-  auto picture = std::make_shared<const std::vector<uint8_t>>(std::move(rgba));
-  std::lock_guard<std::mutex> lock(mutex_);
-  picture_ = std::move(picture);
-  picture_width_ = width;
-  picture_height_ = height;
-  ++picture_version_;
   request_redraw();
 }
 
@@ -225,7 +201,6 @@ void Viewer::render_loop() {
     create_swapchain();
     renderer_ = std::make_unique<gs::SplatRenderer>(*ctx_, render_pass_);
     background_ = std::make_unique<gs::BackgroundRenderer>(*ctx_, render_pass_);
-    picture_uploaded_ = 0;  // a new background has only its placeholder
     {
       std::lock_guard<std::mutex> lock(mutex_);
       renderer_->attach(scene_.get());
@@ -237,9 +212,6 @@ void Viewer::render_loop() {
       gs::OrbitCamera orbit;
       gs::BackdropView backdrop;
       float relight = 1.0f;
-      std::shared_ptr<const std::vector<uint8_t>> picture;
-      uint32_t picture_width = 0, picture_height = 0;
-      uint64_t picture_version = 0;
       std::unique_ptr<gs::GpuScene> incoming;
       bool resized = false;
       bool continuous = false;
@@ -256,17 +228,6 @@ void Viewer::render_loop() {
         backdrop = backdrop_;
         backdrop.ground = ground_;
         relight = relight_;
-        if (picture_version_ != picture_uploaded_ && picture_) {
-          picture = picture_;
-          picture_width = picture_width_;
-          picture_height = picture_height_;
-          picture_version = picture_version_;
-        }
-      }
-      if (picture) {
-        ctx_->queue_wait_idle();  // earlier frames may still read the old picture
-        background_->set_picture(picture->data(), picture_width, picture_height);
-        picture_uploaded_ = picture_version;
       }
 
       if (incoming) {
@@ -586,7 +547,8 @@ bool Viewer::draw_frame(const gs::OrbitCamera& orbit, const gs::BackdropView& ba
     vkCmdResetQueryPool(f.cmd, query_pool_, q, 3);
     vkCmdWriteTimestamp(f.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, query_pool_, q);
   }
-  renderer_->set_lighting(gs::splat_lighting(backdrop.light, backdrop.ground, orbit.flip_y(), relight));
+  renderer_->set_lighting(
+      gs::splat_lighting(backdrop.light, backdrop.ground, orbit.flip_y(), relight, backdrop.relight_count));
   renderer_->record_prepare(f.cmd, camera);
   if (query_pool_ != VK_NULL_HANDLE) {
     vkCmdWriteTimestamp(f.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, query_pool_, q + 1);

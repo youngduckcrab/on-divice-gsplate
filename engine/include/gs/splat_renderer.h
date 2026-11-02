@@ -34,6 +34,12 @@ struct SplatLighting {
   float display[4] = {1, 0, 0, 0};        // x: sign taking scene y and z to display (-1 when flipped)
   float key[4] = {0, 1, 0, 0};            // main light direction, display space
   float rim[4] = {0, 0, 0, 0};            // rim light colour and intensity (rgb)
+  uint32_t limit[4] = {0, 0, 0, 0};       // x: relight only splats below this index (0: all)
+  // See-through cut for a place around the model: splats past `limit` between
+  // the camera and the model's middle, within `cut[1]` of that line and more
+  // than a few centimetres above the feet (scene y `cut[0]`), are not drawn,
+  // so walls and furniture behind the camera never hide the model. cut[2] > 0: on.
+  float cut[4] = {0, 0, 0, 0};
 };
 
 // Throws std::runtime_error if the scene exceeds the device's buffer limits.

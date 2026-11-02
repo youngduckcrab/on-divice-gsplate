@@ -3,7 +3,6 @@ package com.ondevice.gsplat.viewer
 import android.app.Application
 import android.content.ContentResolver
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
@@ -35,14 +34,16 @@ enum class FaceCover(val id: String, val label: String) {
 }
 
 /**
- * Something to show behind the model: a photo scene shipped with the app (assets/backdrops, a
- * 360-degree photo with the light it casts), the plain grey, the white studio, or the user's photo.
+ * A 3D place the model can be put into: a spot in one of the captured places shipped with the
+ * app (assets/environments/manifest.json), or none.
  */
-data class BackdropChoice(
+data class PlaceChoice(
     val id: String,
     val label: String,
     val category: String,  // "indoor", "outdoor" or "other"
-    val settings: JSONObject? = null,  // manifest entry of a photo scene
+    val file: String? = null,  // .gsenv in assets/environments
+    val settings: JSONObject? = null,  // the spot: x, z, yaw, scale, sky
+    val credit: String = "",
 )
 
 /**
@@ -59,8 +60,9 @@ private object ViewerSession {
 }
 
 class ViewerViewModel(application: Application) : AndroidViewModel(application) {
-    private companion object {
-        const val PHOTO = "photo"
+    companion object {
+        const val NO_PLACE = "none"
+        const val MODEL_PLACE = "model"
     }
 
     val loadError: String? = NativeBridge.loadError
@@ -99,17 +101,22 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
     var faceRaise by mutableFloatStateOf(0.0f)
     private var coverAgain = false
 
-    /** Photo scenes from assets/backdrops/manifest.json, then the built-in ones. */
-    val backdrops: List<BackdropChoice> = loadBackdrops()
-    var backdrop by mutableStateOf("plain")
+    /** Spots in the places from assets/environments, then none. */
+    val places: List<PlaceChoice> = loadPlaces()
+    var place by mutableStateOf(NO_PLACE)
         private set
-    /** How much the model takes the backdrop's light (0..1). */
+    /** How far the place is turned around the model (degrees), on top of the spot's own turn. */
+    var placeTurn by mutableFloatStateOf(0.0f)
+    /** How much the model takes the place's light (0..1). */
     var relight by mutableFloatStateOf(1.0f)
         private set
-    var backdropOpen by mutableStateOf(false)
+    var placeOpen by mutableStateOf(false)
         private set
-    var backdropStatus by mutableStateOf("")
+    var placeStatus by mutableStateOf("")
         private set
+    var placeBusy by mutableStateOf(false)
+        private set
+    private var loadedPlaceFile: String? = null  // the .gsenv the native side holds
 
     private val prefs = application.getSharedPreferences("viewer", android.content.Context.MODE_PRIVATE)
 
@@ -117,7 +124,7 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
     val modelsDir: File get() = File(getApplication<Application>().filesDir, "models").apply { mkdirs() }
 
     init {
-        if (loadError == null) restoreBackdrop()
+        if (loadError == null) restorePlace()
         if (loadError == null) {
             val kept = ViewerSession.scene
             if (NativeViewer.sceneCount() > 0 && kept != null) {
@@ -228,49 +235,92 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
 
     fun resetView() = NativeViewer.resetView()
 
-    fun openBackdropPanel() {
-        backdropOpen = true
+    fun openPlacePanel() {
+        placeOpen = true
         faceOpen = false
     }
 
-    fun closeBackdropPanel() {
-        backdropOpen = false
+    fun closePlacePanel() {
+        placeOpen = false
     }
 
-    /** A backdrop from the list; the user's photo goes through [usePhoto]. */
-    fun chooseBackdrop(choice: BackdropChoice) {
-        if (choice.id == PHOTO) return
-        val settings = choice.settings
-        if (settings == null) {
-            if (NativeViewer.setBackdrop(choice.id, null)) {
-                backdrop = choice.id
-                backdropStatus = ""
-                prefs.edit().putString("backdrop", choice.id).apply()
-            }
+    /** Puts the model into [choice] (or takes it out, for none). */
+    fun choosePlace(choice: PlaceChoice) {
+        if (placeBusy) return
+        if (!canCoverFace) {
+            placeStatus = "파일에서 연 모델(학습한 모델, PLY)에서만 쓸 수 있어요"
             return
         }
         viewModelScope.launch {
-            backdropStatus = "${choice.label} 불러오는 중…"
-            val ok = withContext(Dispatchers.Default) {
+            placeBusy = true
+            placeStatus = if (choice.file == null) "" else "${choice.label} 불러오는 중…"
+            val result = withContext(Dispatchers.Default) {
                 runCatching {
-                    val options = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
-                    val bitmap = getApplication<Application>().assets.open("backdrops/${settings.getString("file")}")
-                        .use { BitmapFactory.decodeStream(it, null, options) } ?: error("그림을 읽지 못했어요")
-                    val pixels = IntArray(bitmap.width * bitmap.height)
-                    bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
-                    val width = bitmap.width
-                    val height = bitmap.height
-                    bitmap.recycle()
-                    NativeViewer.setBackdropPicture(pixels, width, height) &&
-                        NativeViewer.setBackdrop("panorama", settings.toString())
-                }.getOrDefault(false)
+                    val file = choice.file
+                    if (file == null) {
+                        JSONObject(NativeViewer.clearPlace(false))
+                    } else {
+                        val bytes = if (loadedPlaceFile == file) {
+                            null
+                        } else {
+                            getApplication<Application>().assets.open("environments/$file").use { it.readBytes() }
+                        }
+                        val settings = JSONObject(choice.settings.toString()).put("turn", placeTurn.toDouble())
+                        JSONObject(NativeViewer.setPlace(bytes, settings.toString())).also {
+                            if (it.optBoolean("ok")) loadedPlaceFile = file
+                        }
+                    }
+                }.getOrElse { JSONObject().put("ok", false).put("error", it.message ?: it.toString()) }
             }
-            if (ok) {
-                backdrop = choice.id
-                backdropStatus = ""
-                prefs.edit().putString("backdrop", choice.id).apply()
+            placeBusy = false
+            if (result.optBoolean("ok")) {
+                place = choice.id
+                placeStatus = if (choice.file == null) "" else placeLine(choice.label, result)
+                prefs.edit().putString("place", choice.id).apply()
             } else {
-                backdropStatus = "${choice.label}을(를) 불러오지 못했어요"
+                placeStatus = "장소를 열지 못했어요: ${result.optString("error")}"
+            }
+        }
+    }
+
+    /** Turns the place around the model to [placeTurn] (when the slider is let go). */
+    fun turnPlace() {
+        prefs.edit().putFloat("place_turn", placeTurn).apply()
+        if (place == NO_PLACE || placeBusy) return
+        viewModelScope.launch {
+            placeBusy = true
+            val result = withContext(Dispatchers.Default) {
+                runCatching { JSONObject(NativeViewer.turnPlace(placeTurn)) }
+                    .getOrElse { JSONObject().put("ok", false).put("error", it.message ?: it.toString()) }
+            }
+            placeBusy = false
+            if (!result.optBoolean("ok")) placeStatus = "돌리지 못했어요: ${result.optString("error")}"
+        }
+    }
+
+    /** Uses one of the models in app storage (a scanned room, say) as the place. */
+    fun useModelAsPlace(file: File) {
+        if (placeBusy) return
+        if (!canCoverFace) {
+            placeStatus = "파일에서 연 모델(학습한 모델, PLY)에서만 쓸 수 있어요"
+            return
+        }
+        viewModelScope.launch {
+            placeBusy = true
+            placeStatus = "${file.name}을(를) 장소로 여는 중…"
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val fd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).detachFd()
+                    JSONObject(NativeViewer.setPlaceFile(fd, JSONObject().put("turn", placeTurn.toDouble()).toString()))
+                }.getOrElse { JSONObject().put("ok", false).put("error", it.message ?: it.toString()) }
+            }
+            placeBusy = false
+            if (result.optBoolean("ok")) {
+                place = MODEL_PLACE
+                loadedPlaceFile = null
+                placeStatus = placeLine(file.nameWithoutExtension, result)
+            } else {
+                placeStatus = "장소로 열지 못했어요: ${result.optString("error")}"
             }
         }
     }
@@ -284,92 +334,51 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
         prefs.edit().putFloat("relight", relight).apply()
     }
 
-    private fun loadBackdrops(): List<BackdropChoice> {
-        val scenes = runCatching {
-            val text = getApplication<Application>().assets.open("backdrops/manifest.json").bufferedReader().use { it.readText() }
+    private fun placeLine(label: String, result: JSONObject): String =
+        "$label · 가우시안 ${"%.0f".format(java.util.Locale.US, result.optInt("count") / 1e4)}만 개 · " +
+            "${result.optDouble("ms").toInt()} ms"
+
+    private fun loadPlaces(): List<PlaceChoice> {
+        val spots = runCatching {
+            val text = getApplication<Application>().assets.open("environments/manifest.json")
+                .bufferedReader().use { it.readText() }
             val list = org.json.JSONArray(text)
-            (0 until list.length()).map { i ->
-                val e = list.getJSONObject(i)
-                BackdropChoice(e.getString("id"), e.getString("label"), e.optString("category", "other"), e)
+            (0 until list.length()).flatMap { i ->
+                val env = list.getJSONObject(i)
+                val credit = "${env.optString("title")} · ${env.optString("author").substringBefore(" (")} · " +
+                    env.optString("license")
+                val spotList = env.getJSONArray("spots")
+                (0 until spotList.length()).map { k ->
+                    val spot = spotList.getJSONObject(k)
+                    val settings = JSONObject()
+                        .put("x", spot.getDouble("x"))
+                        .put("z", spot.getDouble("z"))
+                        .put("yaw", spot.optDouble("yaw", 0.0))
+                        .put("scale", env.optDouble("scale", 1.0))
+                        .put("sky", env.optJSONArray("sky"))
+                    PlaceChoice(spot.getString("id"), spot.getString("label"), spot.optString("category", "other"),
+                        env.getString("file"), settings, credit)
+                }
             }
         }.getOrDefault(emptyList())
-        return scenes + listOf(
-            BackdropChoice("plain", "기본", "other"),
-            BackdropChoice("studio", "흰 스튜디오", "other"),
-            BackdropChoice(PHOTO, "내 사진", "other"),
-        )
+        return spots + PlaceChoice(NO_PLACE, "없음", "other")
     }
 
-    /**
-     * A picture from the phone as the backdrop: a 2:1 picture (a 360-degree panorama) goes all
-     * around the model, any other one behind it, filling the screen.
-     */
-    fun usePhoto(uri: Uri, remembered: Boolean = false) {
-        val resolver = getApplication<Application>().contentResolver
-        if (!remembered) {
-            runCatching { resolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION) }
-        }
-        viewModelScope.launch {
-            backdropStatus = "사진 불러오는 중…"
-            val result = withContext(Dispatchers.Default) { runCatching { decodeBackdrop(uri) } }
-            result.onSuccess { panorama ->
-                if (NativeViewer.setBackdrop(if (panorama) "panorama" else "photo", null)) {
-                    backdrop = PHOTO
-                    prefs.edit().putString("backdrop", PHOTO).putString("backdrop_photo", uri.toString()).apply()
-                    backdropStatus = if (panorama) {
-                        "360° 사진으로 둘렀어요 (모델과 함께 돌아가요)"
-                    } else {
-                        "사진을 뒤에 깔았어요 (모델을 돌려도 사진은 그대로예요)"
-                    }
-                }
-            }.onFailure {
-                backdropStatus = "사진을 쓸 수 없어요: ${it.message ?: it}"
-            }
-        }
-    }
-
-    /** Decodes [uri] (upright, as the gallery shows it) for the backdrop; true if it is a panorama. */
-    private fun decodeBackdrop(uri: Uri): Boolean {
-        val source = android.graphics.ImageDecoder.createSource(getApplication<Application>().contentResolver, uri)
-        var panorama = false
-        val bitmap = android.graphics.ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
-            val w = info.size.width
-            val h = info.size.height
-            val aspect = w.toFloat() / h.coerceAtLeast(1)
-            panorama = aspect in 1.9f..2.1f
-            // Enough detail for a phone screen, small enough to upload quickly.
-            val limit = if (panorama) 4096 else 2048
-            val scale = minOf(1f, limit.toFloat() / maxOf(w, h))
-            decoder.setTargetSize((w * scale).toInt().coerceAtLeast(1), (h * scale).toInt().coerceAtLeast(1))
-            decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
-        }
-        val argb = bitmap.copy(Bitmap.Config.ARGB_8888, false)
-        val width = argb.width
-        val height = argb.height
-        val pixels = IntArray(width * height)
-        argb.getPixels(pixels, 0, width, 0, 0, width, height)
-        if (argb !== bitmap) argb.recycle()
-        bitmap.recycle()
-        if (!NativeViewer.setBackdropPicture(pixels, width, height)) error("화면에 넘기지 못했어요")
-        return panorama
-    }
-
-    private fun restoreBackdrop() {
+    private fun restorePlace() {
         relight = prefs.getFloat("relight", 1.0f)
         NativeViewer.setRelight(relight)
-        val id = prefs.getString("backdrop", null) ?: return
-        if (id != PHOTO) {
-            backdrops.firstOrNull { it.id == id }?.let(::chooseBackdrop)
-            return
+        placeTurn = prefs.getFloat("place_turn", 0.0f)
+        val id = prefs.getString("place", null) ?: return
+        val choice = places.firstOrNull { it.id == id && it.file != null } ?: return
+        // After the model the viewer opens first.
+        viewModelScope.launch {
+            snapshotFlow { loading }.first { !it }
+            if (canCoverFace) choosePlace(choice)
         }
-        val uri = prefs.getString("backdrop_photo", null)?.let(Uri::parse) ?: return
-        val readable = getApplication<Application>().contentResolver.persistedUriPermissions
-            .any { it.uri == uri && it.isReadPermission }
-        if (readable) usePhoto(uri, remembered = true)
     }
 
     fun openFacePanel() {
-        backdropOpen = false
+        placeOpen = false
         faceOpen = true
         if (!facePlaced && !faceBusy) findFace(aroundCamera = false)
     }
@@ -536,6 +545,10 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
                 flipY = result.optBoolean("flip_y")
                 status = ""
                 canCoverFace = result.optBoolean("face_cover")
+                if (!canCoverFace && place != NO_PLACE) {
+                    NativeViewer.clearPlace(false)
+                    place = NO_PLACE
+                }
                 faceOpen = false
                 facePlaced = false
                 faceCover = FaceCover.NONE

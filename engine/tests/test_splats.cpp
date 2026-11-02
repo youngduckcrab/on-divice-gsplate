@@ -13,6 +13,7 @@
 
 #include "gs/background.h"
 #include "gs/camera.h"
+#include "gs/environment.h"
 #include "gs/offscreen.h"
 #include "gs/splat_renderer.h"
 #include "gs/splat_scene.h"
@@ -291,54 +292,36 @@ void test_synthetic_render(gs::VkContext& ctx) {
 
 }  // namespace
 
-// The backdrop under every surface pre-rotation lines up with the picture the
-// splats are drawn into (splat.vert's rotation), and shows a floor with a
-// shadow, and a panorama the right way up.
+// The sky backdrop under every surface pre-rotation lines up with the picture
+// the splats are drawn into (splat.vert's rotation): lighter at the horizon,
+// bluer overhead.
 void test_backdrop(gs::VkContext& ctx) {
   const uint32_t w = 64, h = 48;
   gs::OrbitCamera orbit;
   gs::SceneBounds bounds{{0.0f, 0.85f, 0.0f}, 1.0f};
   orbit.reset(bounds, false);
-  orbit.pitch = 0.35f;
-  orbit.yaw = 0.4f;
+  orbit.pitch = -0.5f;  // looking up a little: horizon low on the screen, sky above
   const gs::Camera camera = orbit.camera(w, h);
-  gs::Ground ground;
-  ground.found = true;
-  ground.low = 0.0f;
-  ground.high = 1.7f;
-  // An asymmetric picture: a gradient across, bands down.
-  std::vector<uint8_t> pano(64 * 32 * 4);
-  for (uint32_t y = 0; y < 32; ++y) {
-    for (uint32_t x = 0; x < 64; ++x) {
-      uint8_t* q = &pano[(y * 64 + x) * 4];
-      q[0] = uint8_t(x * 4);
-      q[1] = uint8_t((y / 4) % 2 ? 200 : 40);
-      q[2] = uint8_t(255 - y * 8);
-      q[3] = 255;
-    }
-  }
-  auto draw = [&](gs::Backdrop kind, uint32_t rotation, const std::vector<uint8_t>& picture = {},
-                  const gs::Camera* level = nullptr, uint32_t pw = 64, uint32_t ph = 32) {
+  gs::BackdropView view;
+  view.kind = gs::Backdrop::Sky;
+  const float zenith[3] = {0.1f, 0.3f, 0.9f}, horizon[3] = {0.9f, 0.9f, 0.9f};
+  std::copy(zenith, zenith + 3, view.zenith);
+  std::copy(horizon, horizon + 3, view.horizon);
+  auto draw = [&](uint32_t rotation) {
     const bool swap = (rotation & 1u) != 0;
     gs::OffscreenTarget target(ctx, swap ? h : w, swap ? w : h);
     gs::BackgroundRenderer background(ctx, target.render_pass());
-    if (!picture.empty()) background.set_picture(picture.data(), pw, ph);
-    gs::BackdropView view;
-    view.kind = kind;
-    view.ground = ground;
-    view.blur = 0.0f;
-    if (kind == gs::Backdrop::Studio) view.light = gs::studio_light();
     const float clear[4] = {1, 0, 1, 1};
     ctx.run([&](VkCommandBuffer cmd) {
-      target.record(cmd, clear, [&](VkCommandBuffer c) {
-        background.record(c, view, level ? *level : camera, false, rotation);
-      });
+      target.record(cmd, clear, [&](VkCommandBuffer c) { background.record(c, view, camera, false, rotation); });
     });
     return target.pixels();
   };
-  const std::vector<uint8_t> upright = draw(gs::Backdrop::Panorama, 0, pano);
+  const std::vector<uint8_t> upright = draw(0);
+  EXPECT(pixel(upright, w, w / 2, 0)[2] > pixel(upright, w, w / 2, 0)[0] + 60, "the top should be sky blue");
+  EXPECT(pixel(upright, w, w / 2, h - 1)[0] > 150, "the bottom should be near the light horizon");
   for (uint32_t rotation : {1u, 2u, 3u}) {
-    const std::vector<uint8_t> turned = draw(gs::Backdrop::Panorama, rotation, pano);
+    const std::vector<uint8_t> turned = draw(rotation);
     const bool swap = (rotation & 1u) != 0;
     const uint32_t fw = swap ? h : w, fh = swap ? w : h;
     double diff = 0;
@@ -357,41 +340,6 @@ void test_backdrop(gs::VkContext& ctx) {
     diff /= double(fw * fh * 3);
     EXPECT(diff < 2.0, "backdrop under rotation %u differs from upright by %.2f", rotation, diff);
   }
-  // Studio: the floor right under the model is darker than the floor beside it.
-  const std::vector<uint8_t> studio = draw(gs::Backdrop::Studio, 0);
-  float under[2];
-  {
-    // Project the floor point under the model.
-    const float p[3] = {0.0f, -0.0085f, 0.0f};
-    float c[3];
-    for (int r = 0; r < 3; ++r) {
-      c[r] = camera.rotation[r * 3] * p[0] + camera.rotation[r * 3 + 1] * p[1] + camera.rotation[r * 3 + 2] * p[2] +
-             camera.translation[r];
-    }
-    under[0] = camera.fx * c[0] / c[2] + camera.cx;
-    under[1] = camera.fy * c[1] / c[2] + camera.cy;
-  }
-  EXPECT(under[0] > 4 && under[0] < w - 4 && under[1] > 0 && under[1] < h, "floor point off screen");
-  const uint8_t* shade = pixel(studio, w, uint32_t(under[0]), std::min(h - 1, uint32_t(under[1])));
-  const uint8_t* corner = pixel(studio, w, 1, h - 1);
-  EXPECT(shade[1] + 20 < corner[1], "studio shadow %u vs floor %u", shade[1], corner[1]);
-  EXPECT(pixel(studio, w, w / 2, 1)[1] > 200, "studio wall should be light");
-  // Panorama, looking level: red sky above, blue ground below.
-  gs::OrbitCamera level_orbit = orbit;
-  level_orbit.pitch = 0.0f;
-  const gs::Camera level = level_orbit.camera(w, h);
-  std::vector<uint8_t> sky(8 * 4 * 4);
-  for (uint32_t y = 0; y < 4; ++y) {
-    for (uint32_t x = 0; x < 8; ++x) {
-      uint8_t* q = &sky[(y * 8 + x) * 4];
-      q[0] = y < 2 ? 255 : 0;
-      q[2] = y < 2 ? 0 : 255;
-      q[3] = 255;
-    }
-  }
-  const std::vector<uint8_t> around = draw(gs::Backdrop::Panorama, 0, sky, &level, 8, 4);
-  EXPECT(pixel(around, w, w / 2, 0)[0] > 200, "panorama top should be sky (red)");
-  EXPECT(pixel(around, w, 2, h - 1)[2] > 150, "panorama bottom should be ground (blue)");
 }
 
 // Relighting: a grey splat takes the colour and brightness of the light, and
@@ -432,6 +380,18 @@ void test_relight(gs::VkContext& ctx) {
   const gs::SplatLighting night = gs::splat_lighting(dim, ground, false, 1.0f);
   const auto dark = centre(&night);
   EXPECT(dark[0] < lit[0] - 40, "dim light should darken: %d vs %d", dark[0], lit[0]);
+  // Only the first `count` splats take the light (the model, not the place around it).
+  const gs::SplatLighting none = gs::splat_lighting(light, ground, false, 1.0f, 0);
+  gs::SplatLighting first_only = none;
+  first_only.limit[0] = 1;
+  gs::SplatScene two = make_scene({{{0, 0, 0}, 0.1f, {0.6f, 0.6f, 0.6f}, 0.99f}, {{0, 0, 0}, 0.1f, {0.6f, 0.6f, 0.6f}, 0.99f}});
+  std::swap(scene, two);
+  const auto both_lit = centre(&none);
+  scene.positions[0] = 10.0f;  // the lit one moves out of view: the one in view is the place's
+  const auto place_only = centre(&first_only);
+  EXPECT(both_lit[0] > plain[0] + 20, "both splats should take the light");
+  EXPECT(std::abs(place_only[0] - plain[0]) <= 2, "splats past the count should keep their colour (%d vs %d)",
+         place_only[0], plain[0]);
 }
 
 int main() {

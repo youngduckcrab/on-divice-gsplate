@@ -22,6 +22,7 @@
 #include "gs/dataset.h"
 #include "gs/diagnose.h"
 #include "gs/device_probe.h"
+#include "gs/environment.h"
 #include "gs/face_cover.h"
 #include "gs/json.h"
 #include "gs/json_parse.h"
@@ -51,6 +52,16 @@ struct FaceSession {
 };
 std::mutex g_face_mutex;
 FaceSession g_face;
+
+// A 3D place the model is put into (tools/environments, or a model used as
+// one), and where in it. Guarded by g_face_mutex.
+struct PlaceSession {
+  std::shared_ptr<const gs::SplatScene> scene;  // RDF, SH degree 0
+  gs::Spot spot;
+  float base_yaw = 0.0f;  // the place's own turn; the user's is added to it
+  bool active = false;
+};
+PlaceSession g_place;
 constexpr uint32_t kFaceKeepLimit = 2000000;  // splats kept on the CPU at most
 
 std::string error_json(const std::string& message) {
@@ -108,6 +119,75 @@ std::vector<uint8_t> read_fd(int fd) {
   return data;
 }
 
+template <typename F>
+std::string face_call(F&& f) {
+  try {
+    std::lock_guard<std::mutex> lock(g_face_mutex);
+    if (!g_face.original) return error_json("파일에서 연 모델에서만 쓸 수 있어요");
+    return f();
+  } catch (const std::exception& e) {
+    return error_json(e.what());
+  }
+}
+
+// Keeps SH up to degree 1: with a place around it the model shares one SH
+// layout with a million place splats, which degree 3 would make too big.
+gs::SplatScene at_most_degree1(const gs::SplatScene& scene) {
+  if (scene.sh_degree <= 1) return scene;
+  gs::SplatScene out = scene;
+  const int coeffs = gs::sh_rest_coeffs(scene.sh_degree);
+  out.sh_degree = 1;
+  out.sh_rest.assign(size_t(scene.count) * 9, 0.0f);
+  for (uint32_t i = 0; i < scene.count; ++i) {
+    std::copy_n(&scene.sh_rest[size_t(i) * coeffs * 3], 9, &out.sh_rest[size_t(i) * 9]);
+  }
+  return out;
+}
+
+// Shows the model as it is now (g_face.shown), in the place if one is
+// chosen, keeping the camera. Caller holds g_face_mutex.
+std::string present_locked() {
+  using Clock = std::chrono::steady_clock;
+  const auto t0 = Clock::now();
+  if (!g_face.shown) return error_json("파일에서 연 모델에서만 쓸 수 있어요");
+  std::shared_ptr<gs::VkContext> ctx;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    ctx = context_locked();
+  }
+  gs::BackdropView view;
+  uint32_t count = g_face.shown->count;
+  float floor = 0.0f;
+  std::unique_ptr<gs::GpuScene> gpu;
+  if (g_place.active && g_place.scene) {
+    gs::Staging staged = gs::stage(at_most_degree1(*g_face.shown), *g_place.scene, g_place.spot);
+    view.kind = gs::Backdrop::Sky;
+    for (int c = 0; c < 3; ++c) {
+      view.zenith[c] = g_place.spot.sky[0][c];
+      view.horizon[c] = g_place.spot.sky[1][c];
+    }
+    view.light = staged.light;
+    view.relight_count = staged.model_count;
+    count = staged.scene.count;
+    floor = staged.floor;
+    gpu = gs::upload_scene(*ctx, staged.scene);
+  } else {
+    gpu = gs::upload_scene(*ctx, *g_face.shown);
+  }
+  Viewer& v = viewer();
+  v.set_backdrop(view);
+  v.swap_scene(std::move(gpu));
+  gs::JsonWriter w;
+  w.begin_object();
+  w.field("ok", true);
+  w.field("count", count);
+  w.field("place", g_place.active);
+  w.field("floor", floor);
+  w.field("ms", std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+  w.end_object();
+  return w.str();
+}
+
 // Parses (via `make_scene`), uploads and hands a scene to the viewer. A scene
 // from a file (`keep`) stays on the CPU too, for covering its face.
 template <typename F>
@@ -149,6 +229,12 @@ std::string load_scene(F&& make_scene, bool keep) {
       g_face = FaceSession{};
       if (kept) g_face.original = std::make_shared<const gs::SplatScene>(std::move(scene));
       g_face.shown = g_face.original;
+      // A place chosen before takes the new model in; a model that cannot be kept shows on its own.
+      if (kept && g_place.active) {
+        present_locked();
+      } else {
+        v.set_backdrop(gs::BackdropView{});
+      }
     }
     return w.str();
   } catch (const std::exception& e) {
@@ -268,72 +354,101 @@ Java_com_ondevice_gsplat_NativeViewer_stats(JNIEnv* env, jobject /*this*/) {
   }
 }
 
-// --- Backdrop (NativeViewer) ------------------------------------------------------
+// --- Places (NativeViewer) --------------------------------------------------------
 
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_ondevice_gsplat_NativeViewer_setBackdrop(JNIEnv* env, jobject /*this*/, jstring jname, jstring jsettings) {
-  gs::BackdropView view;
-  if (!gs::parse_backdrop(from_jstring(env, jname), &view.kind)) return JNI_FALSE;
-  const std::string settings = jsettings != nullptr ? from_jstring(env, jsettings) : std::string();
-  try {
-    if (!settings.empty()) {
-      const gs::JsonValue s = gs::parse_json(settings);
-      view.yaw_deg = float(s.number_or("yaw", 0.0));
-      view.camera_height = float(s.number_or("camera_height", view.camera_height));
-      view.radius = float(s.number_or("radius", view.radius));
-      view.blur = float(s.number_or("blur", view.blur));
-      gs::EnvLight& l = view.light;
-      auto numbers = [&](const char* key, float* out, int n) {
-        const gs::JsonValue* a = s.find(key);
-        if (a == nullptr || a->type != gs::JsonValue::Type::Array || int(a->array.size()) < n) return false;
-        for (int k = 0; k < n; ++k) out[k] = float(a->array[size_t(k)].number);
-        return true;
-      };
-      l.on = numbers("sh", l.sh, 27);
-      numbers("key", l.key, 3);
-      numbers("key_color", l.key_color, 3);
-      l.key_share = float(s.number_or("key_share", 0.0));
+namespace {
+
+// {"x", "z", "yaw", "scale", "sky": [[zenith], [horizon]]}
+void read_spot(const std::string& settings, PlaceSession& place) {
+  if (settings.empty()) return;
+  const gs::JsonValue s = gs::parse_json(settings);
+  place.spot.x = float(s.number_or("x", place.spot.x));
+  place.spot.z = float(s.number_or("z", place.spot.z));
+  place.spot.scale = float(s.number_or("scale", place.spot.scale));
+  place.base_yaw = float(s.number_or("yaw", 0.0));
+  place.spot.yaw_deg = place.base_yaw + float(s.number_or("turn", 0.0));
+  if (const gs::JsonValue* sky = s.find("sky"); sky != nullptr && sky->array.size() == 2) {
+    for (int r = 0; r < 2; ++r) {
+      for (int c = 0; c < 3 && c < int(sky->array[size_t(r)].array.size()); ++c) {
+        place.spot.sky[r][c] = float(sky->array[size_t(r)].array[size_t(c)].number);
+      }
     }
-  } catch (const std::exception&) {
-    return JNI_FALSE;
   }
-  if (view.kind == gs::Backdrop::Studio) view.light = gs::studio_light();
-  const bool from_picture =
-      (view.kind == gs::Backdrop::Photo || view.kind == gs::Backdrop::Panorama) && !view.light.on;
-  bool ok = false;
-  with_viewer([&](Viewer& v) {
-    v.set_backdrop(view, from_picture);
-    ok = true;
-  });
-  return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+}  // namespace
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ondevice_gsplat_NativeViewer_setPlace(JNIEnv* env, jobject /*this*/, jbyteArray jdata, jstring jsettings) {
+  std::vector<uint8_t> data;
+  if (jdata != nullptr) {
+    data.resize(size_t(env->GetArrayLength(jdata)));
+    env->GetByteArrayRegion(jdata, 0, jsize(data.size()), reinterpret_cast<jbyte*>(data.data()));
+  }
+  const std::string settings = jsettings != nullptr ? from_jstring(env, jsettings) : std::string();
+  return to_jstring(env, face_call([&] {
+    if (!data.empty()) g_place.scene = std::make_shared<const gs::SplatScene>(gs::read_gsenv(data.data(), data.size()));
+    if (!g_place.scene) return error_json("장소를 먼저 불러와 주세요");
+    g_place.spot = gs::Spot{};
+    read_spot(settings, g_place);
+    g_place.active = true;
+    return present_locked();
+  }));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ondevice_gsplat_NativeViewer_setPlaceFile(JNIEnv* env, jobject /*this*/, jint fd, jstring jsettings) {
+  const std::string settings = jsettings != nullptr ? from_jstring(env, jsettings) : std::string();
+  std::vector<uint8_t> bytes;
+  try {
+    bytes = read_fd(fd);
+  } catch (const std::exception& e) {
+    return to_jstring(env, error_json(e.what()));
+  }
+  return to_jstring(env, face_call([&] {
+    gs::SplatScene loaded = gs::load_splat_file(bytes.data(), bytes.size());
+    gs::convert_convention(loaded, gs::AxisConvention::RDF);
+    // Colour only: the place is turned around the model.
+    gs::SplatScene place = loaded;
+    place.resize(loaded.count, 0);
+    place.convention = gs::AxisConvention::RDF;
+    place.antialiased = loaded.antialiased;
+    place.positions = loaded.positions;
+    place.log_scales = loaded.log_scales;
+    place.rotations = loaded.rotations;
+    place.opacity_logits = loaded.opacity_logits;
+    place.sh_dc = loaded.sh_dc;
+    const gs::Ground ground = gs::find_ground(place);
+    g_place.scene = std::make_shared<const gs::SplatScene>(std::move(place));
+    g_place.spot = gs::Spot{};
+    g_place.spot.x = ground.centre[0];
+    g_place.spot.z = ground.centre[1];
+    read_spot(settings, g_place);
+    g_place.active = true;
+    return present_locked();
+  }));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ondevice_gsplat_NativeViewer_turnPlace(JNIEnv* env, jobject /*this*/, jfloat degrees) {
+  return to_jstring(env, face_call([&] {
+    g_place.spot.yaw_deg = g_place.base_yaw + degrees;
+    return present_locked();
+  }));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ondevice_gsplat_NativeViewer_clearPlace(JNIEnv* env, jobject /*this*/, jboolean forget) {
+  return to_jstring(env, face_call([&] {
+    g_place.active = false;
+    if (forget == JNI_TRUE) g_place.scene.reset();
+    return present_locked();
+  }));
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_ondevice_gsplat_NativeViewer_setRelight(JNIEnv*, jobject, jfloat strength) {
   with_viewer([&](Viewer& v) { v.set_relight(strength); });
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_ondevice_gsplat_NativeViewer_setBackdropPicture(JNIEnv* env, jobject /*this*/, jintArray jargb, jint width,
-                                                         jint height) {
-  const jsize n = env->GetArrayLength(jargb);
-  if (width <= 0 || height <= 0 || n != width * height) return JNI_FALSE;
-  std::vector<jint> argb(static_cast<size_t>(n));
-  env->GetIntArrayRegion(jargb, 0, n, argb.data());
-  std::vector<uint8_t> rgba(static_cast<size_t>(n) * 4);
-  for (size_t i = 0; i < argb.size(); ++i) {
-    const uint32_t c = static_cast<uint32_t>(argb[i]);
-    rgba[i * 4 + 0] = uint8_t(c >> 16);
-    rgba[i * 4 + 1] = uint8_t(c >> 8);
-    rgba[i * 4 + 2] = uint8_t(c);
-    rgba[i * 4 + 3] = 255;
-  }
-  bool ok = false;
-  with_viewer([&](Viewer& v) {
-    v.set_picture(std::move(rgba), static_cast<uint32_t>(width), static_cast<uint32_t>(height));
-    ok = true;
-  });
-  return ok ? JNI_TRUE : JNI_FALSE;
 }
 
 // --- Face covering (NativeViewer) --------------------------------------------------
@@ -343,16 +458,6 @@ Java_com_ondevice_gsplat_NativeViewer_setBackdropPicture(JNIEnv* env, jobject /*
 
 namespace {
 
-template <typename F>
-std::string face_call(F&& f) {
-  try {
-    std::lock_guard<std::mutex> lock(g_face_mutex);
-    if (!g_face.original) return error_json("파일에서 연 모델에서만 쓸 수 있어요");
-    return f();
-  } catch (const std::exception& e) {
-    return error_json(e.what());
-  }
-}
 
 }  // namespace
 
@@ -436,16 +541,11 @@ Java_com_ondevice_gsplat_NativeViewer_coverFace(JNIEnv* env, jobject /*this*/, j
       scene = std::make_shared<const gs::SplatScene>(gs::cover_face(*g_face.original, g_face.face, options, &stats));
     }
     const auto t1 = std::chrono::steady_clock::now();
-    std::shared_ptr<gs::VkContext> ctx;
-    {
-      std::lock_guard<std::mutex> lock(g_mutex);
-      ctx = context_locked();
-    }
-    viewer().swap_scene(gs::upload_scene(*ctx, *scene));
     g_face.shown = scene;
+    const std::string shown = present_locked();
     gs::JsonWriter w;
     w.begin_object();
-    w.field("ok", true);
+    w.field("ok", shown.find("\"ok\":true") != std::string::npos);
     w.field("count", scene->count);
     w.field("added", stats.added);
     w.field("recoloured", stats.recoloured);
