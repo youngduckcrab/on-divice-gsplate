@@ -202,6 +202,9 @@ if(GS_BUILD_TESTS AND NOT ANDROID)
   target_link_libraries(gs_render PRIVATE gsengine)
   target_include_directories(gs_render PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
+  add_executable(gs_place cli/gs_place.cpp)
+  target_link_libraries(gs_place PRIVATE gsengine)
+
   add_executable(gs_face cli/gs_face.cpp)
   target_link_libraries(gs_face PRIVATE gsengine)
 endif()
