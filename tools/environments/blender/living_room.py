@@ -160,32 +160,44 @@ def rug(centre, size):
 
 
 def foliage():
-    m = principled("foliage", (0.12, 0.24, 0.07), 0.9)
+    m = principled("foliage", (0.06, 0.13, 0.04), 0.9)
     n, l, b = nodes(m)
     noise = n.new("ShaderNodeTexNoise")
     l.new(world_position(m), noise.inputs["Vector"])
-    noise.inputs["Scale"].default_value = 2.0
-    noise.inputs["Detail"].default_value = 8.0
+    noise.inputs["Scale"].default_value = 6.0
+    noise.inputs["Detail"].default_value = 10.0
     ramp = n.new("ShaderNodeValToRGB")
-    ramp.color_ramp.elements[0].color = (0.05, 0.12, 0.03, 1)
-    ramp.color_ramp.elements[1].color = (0.25, 0.40, 0.12, 1)
+    ramp.color_ramp.elements[0].color = (0.02, 0.05, 0.015, 1)
+    ramp.color_ramp.elements[1].color = (0.13, 0.22, 0.06, 1)
     l.new(noise.outputs["Fac"], ramp.inputs["Fac"])
     l.new(ramp.outputs["Color"], b.inputs["Base Color"])
     return m
 
 
 def tree(x, y, r, leaves):
-    """A trunk and a lumpy crown of a few overlapping blobs."""
-    bark = principled("bark", (0.22, 0.16, 0.11), 0.9)
-    cylinder("garden trunk", (x, y, r * 0.6), r * 0.08, r * 1.2, bark, 12)
+    """A trunk with a few limbs and a crown of many small leafy clumps (an
+    ellipsoid of radius `r`), which reads as a tree from indoors."""
+    bark = principled("bark", (0.16, 0.12, 0.09), 0.9)
     rnd = random.Random(int(x * 10 + y))
-    for k in range(5):
-        c = (x + rnd.uniform(-0.45, 0.45) * r, y + rnd.uniform(-0.45, 0.45) * r, r * (1.45 + rnd.uniform(-0.2, 0.4)))
-        bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=3, radius=r * rnd.uniform(0.55, 0.8), location=c)
+    top = mathutils.Vector((x, y, r * 1.5))
+    kit.rod("garden trunk", (x, y, 0), top, r * 0.07, bark)
+    for k in range(4):
+        a = k * math.pi / 2 + rnd.uniform(-0.4, 0.4)
+        end = top + mathutils.Vector((math.cos(a) * r * 0.6, math.sin(a) * r * 0.6, r * rnd.uniform(0.3, 0.7)))
+        kit.rod("garden limb", top - mathutils.Vector((0, 0, r * 0.3)), end, r * 0.035, bark, 8)
+    centre = top + mathutils.Vector((0, 0, r * 0.45))
+    for k in range(22):
+        while True:
+            d = mathutils.Vector((rnd.uniform(-1, 1), rnd.uniform(-1, 1), rnd.uniform(-1, 1)))
+            if d.length <= 1:
+                break
+        c = centre + mathutils.Vector((d.x * r, d.y * r, d.z * r * 0.8))
+        bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=2, radius=r * rnd.uniform(0.28, 0.42), location=c)
         blob = bpy.context.object
         blob.name = "garden crown"
         for v in blob.data.vertices:
-            v.co *= 1.0 + 0.12 * math.sin(7 * v.co.x + 3 * k) * math.cos(5 * v.co.y - k) + 0.08 * math.sin(11 * v.co.z)
+            v.co *= 1.0 + 0.18 * math.sin(9 * v.co.x / r + k) * math.cos(7 * v.co.y / r - k) + 0.1 * math.sin(13 * v.co.z / r)
+        bpy.ops.object.shade_smooth()
         blob.data.materials.append(leaves)
 
 
@@ -265,10 +277,11 @@ def build():
 
     # Outside: a lawn and a low garden wall beyond.
     plane("lawn", (0, D / 2 + 9, -0.3), (30, 18, 1), lawn())
-    box("garden wall", (0, D / 2 + 7, 0.3), (14, 0.3, 1.2), plaster("stone", (0.62, 0.58, 0.52)))
+    box("garden wall", (0, D / 2 + 7, 0.3), (14, 0.3, 1.2), plaster("stone", (0.40, 0.37, 0.33)))
     leaves = foliage()
     box("garden hedge", (0, D / 2 + 6.4, 0.45), (12, 0.9, 1.5), leaves, bevel=0.3)
-    for (x, y, r) in ((-4.5, D / 2 + 9.5, 2.0), (1.5, D / 2 + 11, 2.6), (6.0, D / 2 + 8.5, 1.7)):
+    for (x, y, r) in ((-4.5, D / 2 + 9.5, 2.0), (1.5, D / 2 + 11, 2.6), (6.0, D / 2 + 8.5, 1.7),
+                      (-1.8, D / 2 + 15, 2.4), (4.0, D / 2 + 16, 2.2)):
         tree(x, y, r, leaves)
 
     # The sofa against the -y wall, a rug, a coffee table with flowers.
