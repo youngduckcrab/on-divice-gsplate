@@ -1166,7 +1166,11 @@ FacePlacement guess_face(const SplatScene& scene, const FaceViews& views, const 
   f = normalize(f);
   const Vec3 r = cross(up, f);
   const float radius = views.head.radius;
-  const Vec3 eyes = Vec3(views.head.center) + up * (0.15f * radius);
+  // Eyes a little above the head's centre: about 1 cm for a standing adult
+  // with ordinary hair. Hair raises the top the centre is measured from, by
+  // anything from a little to (with buns) several centimetres, so this is
+  // where the cover starts; the user moves it if needed.
+  const Vec3 eyes = Vec3(views.head.center) + up * (0.06f * radius);
   // Find the surface in front of the eyes.
   OrthoView v;
   (eyes + f * (2.0f * radius)).store(v.origin);

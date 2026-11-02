@@ -202,7 +202,10 @@ void test_place(const Person& p, const gs::FaceViews& views, gs::FacePlacement* 
   const gs::FacePlacement guess = gs::guess_face(p.scene, views, facing);
   const V gc = {guess.center[0], guess.center[1], guess.center[2]};
   EXPECT(guess.found && !guess.detected, "guess not made");
-  EXPECT(len(sub(gc, mid)) < 0.04f, "guessed centre off by %.1f mm", 1000 * len(sub(gc, mid)));
+  // A guess from the head's size alone: this bald head's eyes sit higher than usual.
+  EXPECT(len(sub(gc, mid)) < 0.05f, "guessed centre off by %.1f mm", 1000 * len(sub(gc, mid)));
+  const V gf = {guess.forward[0], guess.forward[1], guess.forward[2]};
+  EXPECT(dot(gf, p.facing) > 0.99f, "guessed forward . facing = %.3f", dot(gf, p.facing));
 }
 
 void test_styles(const Person& p, const gs::FacePlacement& face) {
