@@ -251,17 +251,20 @@ def _arrays(o):
     return world, normals, edges, lengths / np.maximum(counts, 1), counts
 
 
-def bake_and_export(path, samples, spacing_for, median_grey=0.32, smooth_light=4, expose=None):
+def bake_and_export(path, samples, spacing_for, median_grey=0.32, smooth_light=4, expose=None, gain_for=None):
     """Bakes every mesh's light into splats and writes them to `path` (PLY).
     `spacing_for(object)` gives the splat spacing for an object (metres);
     `median_grey` is the scene value (before tone mapping) the median surface
     is exposed to, of the objects `expose(object)` picks if given;
     `smooth_light` how many rings of neighbours the baked light is averaged
-    over (it is path traced, so noisy)."""
+    over (it is path traced, so noisy); `gain_for(object)` scales an object's
+    light after exposure (below 1 for what is seen through a window: the sunny
+    outside is far brighter than the room, and a photographer would hold it
+    back so it is not a white blank)."""
     s = bpy.context.scene
     render_settings(samples)
     lit_meshes, glowing = [], []
-    exposed_names = []
+    exposed_names, gains = [], []
     for o in [o for o in bpy.data.objects if o.type == "MESH"]:
         bpy.context.view_layer.objects.active = o
         o.select_set(True)
@@ -277,6 +280,7 @@ def bake_and_export(path, samples, spacing_for, median_grey=0.32, smooth_light=4
         k = len(lit_meshes)
         lit_meshes.append(o)
         exposed_names.append(bool(expose(o)) if expose else True)
+        gains.append(float(gain_for(o)) if gain_for else 1.0)
         src = o.data.attributes.new("src", "INT", "POINT")
         src.data.foreach_set("value", np.full(len(o.data.vertices), k, dtype=np.int32))
     heavy = {}
@@ -332,7 +336,7 @@ def bake_and_export(path, samples, spacing_for, median_grey=0.32, smooth_light=4
             neighbour[:, c] = (np.bincount(edges[:, 0], e[edges[:, 1], c], n) +
                                np.bincount(edges[:, 1], e[edges[:, 0], c], n))
         e = np.where(counts[:, None] > 0, 0.4 * e + 0.6 * neighbour / np.maximum(counts, 1)[:, None], e)
-    colours = albedo * e
+    colours = albedo * e * np.array(gains)[src][:, None]
     # Surfaces no light reaches are hidden (inside or under things). Judged
     # on the smoothed light: a dim corner gets some from its neighbours, a
     # hidden face has none around it either.
