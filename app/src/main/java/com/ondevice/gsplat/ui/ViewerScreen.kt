@@ -51,7 +51,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ondevice.gsplat.NativeViewer
-import com.ondevice.gsplat.viewer.Backdrop
 import com.ondevice.gsplat.viewer.FaceCover
 import com.ondevice.gsplat.viewer.ViewerViewModel
 import java.io.File
@@ -186,7 +185,7 @@ fun ViewerScreen(
     }
 }
 
-/** What is behind the model: drawn scenes with a floor, or a picture from the phone. */
+/** What is behind the model: photo scenes indoors and out, plain ones, or a photo from the phone. */
 @Composable
 private fun BackdropPanel(vm: ViewerViewModel, onPickPhoto: () -> Unit) {
     Card(Modifier.fillMaxWidth()) {
@@ -195,17 +194,27 @@ private fun BackdropPanel(vm: ViewerViewModel, onPickPhoto: () -> Unit) {
                 Text("배경", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
                 TextButton(onClick = vm::closeBackdropPanel) { Text("닫기") }
             }
-            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                for (choice in Backdrop.entries) {
-                    FilterChip(
-                        selected = vm.backdrop == choice,
-                        onClick = { if (choice == Backdrop.PHOTO) onPickPhoto() else vm.chooseBackdrop(choice) },
-                        label = { Text(choice.label) },
-                    )
+            for ((category, title) in listOf("indoor" to "실내", "outdoor" to "야외", "other" to "기타")) {
+                val choices = vm.backdrops.filter { it.category == category }
+                if (choices.isEmpty()) continue
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(title, style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(32.dp))
+                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        for (choice in choices) {
+                            FilterChip(
+                                selected = vm.backdrop == choice.id,
+                                onClick = { if (choice.id == "photo") onPickPhoto() else vm.chooseBackdrop(choice) },
+                                label = { Text(choice.label) },
+                            )
+                        }
+                    }
                 }
             }
+            CoverSlider("조명", vm.relight, 0f..1f, onChange = vm::changeRelight, onDone = vm::saveRelight)
             Text(
-                vm.backdropStatus.ifEmpty { "내 사진: 가로·세로 2:1 사진(360° 파노라마)은 모델을 둘러싸고, 다른 사진은 뒤에 깔려요" },
+                vm.backdropStatus.ifEmpty {
+                    "조명: 모델에 배경의 빛(색·방향·밝기)을 얼마나 입힐지 · 내 사진: 2:1 사진(360°)은 둘러싸고, 다른 사진은 뒤에 깔려요"
+                },
                 style = MaterialTheme.typography.bodySmall,
             )
         }

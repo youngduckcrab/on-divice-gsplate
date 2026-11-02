@@ -131,7 +131,7 @@ std::unique_ptr<GpuScene> upload_scene(VkContext& ctx, const SplatScene& scene) 
 
 SplatRenderer::SplatRenderer(VkContext& ctx, VkRenderPass render_pass)
     : ctx_(ctx),
-      preprocess_(ctx.create_compute_pipeline(shaders::splat_preprocess, 6, sizeof(PreprocessParams))),
+      preprocess_(ctx.create_compute_pipeline(shaders::splat_preprocess, 7, sizeof(PreprocessParams))),
       sort_(ctx) {
   VkDevice device = ctx_.device();
   pool_ = ctx_.create_descriptor_pool(16, 96);
@@ -256,9 +256,12 @@ void SplatRenderer::attach(GpuScene* scene) {
   sort_binding_ = {};
   if (scene == nullptr) return;
   sort_.reserve(scene->count);
-  preprocess_set_ = ctx_.allocate_set(
-      pool_, preprocess_.set_layout(),
-      {&scene->splats, &scene->sh_rest, &scene->projected, &scene->keys, &scene->order, &scene->draw_args});
+  if (lighting_buffer_.handle() == VK_NULL_HANDLE) {
+    lighting_buffer_ = ctx_.create_buffer(sizeof(SplatLighting), MemoryKind::Device);
+  }
+  preprocess_set_ = ctx_.allocate_set(pool_, preprocess_.set_layout(),
+                                      {&scene->splats, &scene->sh_rest, &scene->projected, &scene->keys,
+                                       &scene->order, &scene->draw_args, &lighting_buffer_});
   draw_set_ = ctx_.allocate_set(pool_, draw_set_layout_, {&scene->projected, &scene->order});
   sort_binding_ = sort_.bind(pool_, scene->keys, scene->order);
 }
@@ -271,6 +274,8 @@ void SplatRenderer::record_prepare(VkCommandBuffer cmd, const Camera& camera) {
                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
                        0, nullptr, 0, nullptr);
   vkCmdFillBuffer(cmd, scene_->draw_args.handle(), 4, 4, 0);  // instanceCount = 0
+  // In the command stream, so frames in flight each read their own lighting.
+  vkCmdUpdateBuffer(cmd, lighting_buffer_.handle(), 0, sizeof(SplatLighting), &lighting_);
   VkContext::barrier(cmd);
 
   PreprocessParams p{};

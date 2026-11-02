@@ -43,10 +43,13 @@ class Viewer {
   void reset_view();
   void set_flip_y(bool flip_y);
   void set_continuous(bool continuous);
-  // What is drawn behind the model, and the picture Photo / Panorama show
-  // (RGBA8, kept so a new window gets it again).
-  void set_backdrop(gs::Backdrop backdrop);
+  // What is drawn behind the model (its ground is filled in from the scene),
+  // and the picture Photo / Panorama show (RGBA8, kept so a new window gets
+  // it again). With `light_from_picture` the light comes from that picture.
+  void set_backdrop(gs::BackdropView view, bool light_from_picture);
   void set_picture(std::vector<uint8_t> rgba, uint32_t width, uint32_t height);
+  // How much the model takes the backdrop's light: 0 as captured, 1 fully.
+  void set_relight(float strength);
 
   std::string stats_json();
 
@@ -75,7 +78,7 @@ class Viewer {
   void create_swapchain();
   void destroy_swapchain();
   // Returns false when the swapchain is out of date.
-  bool draw_frame(const gs::OrbitCamera& orbit, gs::Backdrop backdrop, const gs::Ground& ground);
+  bool draw_frame(const gs::OrbitCamera& orbit, const gs::BackdropView& backdrop, float relight);
   void read_timestamps(uint32_t frame);
 
   std::shared_ptr<gs::VkContext> ctx_;
@@ -95,7 +98,8 @@ class Viewer {
   gs::OrbitCamera orbit_;
   gs::SceneBounds bounds_{{0.0f, 0.0f, 0.0f}, 1.0f};
   gs::Ground ground_;
-  gs::Backdrop backdrop_ = gs::Backdrop::Plain;
+  gs::BackdropView backdrop_;
+  float relight_ = 1.0f;
   std::shared_ptr<const std::vector<uint8_t>> picture_;
   uint32_t picture_width_ = 0;
   uint32_t picture_height_ = 0;

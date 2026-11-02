@@ -2,6 +2,7 @@
 #include <zlib.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -162,11 +163,13 @@ gs::OrbitCamera front_camera() {
 }
 
 std::vector<uint8_t> render(gs::VkContext& ctx, const gs::SplatScene& scene, const gs::OrbitCamera& orbit,
-                            uint32_t w, uint32_t h, uint32_t* visible = nullptr) {
+                            uint32_t w, uint32_t h, uint32_t* visible = nullptr,
+                            const gs::SplatLighting* lighting = nullptr) {
   auto gpu = gs::upload_scene(ctx, scene);
   gs::OffscreenTarget target(ctx, w, h);
   gs::SplatRenderer renderer(ctx, target.render_pass());
   renderer.attach(gpu.get());
+  if (lighting != nullptr) renderer.set_lighting(*lighting);
   const gs::Camera camera = orbit.camera(w, h);
   const float clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
   ctx.run([&](VkCommandBuffer cmd) {
@@ -303,23 +306,39 @@ void test_backdrop(gs::VkContext& ctx) {
   ground.found = true;
   ground.low = 0.0f;
   ground.high = 1.7f;
+  // An asymmetric picture: a gradient across, bands down.
+  std::vector<uint8_t> pano(64 * 32 * 4);
+  for (uint32_t y = 0; y < 32; ++y) {
+    for (uint32_t x = 0; x < 64; ++x) {
+      uint8_t* q = &pano[(y * 64 + x) * 4];
+      q[0] = uint8_t(x * 4);
+      q[1] = uint8_t((y / 4) % 2 ? 200 : 40);
+      q[2] = uint8_t(255 - y * 8);
+      q[3] = 255;
+    }
+  }
   auto draw = [&](gs::Backdrop kind, uint32_t rotation, const std::vector<uint8_t>& picture = {},
-                  const gs::Camera* level = nullptr) {
+                  const gs::Camera* level = nullptr, uint32_t pw = 64, uint32_t ph = 32) {
     const bool swap = (rotation & 1u) != 0;
     gs::OffscreenTarget target(ctx, swap ? h : w, swap ? w : h);
     gs::BackgroundRenderer background(ctx, target.render_pass());
-    if (!picture.empty()) background.set_picture(picture.data(), 8, 4);
+    if (!picture.empty()) background.set_picture(picture.data(), pw, ph);
+    gs::BackdropView view;
+    view.kind = kind;
+    view.ground = ground;
+    view.blur = 0.0f;
+    if (kind == gs::Backdrop::Studio) view.light = gs::studio_light();
     const float clear[4] = {1, 0, 1, 1};
     ctx.run([&](VkCommandBuffer cmd) {
       target.record(cmd, clear, [&](VkCommandBuffer c) {
-        background.record(c, kind, ground, level ? *level : camera, false, rotation);
+        background.record(c, view, level ? *level : camera, false, rotation);
       });
     });
     return target.pixels();
   };
-  const std::vector<uint8_t> upright = draw(gs::Backdrop::Checker, 0);
+  const std::vector<uint8_t> upright = draw(gs::Backdrop::Panorama, 0, pano);
   for (uint32_t rotation : {1u, 2u, 3u}) {
-    const std::vector<uint8_t> turned = draw(gs::Backdrop::Checker, rotation);
+    const std::vector<uint8_t> turned = draw(gs::Backdrop::Panorama, rotation, pano);
     const bool swap = (rotation & 1u) != 0;
     const uint32_t fw = swap ? h : w, fh = swap ? w : h;
     double diff = 0;
@@ -332,10 +351,10 @@ void test_backdrop(gs::VkContext& ctx) {
         if (rotation == 2) nx = -fx, ny = -fy;
         if (rotation == 3) nx = -fy, ny = fx;
         const uint32_t x = uint32_t((nx + 1) * 0.5f * w), y = uint32_t((ny + 1) * 0.5f * h);
-        diff += std::abs(int(pixel(turned, fw, i, j)[1]) - int(pixel(upright, w, x, y)[1]));
+        for (int c = 0; c < 3; ++c) diff += std::abs(int(pixel(turned, fw, i, j)[c]) - int(pixel(upright, w, x, y)[c]));
       }
     }
-    diff /= double(fw * fh);
+    diff /= double(fw * fh * 3);
     EXPECT(diff < 2.0, "backdrop under rotation %u differs from upright by %.2f", rotation, diff);
   }
   // Studio: the floor right under the model is darker than the floor beside it.
@@ -361,18 +380,58 @@ void test_backdrop(gs::VkContext& ctx) {
   gs::OrbitCamera level_orbit = orbit;
   level_orbit.pitch = 0.0f;
   const gs::Camera level = level_orbit.camera(w, h);
-  std::vector<uint8_t> pano(8 * 4 * 4);
+  std::vector<uint8_t> sky(8 * 4 * 4);
   for (uint32_t y = 0; y < 4; ++y) {
     for (uint32_t x = 0; x < 8; ++x) {
-      uint8_t* q = &pano[(y * 8 + x) * 4];
+      uint8_t* q = &sky[(y * 8 + x) * 4];
       q[0] = y < 2 ? 255 : 0;
       q[2] = y < 2 ? 0 : 255;
       q[3] = 255;
     }
   }
-  const std::vector<uint8_t> around = draw(gs::Backdrop::Panorama, 0, pano, &level);
+  const std::vector<uint8_t> around = draw(gs::Backdrop::Panorama, 0, sky, &level, 8, 4);
   EXPECT(pixel(around, w, w / 2, 0)[0] > 200, "panorama top should be sky (red)");
   EXPECT(pixel(around, w, 2, h - 1)[2] > 150, "panorama bottom should be ground (blue)");
+}
+
+// Relighting: a grey splat takes the colour and brightness of the light, and
+// strength 0 leaves it as captured.
+void test_relight(gs::VkContext& ctx) {
+  const uint32_t w = 64, h = 64;
+  gs::SplatScene scene = make_scene({{{0, 0, 0}, 0.1f, {0.6f, 0.6f, 0.6f}, 0.99f}});
+  // Two of them, so the "middle" the normals turn away from is not the splat itself.
+  gs::Ground ground;
+  ground.found = true;
+  ground.low = -1.0f;
+  ground.high = 1.0f;
+  ground.centre[0] = 0.0f;
+  ground.centre[1] = -0.5f;  // behind the splat: its normal faces the camera
+  gs::EnvLight light;
+  light.on = true;
+  // Uniform warm light: only the constant term, red twice green, no blue.
+  const float dc = 1.0f / 0.282095f;
+  light.sh[0] = 1.6f * dc;
+  light.sh[1] = 0.8f * dc;
+  light.sh[2] = 0.0f;
+  auto centre = [&](const gs::SplatLighting* l) {
+    const std::vector<uint8_t> img = render(ctx, scene, front_camera(), w, h, nullptr, l);
+    return std::array<int, 3>{img[(32 * w + 32) * 4], img[(32 * w + 32) * 4 + 1], img[(32 * w + 32) * 4 + 2]};
+  };
+  const auto plain = centre(nullptr);
+  const gs::SplatLighting off = gs::splat_lighting(light, ground, false, 0.0f);
+  const auto unlit = centre(&off);
+  EXPECT(unlit == plain, "strength 0 changed the colour (%d %d %d vs %d %d %d)", unlit[0], unlit[1], unlit[2], plain[0],
+         plain[1], plain[2]);
+  const gs::SplatLighting full = gs::splat_lighting(light, ground, false, 1.0f);
+  const auto lit = centre(&full);
+  EXPECT(lit[0] > plain[0] + 20 && lit[1] < plain[1] && lit[2] < 20, "warm light: %d %d %d from %d %d %d", lit[0],
+         lit[1], lit[2], plain[0], plain[1], plain[2]);
+  // A dim place (night): darker.
+  gs::EnvLight dim = light;
+  for (float& v : dim.sh) v *= 0.3f;
+  const gs::SplatLighting night = gs::splat_lighting(dim, ground, false, 1.0f);
+  const auto dark = centre(&night);
+  EXPECT(dark[0] < lit[0] - 40, "dim light should darken: %d vs %d", dark[0], lit[0]);
 }
 
 int main() {
@@ -385,6 +444,7 @@ int main() {
     test_flip_equivalence(ctx);
     test_synthetic_render(ctx);
     test_backdrop(ctx);
+    test_relight(ctx);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FAIL: exception: %s\n", e.what());
     return 1;

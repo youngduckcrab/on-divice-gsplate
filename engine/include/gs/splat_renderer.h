@@ -22,6 +22,20 @@ struct GpuScene {
   Buffer draw_args;  // VkDrawIndirectCommand; instanceCount = visible splats (host visible)
 };
 
+// Relighting of the splats to match a backdrop (see gs::splat_lighting): each
+// splat's captured colour is multiplied, in linear light, by the irradiance
+// the backdrop casts on it, its normal taken from its thinnest axis (turned
+// away from the model's middle) or, for round splats, from the middle out,
+// plus a rim of the main light where the surface turns away from the camera
+// towards that light (a backlit outline).
+struct SplatLighting {
+  float sh[9][4] = {};                    // irradiance SH, rgb + unused, display space
+  float centre[4] = {0, 0, 0, 0};         // the model's middle in scene coordinates; w: strength (0: off)
+  float display[4] = {1, 0, 0, 0};        // x: sign taking scene y and z to display (-1 when flipped)
+  float key[4] = {0, 1, 0, 0};            // main light direction, display space
+  float rim[4] = {0, 0, 0, 0};            // rim light colour and intensity (rgb)
+};
+
 // Throws std::runtime_error if the scene exceeds the device's buffer limits.
 // Lowers the SH degree if the coefficients would not fit a single binding.
 std::unique_ptr<GpuScene> upload_scene(VkContext& ctx, const SplatScene& scene);
@@ -42,6 +56,9 @@ class SplatRenderer {
   // Binds `scene` (may be null). The GPU must be done with the previous scene.
   void attach(GpuScene* scene);
   GpuScene* scene() const { return scene_; }
+
+  // Takes effect from the next record_prepare.
+  void set_lighting(const SplatLighting& lighting) { lighting_ = lighting; }
 
   // Projection + depth sort. Record outside a render pass.
   void record_prepare(VkCommandBuffer cmd, const Camera& camera);
@@ -66,6 +83,8 @@ class SplatRenderer {
   VkDescriptorSet preprocess_set_ = VK_NULL_HANDLE;
   VkDescriptorSet draw_set_ = VK_NULL_HANDLE;
   RadixSort::Binding sort_binding_;
+  SplatLighting lighting_;
+  Buffer lighting_buffer_;
 };
 
 }  // namespace gs

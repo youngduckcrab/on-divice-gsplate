@@ -24,6 +24,7 @@
 #include "gs/device_probe.h"
 #include "gs/face_cover.h"
 #include "gs/json.h"
+#include "gs/json_parse.h"
 #include "gs/splat_renderer.h"
 #include "gs/splat_scene.h"
 #include "gs/train_selftest.h"
@@ -270,15 +271,46 @@ Java_com_ondevice_gsplat_NativeViewer_stats(JNIEnv* env, jobject /*this*/) {
 // --- Backdrop (NativeViewer) ------------------------------------------------------
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_ondevice_gsplat_NativeViewer_setBackdrop(JNIEnv* env, jobject /*this*/, jstring jname) {
-  gs::Backdrop backdrop;
-  if (!gs::parse_backdrop(from_jstring(env, jname), &backdrop)) return JNI_FALSE;
+Java_com_ondevice_gsplat_NativeViewer_setBackdrop(JNIEnv* env, jobject /*this*/, jstring jname, jstring jsettings) {
+  gs::BackdropView view;
+  if (!gs::parse_backdrop(from_jstring(env, jname), &view.kind)) return JNI_FALSE;
+  const std::string settings = jsettings != nullptr ? from_jstring(env, jsettings) : std::string();
+  try {
+    if (!settings.empty()) {
+      const gs::JsonValue s = gs::parse_json(settings);
+      view.yaw_deg = float(s.number_or("yaw", 0.0));
+      view.camera_height = float(s.number_or("camera_height", view.camera_height));
+      view.radius = float(s.number_or("radius", view.radius));
+      view.blur = float(s.number_or("blur", view.blur));
+      gs::EnvLight& l = view.light;
+      auto numbers = [&](const char* key, float* out, int n) {
+        const gs::JsonValue* a = s.find(key);
+        if (a == nullptr || a->type != gs::JsonValue::Type::Array || int(a->array.size()) < n) return false;
+        for (int k = 0; k < n; ++k) out[k] = float(a->array[size_t(k)].number);
+        return true;
+      };
+      l.on = numbers("sh", l.sh, 27);
+      numbers("key", l.key, 3);
+      numbers("key_color", l.key_color, 3);
+      l.key_share = float(s.number_or("key_share", 0.0));
+    }
+  } catch (const std::exception&) {
+    return JNI_FALSE;
+  }
+  if (view.kind == gs::Backdrop::Studio) view.light = gs::studio_light();
+  const bool from_picture =
+      (view.kind == gs::Backdrop::Photo || view.kind == gs::Backdrop::Panorama) && !view.light.on;
   bool ok = false;
   with_viewer([&](Viewer& v) {
-    v.set_backdrop(backdrop);
+    v.set_backdrop(view, from_picture);
     ok = true;
   });
   return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_ondevice_gsplat_NativeViewer_setRelight(JNIEnv*, jobject, jfloat strength) {
+  with_viewer([&](Viewer& v) { v.set_relight(strength); });
 }
 
 extern "C" JNIEXPORT jboolean JNICALL

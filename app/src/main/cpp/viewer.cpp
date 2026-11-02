@@ -146,9 +146,29 @@ void Viewer::set_continuous(bool continuous) {
   request_redraw();
 }
 
-void Viewer::set_backdrop(gs::Backdrop backdrop) {
+void Viewer::set_backdrop(gs::BackdropView view, bool light_from_picture) {
+  if (light_from_picture) {
+    std::shared_ptr<const std::vector<uint8_t>> picture;
+    uint32_t width = 0, height = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      picture = picture_;
+      width = picture_width_;
+      height = picture_height_;
+    }
+    if (picture) {
+      view.light = gs::light_from_picture(picture->data(), width, height, view.kind == gs::Backdrop::Panorama,
+                                          view.yaw_deg);
+    }
+  }
   std::lock_guard<std::mutex> lock(mutex_);
-  backdrop_ = backdrop;
+  backdrop_ = view;
+  request_redraw();
+}
+
+void Viewer::set_relight(float strength) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  relight_ = strength;
   request_redraw();
 }
 
@@ -215,8 +235,8 @@ void Viewer::render_loop() {
     int fps_frames = 0;
     while (true) {
       gs::OrbitCamera orbit;
-      gs::Backdrop backdrop = gs::Backdrop::Plain;
-      gs::Ground ground;
+      gs::BackdropView backdrop;
+      float relight = 1.0f;
       std::shared_ptr<const std::vector<uint8_t>> picture;
       uint32_t picture_width = 0, picture_height = 0;
       uint64_t picture_version = 0;
@@ -234,7 +254,8 @@ void Viewer::render_loop() {
         continuous = continuous_;
         orbit = orbit_;
         backdrop = backdrop_;
-        ground = ground_;
+        backdrop.ground = ground_;
+        relight = relight_;
         if (picture_version_ != picture_uploaded_ && picture_) {
           picture = picture_;
           picture_width = picture_width_;
@@ -265,7 +286,7 @@ void Viewer::render_loop() {
         continue;
       }
 
-      if (!draw_frame(orbit, backdrop, ground)) {
+      if (!draw_frame(orbit, backdrop, relight)) {
         std::lock_guard<std::mutex> lock(mutex_);
         resized_ = true;
         redraw_ = true;
@@ -539,7 +560,7 @@ void Viewer::read_timestamps(uint32_t frame) {
   stats_.draw_ms = stats_.draw_ms == 0.0 ? draw : 0.8 * stats_.draw_ms + 0.2 * draw;
 }
 
-bool Viewer::draw_frame(const gs::OrbitCamera& orbit, gs::Backdrop backdrop, const gs::Ground& ground) {
+bool Viewer::draw_frame(const gs::OrbitCamera& orbit, const gs::BackdropView& backdrop, float relight) {
   VkDevice device = ctx_->device();
   Frame& f = frames_[frame_index_];
   GS_VK_CHECK(vkWaitForFences(device, 1, &f.fence, VK_TRUE, UINT64_MAX));
@@ -565,6 +586,7 @@ bool Viewer::draw_frame(const gs::OrbitCamera& orbit, gs::Backdrop backdrop, con
     vkCmdResetQueryPool(f.cmd, query_pool_, q, 3);
     vkCmdWriteTimestamp(f.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, query_pool_, q);
   }
+  renderer_->set_lighting(gs::splat_lighting(backdrop.light, backdrop.ground, orbit.flip_y(), relight));
   renderer_->record_prepare(f.cmd, camera);
   if (query_pool_ != VK_NULL_HANDLE) {
     vkCmdWriteTimestamp(f.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, query_pool_, q + 1);
@@ -582,7 +604,7 @@ bool Viewer::draw_frame(const gs::OrbitCamera& orbit, gs::Backdrop backdrop, con
   pass.clearValueCount = 1;
   pass.pClearValues = &clear;
   vkCmdBeginRenderPass(f.cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
-  background_->record(f.cmd, backdrop, ground, camera, orbit.flip_y(), rotation_);
+  background_->record(f.cmd, backdrop, camera, orbit.flip_y(), rotation_);
   renderer_->record_draw(f.cmd, width, height, rotation_);
   vkCmdEndRenderPass(f.cmd);
   if (query_pool_ != VK_NULL_HANDLE) {

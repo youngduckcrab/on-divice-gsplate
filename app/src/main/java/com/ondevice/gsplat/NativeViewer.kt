@@ -37,11 +37,15 @@ object NativeViewer {
     external fun stats(): String
 
     /**
-     * What is drawn behind the model: plain, studio, dark, park, checker, sunset, night (scenes with
-     * a floor and a shadow under the model, turning with it), photo (the picture behind) or
-     * panorama (a 360-degree picture around). False if the name is unknown.
+     * What is drawn behind the model: plain, studio (white, with a floor and a shadow), photo (the
+     * picture behind, fixed) or panorama (a 360-degree picture around, its floor under the model).
+     * [settings] is a photo scene's manifest entry (assets/backdrops/manifest.json: placement and
+     * light); without one, a photo's light is measured from the picture. False if unknown.
      */
-    external fun setBackdrop(name: String): Boolean
+    external fun setBackdrop(name: String, settings: String?): Boolean
+
+    /** How much the model takes the backdrop's light: 0 as captured, 1 fully. */
+    external fun setRelight(strength: Float)
 
     /** The picture for the photo and panorama backdrops, as ARGB_8888 pixels. */
     external fun setBackdropPicture(argb: IntArray, width: Int, height: Int): Boolean

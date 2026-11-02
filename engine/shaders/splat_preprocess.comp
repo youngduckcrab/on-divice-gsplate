@@ -24,6 +24,15 @@ layout(std430, binding = 5) buffer DrawArgs {
   uint first_instance;
 } draw_args;
 
+// Relighting by the backdrop's light (gs::SplatLighting); strength 0 is off.
+layout(std430, binding = 6) readonly buffer Lighting {
+  vec4 sh[9];     // irradiance SH (rgb), display space
+  vec4 centre;    // the model's middle (scene); w: strength
+  vec4 display;   // x: sign taking scene y and z to display
+  vec4 key;       // main light direction (display)
+  vec4 rim;       // rim light colour (rgb)
+} light;
+
 layout(push_constant) uniform Params {
   vec4 rot0;        // scene -> camera rotation row 0, w = translation x
   vec4 rot1;
@@ -74,6 +83,59 @@ vec3 eval_sh(vec3 dc, uint degree, uint base, vec3 d) {
     }
   }
   return max(c + 0.5, vec3(0.0));
+}
+
+vec3 srgb_to_linear(vec3 c) {
+  return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
+}
+
+vec3 linear_to_srgb(vec3 c) {
+  return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
+}
+
+vec3 irradiance(vec3 n) {
+  const float x = n.x, y = n.y, z = n.z;
+  return light.sh[0].rgb * 0.282095 + light.sh[1].rgb * (0.488603 * y) + light.sh[2].rgb * (0.488603 * z) +
+         light.sh[3].rgb * (0.488603 * x) + light.sh[4].rgb * (1.092548 * x * y) +
+         light.sh[5].rgb * (1.092548 * y * z) + light.sh[6].rgb * (0.315392 * (3.0 * z * z - 1.0)) +
+         light.sh[7].rgb * (1.092548 * x * z) + light.sh[8].rgb * (0.546274 * (x * x - y * y));
+}
+
+// The splat's colour lit by the backdrop. Its normal is its thinnest axis
+// turned away from the model's middle, leaning to "away from the middle" the
+// rounder the splat is (and half way even for flat ones: trained splats'
+// axes are noisy). Like a camera exposing for the subject, the light is
+// partly normalised by what falls on the side facing the camera, and its
+// direction is softened: a 2-band SH of a sunny sky is harsher than a photo
+// of a person in it looks.
+vec3 relight(vec3 color, vec3 p, mat3 R, vec3 scale, vec3 to_camera, vec3 middle_to_camera) {
+  vec3 out_dir = p - light.centre.xyz;
+  const float len = length(out_dir);
+  out_dir = len > 1e-6 ? out_dir / len : vec3(0.0, 1.0, 0.0);
+  int thin = scale.x < scale.y ? (scale.x < scale.z ? 0 : 2) : (scale.y < scale.z ? 1 : 2);
+  const float smallest = scale[thin];
+  const float middle = max(min(max(scale.x, scale.y), max(min(scale.x, scale.y), scale.z)), 1e-9);
+  vec3 axis = R[thin];
+  if (dot(axis, out_dir) < 0.0) axis = -axis;
+  const float flatness = 0.5 * clamp(1.0 - smallest / middle, 0.0, 1.0);
+  vec3 n = normalize(mix(out_dir, axis, flatness));
+  // Normal and view directions in display space, where the light is.
+  const float s = light.display.x;
+  n = vec3(n.x, n.y * s, n.z * s);
+  const vec3 v = vec3(to_camera.x, to_camera.y * s, to_camera.z * s);
+  const vec3 vm = vec3(middle_to_camera.x, middle_to_camera.y * s, middle_to_camera.z * s);
+  const vec3 ambient = light.sh[0].rgb * 0.282095;
+  const vec3 lit_n = mix(ambient, max(irradiance(n), vec3(0.0)), 0.6);
+  const vec3 lit_v = mix(ambient, max(irradiance(vm), vec3(0.0)), 0.6);
+  const vec3 luma = vec3(0.2126, 0.7152, 0.0722);
+  const float exposure = mix(1.0, dot(lit_v, luma) / max(dot(ambient, luma), 1e-4), 0.5);
+  // Rim: grazing to the camera, facing the light (strongest when the light is behind the model).
+  const float grazing = pow(1.0 - clamp(dot(n, v), 0.0, 1.0), 3.0);
+  const float facing = clamp(dot(n, light.key.xyz) * 0.75 + 0.25, 0.0, 1.0);
+  const float behind = clamp(0.5 - 0.5 * dot(v, light.key.xyz), 0.0, 1.0);
+  const vec3 gain = lit_n / max(exposure, 0.25) + light.rim.rgb * (grazing * facing * (0.3 + 0.7 * behind));
+  const vec3 lit = linear_to_srgb(min(srgb_to_linear(min(color, vec3(1.0))) * gain, vec3(1.0)));
+  return mix(color, lit, light.centre.w);
 }
 
 mat3 quat_to_matrix(vec4 q) {
@@ -151,6 +213,10 @@ void main() {
         uint coeffs = degree == 0u ? 0u : (degree + 1u) * (degree + 1u) - 1u;
         uint stride = (coeffs * 3u + 1u) / 2u;
         vec3 color = eval_sh(s.sh_dc.xyz, degree, i * stride, normalize(p - pc.cam_pos.xyz));
+        if (light.centre.w > 0.0) {
+          color = relight(color, p, R, s.scale.xyz, normalize(pc.cam_pos.xyz - p),
+                          normalize(pc.cam_pos.xyz - light.centre.xyz));
+        }
         out0 = uvec4(floatBitsToUint(center), floatBitsToUint(axis1));
         out1 = uvec4(floatBitsToUint(axis2), packHalf2x16(color.rg), packHalf2x16(vec2(color.b, opacity)));
         // Log depth spreads the 16-bit key evenly across scales; far splats get small keys.

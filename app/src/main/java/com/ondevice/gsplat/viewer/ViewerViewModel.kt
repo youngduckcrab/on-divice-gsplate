@@ -3,6 +3,7 @@ package com.ondevice.gsplat.viewer
 import android.app.Application
 import android.content.ContentResolver
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
@@ -33,17 +34,16 @@ enum class FaceCover(val id: String, val label: String) {
     SMILE("smile", "스마일"),
 }
 
-/** What is drawn behind the model (NativeViewer.setBackdrop names). */
-enum class Backdrop(val id: String, val label: String) {
-    PLAIN("plain", "기본"),
-    STUDIO("studio", "흰 스튜디오"),
-    DARK("dark", "어두운 무대"),
-    PARK("park", "하늘·잔디"),
-    CHECKER("checker", "체크 바닥"),
-    SUNSET("sunset", "노을"),
-    NIGHT("night", "밤하늘"),
-    PHOTO("photo", "내 사진"),
-}
+/**
+ * Something to show behind the model: a photo scene shipped with the app (assets/backdrops, a
+ * 360-degree photo with the light it casts), the plain grey, the white studio, or the user's photo.
+ */
+data class BackdropChoice(
+    val id: String,
+    val label: String,
+    val category: String,  // "indoor", "outdoor" or "other"
+    val settings: JSONObject? = null,  // manifest entry of a photo scene
+)
 
 /**
  * What the viewer shows, for the life of the process. The native scene (and a
@@ -59,6 +59,10 @@ private object ViewerSession {
 }
 
 class ViewerViewModel(application: Application) : AndroidViewModel(application) {
+    private companion object {
+        const val PHOTO = "photo"
+    }
+
     val loadError: String? = NativeBridge.loadError
 
     var status by mutableStateOf("")
@@ -95,7 +99,12 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
     var faceRaise by mutableFloatStateOf(0.0f)
     private var coverAgain = false
 
-    var backdrop by mutableStateOf(Backdrop.PLAIN)
+    /** Photo scenes from assets/backdrops/manifest.json, then the built-in ones. */
+    val backdrops: List<BackdropChoice> = loadBackdrops()
+    var backdrop by mutableStateOf("plain")
+        private set
+    /** How much the model takes the backdrop's light (0..1). */
+    var relight by mutableFloatStateOf(1.0f)
         private set
     var backdropOpen by mutableStateOf(false)
         private set
@@ -228,14 +237,67 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
         backdropOpen = false
     }
 
-    /** A drawn backdrop; the photo one goes through [usePhoto]. */
-    fun chooseBackdrop(choice: Backdrop) {
-        if (choice == Backdrop.PHOTO) return
-        if (NativeViewer.setBackdrop(choice.id)) {
-            backdrop = choice
-            backdropStatus = ""
-            prefs.edit().putString("backdrop", choice.id).apply()
+    /** A backdrop from the list; the user's photo goes through [usePhoto]. */
+    fun chooseBackdrop(choice: BackdropChoice) {
+        if (choice.id == PHOTO) return
+        val settings = choice.settings
+        if (settings == null) {
+            if (NativeViewer.setBackdrop(choice.id, null)) {
+                backdrop = choice.id
+                backdropStatus = ""
+                prefs.edit().putString("backdrop", choice.id).apply()
+            }
+            return
         }
+        viewModelScope.launch {
+            backdropStatus = "${choice.label} 불러오는 중…"
+            val ok = withContext(Dispatchers.Default) {
+                runCatching {
+                    val options = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
+                    val bitmap = getApplication<Application>().assets.open("backdrops/${settings.getString("file")}")
+                        .use { BitmapFactory.decodeStream(it, null, options) } ?: error("그림을 읽지 못했어요")
+                    val pixels = IntArray(bitmap.width * bitmap.height)
+                    bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+                    val width = bitmap.width
+                    val height = bitmap.height
+                    bitmap.recycle()
+                    NativeViewer.setBackdropPicture(pixels, width, height) &&
+                        NativeViewer.setBackdrop("panorama", settings.toString())
+                }.getOrDefault(false)
+            }
+            if (ok) {
+                backdrop = choice.id
+                backdropStatus = ""
+                prefs.edit().putString("backdrop", choice.id).apply()
+            } else {
+                backdropStatus = "${choice.label}을(를) 불러오지 못했어요"
+            }
+        }
+    }
+
+    fun changeRelight(value: Float) {
+        relight = value
+        NativeViewer.setRelight(value)
+    }
+
+    fun saveRelight() {
+        prefs.edit().putFloat("relight", relight).apply()
+    }
+
+    private fun loadBackdrops(): List<BackdropChoice> {
+        val scenes = runCatching {
+            val text = getApplication<Application>().assets.open("backdrops/manifest.json").bufferedReader().use { it.readText() }
+            val list = org.json.JSONArray(text)
+            (0 until list.length()).map { i ->
+                val e = list.getJSONObject(i)
+                BackdropChoice(e.getString("id"), e.getString("label"), e.optString("category", "other"), e)
+            }
+        }.getOrDefault(emptyList())
+        return scenes + listOf(
+            BackdropChoice("plain", "기본", "other"),
+            BackdropChoice("studio", "흰 스튜디오", "other"),
+            BackdropChoice(PHOTO, "내 사진", "other"),
+        )
     }
 
     /**
@@ -251,9 +313,9 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
             backdropStatus = "사진 불러오는 중…"
             val result = withContext(Dispatchers.Default) { runCatching { decodeBackdrop(uri) } }
             result.onSuccess { panorama ->
-                if (NativeViewer.setBackdrop(if (panorama) "panorama" else "photo")) {
-                    backdrop = Backdrop.PHOTO
-                    prefs.edit().putString("backdrop", Backdrop.PHOTO.id).putString("backdrop_photo", uri.toString()).apply()
+                if (NativeViewer.setBackdrop(if (panorama) "panorama" else "photo", null)) {
+                    backdrop = PHOTO
+                    prefs.edit().putString("backdrop", PHOTO).putString("backdrop_photo", uri.toString()).apply()
                     backdropStatus = if (panorama) {
                         "360° 사진으로 둘렀어요 (모델과 함께 돌아가요)"
                     } else {
@@ -293,10 +355,11 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun restoreBackdrop() {
+        relight = prefs.getFloat("relight", 1.0f)
+        NativeViewer.setRelight(relight)
         val id = prefs.getString("backdrop", null) ?: return
-        val choice = Backdrop.entries.firstOrNull { it.id == id } ?: return
-        if (choice != Backdrop.PHOTO) {
-            chooseBackdrop(choice)
+        if (id != PHOTO) {
+            backdrops.firstOrNull { it.id == id }?.let(::chooseBackdrop)
             return
         }
         val uri = prefs.getString("backdrop_photo", null)?.let(Uri::parse) ?: return

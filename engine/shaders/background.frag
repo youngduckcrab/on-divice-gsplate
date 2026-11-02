@@ -1,8 +1,16 @@
 #version 450
-// A backdrop behind the splats: procedural rooms and skies with a floor under
-// the subject and a soft shadow, a photo behind, or a 360-degree panorama
-// around. Rays come from the same camera the splats are drawn with, in the
-// viewer's display space (y up), so the backdrop turns with the model.
+// A backdrop behind the splats: a 360-degree photo around the model (with its
+// floor under the model's feet), a photo behind it, or a white studio. Rays
+// come from the camera the splats are drawn with, in the viewer's display
+// space (y up), so the backdrop turns with the model.
+//
+// Panoramas are "ground projected": the photo is taken to have been shot
+// `camera_height` above a flat floor, with the surroundings `radius` away. A
+// ray that meets the floor near the model samples the photo's floor where
+// the photo saw that spot, so the model stands on it as the view turns.
+// Like a camera focused on the model, the farther something is from the
+// model's distance the blurrier it gets (the picture's mip levels). A soft
+// shadow pools under the model and falls away from the main light.
 layout(binding = 0) uniform sampler2D picture;
 
 layout(push_constant) uniform Params {
@@ -10,45 +18,47 @@ layout(push_constant) uniform Params {
   vec4 axis_y;  // camera y (down) axis; w: fy
   vec4 axis_z;  // camera forward; w: cx
   vec4 eye;     // camera centre; w: cy
-  vec4 ground;  // floor height, shadow centre x, shadow centre z, shadow radius
-  vec4 extra;   // picture aspect (width / height), scene scale (subject height), unused, unused
-  uvec4 info;   // logical width, height, surface rotation (quarter turns), backdrop
+  vec4 ground;  // floor height, model centre x, model centre z, model height
+  vec4 env;     // panorama turn (radians), camera height, radius (display units), blur
+  vec4 key;     // direction the main light comes from (unit), shadow strength
+  uvec4 info;   // logical width, height, rotation | backdrop << 8, picture aspect (float bits)
 } pc;
 
 layout(location = 0) out vec4 out_color;
 
-const uint kPlain = 0u, kStudio = 1u, kDark = 2u, kPark = 3u, kChecker = 4u, kSunset = 5u, kNight = 6u,
-           kPhoto = 7u, kPanorama = 8u;
+const uint kPlain = 0u, kStudio = 1u, kPhoto = 2u, kPanorama = 3u;
 const float kPi = 3.14159265;
 
-float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
-float hash3(vec3 p) { return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
-float noise(vec2 p) {
-  vec2 i = floor(p), f = fract(p);
-  vec2 u = f * f * (3.0 - 2.0 * f);
-  return mix(mix(hash(i), hash(i + vec2(1, 0)), u.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), u.x), u.y);
+// How much light reaches the floor at xz: a pool of shade under the model and
+// its shadow stretched away from the main light.
+float shadow(vec2 xz) {
+  const float h = max(pc.ground.w, 1e-3);
+  const vec2 q = (xz - pc.ground.yz) / h;
+  float lit = 1.0 - 0.42 * exp(-dot(q, q) / 0.035);
+  const vec2 away = -pc.key.xz;
+  const float horizontal = length(away);
+  if (pc.key.w > 0.0 && horizontal > 1e-3 && pc.key.y > 0.05) {
+    const vec2 dir = away / horizontal;
+    // A standing model's shadow is about height / tan(elevation) long.
+    const float len = clamp(horizontal / pc.key.y, 0.25, 2.5);
+    const float along = dot(q, dir), across = dot(q, vec2(-dir.y, dir.x));
+    const float a = (along - 0.5 * len) / (0.5 * len + 0.08);
+    const float width = 0.16 + 0.04 * len;
+    lit *= 1.0 - pc.key.w * exp(-a * a * 1.6 - across * across / (width * width));
+  }
+  return lit;
 }
 
-// Checkerboard filtered over the pixel's footprint (no shimmer towards the horizon).
-float checker(vec2 p) {
-  vec2 w = fwidth(p) + 1e-4;
-  vec2 i = 2.0 * (abs(fract((p - 0.5 * w) * 0.5) - 0.5) - abs(fract((p + 0.5 * w) * 0.5) - 0.5)) / w;
-  return 0.5 - 0.5 * i.x * i.y;
-}
-
-// Darker under the subject, fading out over the shadow radius.
-float shadow(vec2 xz, float strength) {
-  vec2 q = (xz - pc.ground.yz) / max(pc.ground.w, 1e-4);
-  return 1.0 - strength * exp(-dot(q, q));
-}
-
-vec3 sky(vec3 d, vec3 horizon, vec3 zenith, float power) {
-  return mix(horizon, zenith, pow(clamp(d.y, 0.0, 1.0), power));
+vec3 sample_panorama(vec3 dir, float lod) {
+  const vec2 uv = vec2(atan(dir.x, -dir.z) / (2.0 * kPi) + 0.5 + pc.env.x / (2.0 * kPi),
+                       acos(clamp(dir.y, -1.0, 1.0)) / kPi);
+  return textureLod(picture, uv, lod).rgb;  // explicit level: no seam where u wraps
 }
 
 void main() {
   const vec2 size = vec2(pc.info.xy);
   const uint rotation = pc.info.z & 3u;
+  const uint kind = pc.info.z >> 8;
   // Undo the surface pre-rotation (splat.vert applies it to splats).
   const vec2 fb = (rotation & 1u) != 0u ? size.yx : size;
   const vec2 f = gl_FragCoord.xy / fb * 2.0 - 1.0;
@@ -59,113 +69,77 @@ void main() {
   const vec2 px = (ndc + 1.0) * 0.5 * size;
   const vec3 d = normalize(pc.axis_x.xyz * ((px.x - pc.axis_z.w) / pc.axis_x.w) +
                            pc.axis_y.xyz * ((px.y - pc.eye.w) / pc.axis_y.w) + pc.axis_z.xyz);
-  const uint kind = pc.info.w;
-  const float scale = max(pc.extra.y, 1e-3);
+  const vec3 eye = pc.eye.xyz;
+  const float floor_y = pc.ground.x;
+  const float height = max(pc.ground.w, 1e-3);
+  const vec3 model = vec3(pc.ground.y, floor_y + 0.5 * height, pc.ground.z);
+  const float focus = max(length(model - eye), 1e-3);
+  const float levels = float(textureQueryLevels(picture));
 
-  if (kind == kPhoto) {
-    // Fills the screen (cropping the picture), and stays put as the model turns.
-    vec2 uv = px / size;
-    const float screen = size.x / size.y, aspect = max(pc.extra.x, 1e-3);
-    if (aspect > screen) uv.x = 0.5 + (uv.x - 0.5) * screen / aspect;
-    else uv.y = 0.5 + (uv.y - 0.5) * aspect / screen;
-    out_color = vec4(texture(picture, uv).rgb, 1.0);
-    return;
-  }
   if (kind == kPlain) {
     out_color = vec4(0.08, 0.09, 0.11, 1.0);
     return;
   }
-
-  // Where the ray meets the floor, if it does (looking down, from above it).
-  bool on_floor = false;
-  vec2 xz = vec2(0.0);
-  float dist = 0.0;
-  if (d.y < -1e-4) {
-    const float t = (pc.ground.x - pc.eye.y) / d.y;
-    if (t > 0.0) {
-      on_floor = true;
-      xz = pc.eye.xz + d.xz * t;
-      dist = t / scale;  // in subject heights
-    }
-  }
-
-  if (kind == kPanorama) {
-    const vec2 uv = vec2(atan(d.x, -d.z) / (2.0 * kPi) + 0.5, acos(clamp(d.y, -1.0, 1.0)) / kPi);
-    vec3 p = textureLod(picture, uv, 0.0).rgb;  // one level: no seam where u wraps
-    // A soft shadow where the floor would be, so the model stands in the picture.
-    if (on_floor) p *= shadow(xz, 0.35);
-    out_color = vec4(p, 1.0);
+  if (kind == kPhoto) {
+    // Fills the screen (cropping the picture) and stays put as the model
+    // turns, a little out of focus behind it.
+    vec2 uv = px / size;
+    const float screen = size.x / size.y, aspect = max(uintBitsToFloat(pc.info.w), 1e-3);
+    if (aspect > screen) uv.x = 0.5 + (uv.x - 0.5) * screen / aspect;
+    else uv.y = 0.5 + (uv.y - 0.5) * aspect / screen;
+    out_color = vec4(textureLod(picture, uv, min(pc.env.w * 1.2, levels - 1.0)).rgb, 1.0);
     return;
   }
 
-  vec3 c;
+  // Where the ray meets the floor (looking down, from above it).
+  bool on_floor = false;
+  float t_floor = 0.0;
+  if (d.y < -1e-4) {
+    t_floor = (floor_y - eye.y) / d.y;
+    on_floor = t_floor > 0.0;
+  }
+
   if (kind == kStudio) {
     // A white cyclorama: the floor fades into the wall with distance.
-    const vec3 wall = sky(d, vec3(0.97), vec3(0.86, 0.87, 0.89), 0.6);
-    c = wall;
+    const vec3 wall = mix(vec3(0.97), vec3(0.86, 0.87, 0.89), pow(clamp(d.y, 0.0, 1.0), 0.6));
+    vec3 c = wall;
     if (on_floor) {
-      vec3 floor_c = vec3(0.93) * shadow(xz, 0.45);
-      c = mix(floor_c, vec3(0.97), 1.0 - exp(-dist / 6.0));
+      const vec3 p = eye + d * t_floor;
+      const vec3 floor_c = vec3(0.93) * shadow(p.xz);
+      c = mix(floor_c, vec3(0.97), 1.0 - exp(-(t_floor / height) / 6.0));
     }
-  } else if (kind == kDark) {
-    c = sky(d, vec3(0.06, 0.06, 0.07), vec3(0.015), 0.5);
-    if (on_floor) {
-      vec2 q = (xz - pc.ground.yz) / scale;
-      const float pool = exp(-dot(q, q) / 0.6);
-      vec3 floor_c = (vec3(0.07) + vec3(0.30, 0.29, 0.27) * pool) * shadow(xz, 0.6);
-      c = mix(floor_c, vec3(0.06, 0.06, 0.07), 1.0 - exp(-dist / 5.0));
-    }
-  } else if (kind == kPark) {
-    const vec3 sun = normalize(vec3(0.45, 0.55, -0.7));
-    c = sky(d, vec3(0.78, 0.86, 0.95), vec3(0.30, 0.52, 0.88), 0.55);
-    const float s = max(dot(d, sun), 0.0);
-    c += vec3(1.0, 0.9, 0.7) * (pow(s, 600.0) * 2.0 + pow(s, 12.0) * 0.18);
-    if (on_floor) {
-      const vec2 p = xz / scale;
-      const float n = 0.55 * noise(p * 6.0) + 0.3 * noise(p * 23.0) + 0.15 * noise(p * 80.0);
-      vec3 grass = mix(vec3(0.20, 0.36, 0.12), vec3(0.36, 0.52, 0.20), n);
-      grass *= shadow(xz, 0.5);
-      c = mix(grass, vec3(0.72, 0.80, 0.86), 1.0 - exp(-dist / 12.0));
-    }
-  } else if (kind == kChecker) {
-    c = sky(d, vec3(0.82, 0.84, 0.87), vec3(0.55, 0.60, 0.70), 0.7);
-    if (on_floor) {
-      const float k = checker(xz / (0.3 * scale));
-      vec3 floor_c = mix(vec3(0.55), vec3(0.88), k) * shadow(xz, 0.45);
-      c = mix(floor_c, vec3(0.82, 0.84, 0.87), 1.0 - exp(-dist / 10.0));
-    }
-  } else if (kind == kSunset) {
-    const vec3 sun = normalize(vec3(-0.25, 0.06, -1.0));
-    const float h = clamp(d.y, 0.0, 1.0);
-    c = mix(vec3(1.0, 0.58, 0.28), vec3(0.88, 0.38, 0.42), smoothstep(0.0, 0.18, h));
-    c = mix(c, vec3(0.20, 0.16, 0.36), smoothstep(0.15, 0.7, h));
-    const float s = max(dot(d, sun), 0.0);
-    c += vec3(1.0, 0.75, 0.45) * (pow(s, 900.0) * 2.5 + pow(s, 20.0) * 0.35);
-    if (on_floor) {
-      // Dark water-like ground with the sun's glow on it.
-      const vec3 r = reflect(d, vec3(0, 1, 0));
-      const float g = pow(max(dot(r, sun), 0.0), 40.0);
-      vec3 floor_c = (vec3(0.11, 0.07, 0.10) + vec3(0.9, 0.5, 0.3) * g * 0.6) * shadow(xz, 0.5);
-      c = mix(floor_c, vec3(0.95, 0.55, 0.32), 1.0 - exp(-dist / 9.0));
-    }
-  } else {  // kNight
-    c = sky(d, vec3(0.06, 0.08, 0.18), vec3(0.01, 0.015, 0.05), 0.45);
-    if (d.y > 0.0) {
-      const vec3 q = d * 260.0;
-      const vec3 cell = floor(q);
-      const float h = hash3(cell);
-      if (h > 0.985) {
-        const vec3 at = cell + vec3(hash3(cell + 1.7), hash3(cell + 3.1), hash3(cell + 5.3));
-        const float star = smoothstep(0.45, 0.0, length(q - at)) * (h - 0.985) / 0.015;
-        c += vec3(0.9, 0.92, 1.0) * star * smoothstep(0.0, 0.15, d.y);
-      }
-    }
-    if (on_floor) {
-      vec2 q = (xz - pc.ground.yz) / scale;
-      const float glow = exp(-dot(q, q) / 0.4);
-      vec3 floor_c = (vec3(0.025, 0.03, 0.055) + vec3(0.10, 0.22, 0.45) * glow) * shadow(xz, 0.6);
-      c = mix(floor_c, vec3(0.06, 0.08, 0.18), 1.0 - exp(-dist / 6.0));
+    out_color = vec4(c, 1.0);
+    return;
+  }
+
+  // Panorama, ground projected around a centre `camera height` above the floor under the model.
+  const vec3 centre = vec3(model.x, floor_y + pc.env.y, model.z);
+  const float radius = pc.env.z;
+  vec3 sample_dir = d;
+  float dist = 1e4 * height;
+  bool floor_hit = false;
+  vec3 hit = vec3(0.0);
+  if (on_floor) {
+    hit = eye + d * t_floor;
+    if (length(hit.xz - centre.xz) < radius) {
+      floor_hit = true;
+      sample_dir = normalize(hit - centre);
+      dist = t_floor;
     }
   }
+  if (!floor_hit) {
+    // The surroundings: a sphere of `radius` around the centre (if the camera is inside it).
+    const vec3 oc = eye - centre;
+    const float b = dot(oc, d), c = dot(oc, oc) - radius * radius;
+    const float disc = b * b - c;
+    if (c < 0.0 && disc >= 0.0) {
+      const float t = -b + sqrt(disc);
+      sample_dir = normalize(eye + d * t - centre);
+      dist = t;
+    }
+  }
+  const float lod = clamp(pc.env.w * abs(log2(dist / focus)), 0.0, min(levels - 1.0, 3.5));
+  vec3 c = sample_panorama(sample_dir, lod);
+  if (floor_hit) c *= shadow(hit.xz);
   out_color = vec4(c, 1.0);
 }
