@@ -24,7 +24,7 @@ import bpy  # first: it makes mathutils importable
 import mathutils
 
 import place_kit as kit
-from place_kit import box, cylinder, nodes, painting, plane, principled
+from place_kit import box, cylinder, nodes, painting, panel, plane, principled, world_position
 
 ASSETS = sys.argv[1]
 OUT = sys.argv[2]
@@ -45,7 +45,7 @@ def plaster(name, color):
 def oak_floor():
     m = principled("oak floor", (0.45, 0.30, 0.18), 0.35)
     n, l, b = nodes(m)
-    tc = n.new("ShaderNodeTexCoord")
+    pos = world_position(m)
     mp = n.new("ShaderNodeMapping")
     mp.inputs["Scale"].default_value = (1.0, 1.0, 1.0)
     brick = n.new("ShaderNodeTexBrick")
@@ -70,9 +70,9 @@ def oak_floor():
     gray = n.new("ShaderNodeValToRGB")
     gray.color_ramp.elements[0].color = (0.75, 0.72, 0.70, 1)
     gray.color_ramp.elements[1].color = (1.1, 1.05, 1.0, 1)
-    l.new(tc.outputs["Object"], mp.inputs["Vector"])
+    l.new(pos, mp.inputs["Vector"])
     l.new(mp.outputs["Vector"], brick.inputs["Vector"])
-    l.new(tc.outputs["Object"], stretch.inputs["Vector"])
+    l.new(pos, stretch.inputs["Vector"])
     l.new(stretch.outputs["Vector"], grain.inputs["Vector"])
     l.new(grain.outputs["Fac"], gray.inputs["Fac"])
     l.new(brick.outputs["Color"], mix.inputs["A"])
@@ -84,7 +84,6 @@ def oak_floor():
 def walnut():
     m = principled("walnut", (0.25, 0.14, 0.08), 0.4)
     n, l, b = nodes(m)
-    tc = n.new("ShaderNodeTexCoord")
     mp = n.new("ShaderNodeMapping")
     mp.inputs["Scale"].default_value = (1.0, 14.0, 1.0)
     wave = n.new("ShaderNodeTexWave")
@@ -94,20 +93,24 @@ def walnut():
     ramp = n.new("ShaderNodeValToRGB")
     ramp.color_ramp.elements[0].color = (0.17, 0.09, 0.05, 1)
     ramp.color_ramp.elements[1].color = (0.33, 0.19, 0.11, 1)
-    l.new(tc.outputs["Object"], mp.inputs["Vector"])
+    l.new(world_position(m), mp.inputs["Vector"])
     l.new(mp.outputs["Vector"], wave.inputs["Vector"])
     l.new(wave.outputs["Fac"], ramp.inputs["Fac"])
     l.new(ramp.outputs["Color"], b.inputs["Base Color"])
     return m
 
 
-def rug():
-    """A wool rug: a navy border, a thin rust line, a cream field with a soft mottle."""
+def rug(centre, size):
+    """A wool rug: a navy border, a thin rust line, a cream field with a soft
+    mottle; laid out for a rug of `size` (x, y) at `centre`."""
     m = principled("rug", (0.7, 0.66, 0.6), 1.0, sheen=0.5)
     n, l, b = nodes(m)
-    tc = n.new("ShaderNodeTexCoord")
+    local = n.new("ShaderNodeMapping")  # world -> 0..1 across the rug
+    local.inputs["Scale"].default_value = (1 / size[0], 1 / size[1], 1.0)
+    local.inputs["Location"].default_value = (0.5 - centre[0] / size[0], 0.5 - centre[1] / size[1], 0.0)
+    l.new(world_position(m), local.inputs["Vector"])
     sep = n.new("ShaderNodeSeparateXYZ")
-    l.new(tc.outputs["Generated"], sep.inputs["Vector"])
+    l.new(local.outputs["Vector"], sep.inputs["Vector"])
     # Distance to the nearest edge, in the rug's 0..1 coordinates (x across 2.6 m, y across 1.8 m).
     def edge(axis, size):
         sub = n.new("ShaderNodeMath")
@@ -123,7 +126,7 @@ def rug():
         inv.inputs[2].default_value = 0.5 * size
         l.new(ab.outputs[0], inv.inputs[0])
         return inv
-    ex, ey = edge("X", 2.6), edge("Y", 1.8)
+    ex, ey = edge("X", size[0]), edge("Y", size[1])
     near = n.new("ShaderNodeMath")
     near.operation = "MINIMUM"
     l.new(ex.outputs[0], near.inputs[0])
@@ -139,7 +142,8 @@ def rug():
     e.color = (0.80, 0.76, 0.68, 1)  # cream field
     l.new(near.outputs[0], ramp.inputs["Fac"])
     mottle = n.new("ShaderNodeTexNoise")
-    mottle.inputs["Scale"].default_value = 25.0
+    l.new(world_position(m), mottle.inputs["Vector"])
+    mottle.inputs["Scale"].default_value = 12.0
     mottle.inputs["Detail"].default_value = 6.0
     tint = n.new("ShaderNodeValToRGB")
     tint.color_ramp.elements[0].color = (0.85, 0.85, 0.85, 1)
@@ -159,7 +163,8 @@ def foliage():
     m = principled("foliage", (0.12, 0.24, 0.07), 0.9)
     n, l, b = nodes(m)
     noise = n.new("ShaderNodeTexNoise")
-    noise.inputs["Scale"].default_value = 3.0
+    l.new(world_position(m), noise.inputs["Vector"])
+    noise.inputs["Scale"].default_value = 2.0
     noise.inputs["Detail"].default_value = 8.0
     ramp = n.new("ShaderNodeValToRGB")
     ramp.color_ramp.elements[0].color = (0.05, 0.12, 0.03, 1)
@@ -188,7 +193,8 @@ def lawn():
     m = principled("lawn", (0.16, 0.30, 0.08), 0.9)
     n, l, b = nodes(m)
     noise = n.new("ShaderNodeTexNoise")
-    noise.inputs["Scale"].default_value = 2.0
+    l.new(world_position(m), noise.inputs["Vector"])
+    noise.inputs["Scale"].default_value = 0.6
     ramp = n.new("ShaderNodeValToRGB")
     ramp.color_ramp.elements[0].color = (0.10, 0.22, 0.05, 1)
     ramp.color_ramp.elements[1].color = (0.26, 0.42, 0.12, 1)
@@ -219,16 +225,21 @@ def build():
     books = [principled(f"book {i}", c, 0.6) for i, c in enumerate(book_colors)]
 
     # Floor and ceiling, walls, the window opening in +y.
-    box("floor", (0, 0, -0.05), (W, D, 0.1), oak_floor())
-    box("ceiling", (0, 0, H + 0.05), (W, D, 0.1), ceiling)
-    box("wall -x", (-W / 2 - 0.05, 0, H / 2), (0.1, D, H), wall)
-    box("wall +x", (W / 2 + 0.05, 0, H / 2), (0.1, D, H), wall)
-    box("wall -y", (0, -D / 2 - 0.05, H / 2), (W, 0.1, H), wall)
+    panel("floor", (0, 0, 0), (W, D, 0), "+z", oak_floor())
+    panel("ceiling", (0, 0, H), (W, D, 0), "-z", ceiling)
+    panel("wall -x", (-W / 2, 0, H / 2), (0, D, H), "+x", wall)
+    panel("wall +x", (W / 2, 0, H / 2), (0, D, H), "-x", wall)
+    panel("wall -y", (0, -D / 2, H / 2), (W, 0, H), "+y", wall)
     side = (W - WIN_W) / 2
-    box("wall +y left", (-W / 2 + side / 2, D / 2 + 0.05, H / 2), (side, 0.1, H), wall)
-    box("wall +y right", (W / 2 - side / 2, D / 2 + 0.05, H / 2), (side, 0.1, H), wall)
-    box("wall +y below", (0, D / 2 + 0.05, WIN_SILL / 2), (WIN_W, 0.1, WIN_SILL), wall)
-    box("wall +y above", (0, D / 2 + 0.05, (WIN_TOP + H) / 2), (WIN_W, 0.1, H - WIN_TOP), wall)
+    panel("wall +y left", (-W / 2 + side / 2, D / 2, H / 2), (side, 0, H), "-y", wall)
+    panel("wall +y right", (W / 2 - side / 2, D / 2, H / 2), (side, 0, H), "-y", wall)
+    panel("wall +y below", (0, D / 2, WIN_SILL / 2), (WIN_W, 0, WIN_SILL), "-y", wall)
+    panel("wall +y above", (0, D / 2, (WIN_TOP + H) / 2), (WIN_W, 0, H - WIN_TOP), "-y", wall)
+    # The sides of the window opening (the wall is 10 cm thick).
+    mid = (WIN_SILL + WIN_TOP) / 2
+    panel("wall reveal", (-WIN_W / 2, D / 2 + 0.05, mid), (0, 0.1, WIN_TOP - WIN_SILL), "+x", wall)
+    panel("wall reveal", (WIN_W / 2, D / 2 + 0.05, mid), (0, 0.1, WIN_TOP - WIN_SILL), "-x", wall)
+    panel("wall reveal", (0, D / 2 + 0.05, WIN_TOP), (WIN_W, 0.1, 0), "-z", wall)
     # Window frame: a border and two mullions, a sill.
     for x in (-WIN_W / 2, WIN_W / 2, -WIN_W / 6, WIN_W / 6):
         box("mullion", (x, D / 2 + 0.05, (WIN_SILL + WIN_TOP) / 2), (0.05, 0.12, WIN_TOP - WIN_SILL), frame)
@@ -262,7 +273,7 @@ def build():
 
     # The sofa against the -y wall, a rug, a coffee table with flowers.
     asset("GlamVelvetSofa", (-0.4, -D / 2 + 0.55, 0))
-    box("rug", (-0.4, -0.6, 0.005), (2.6, 1.8, 0.01), rug())
+    box("rug", (-0.4, -0.6, 0.005), (2.6, 1.8, 0.01), rug((-0.4, -0.6), (2.6, 1.8)))
     box("table top", (-0.4, -0.85, 0.40), (1.2, 0.6, 0.035), walnut(), bevel=0.008)
     for dx in (-0.55, 0.55):
         for dy in (-0.25, 0.25):
@@ -364,7 +375,9 @@ def spacing_for(o):
     if o.name.startswith(("lawn", "garden")):
         return 0.15  # outside, seen only through the window
     if o.name.startswith("ceiling"):
-        return 0.045
+        return SPACING * 2  # sparser than the floor, so the viewer finds the floor
+    if o.name.startswith("wall"):
+        return SPACING * 1.5  # plain plaster
     return SPACING
 
 
@@ -377,6 +390,6 @@ build()
 light()
 if MODE == "bake":
     kit.bake_and_export(os.path.join(OUT, "living_room.ply"), int(os.environ.get("BAKE_SAMPLES", "64")), spacing_for,
-                        median_grey=0.27)
+                        median_grey=0.5, expose=lambda o: o.name.startswith("wall"))
 else:
     kit.preview(OUT, VIEWS, exposure=-0.4, samples=32)

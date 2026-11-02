@@ -37,11 +37,19 @@ def nodes(m):
     return m.node_tree.nodes, m.node_tree.links, m.node_tree.nodes["Principled BSDF"]
 
 
-def mottled(name, color, scale=6.0, low=0.95, high=1.03, rough=0.9):
-    """A flat colour with a soft noise in it (plaster, paint, paper, concrete)."""
+def world_position(m):
+    """The shaded point in world space. Textures are laid out in world space
+    (not per object), so they stay put when the bake joins all objects."""
+    return m.node_tree.nodes.new("ShaderNodeNewGeometry").outputs["Position"]
+
+
+def mottled(name, color, scale=1.5, low=0.95, high=1.03, rough=0.9):
+    """A flat colour with a soft noise in it (plaster, paint, paper, concrete);
+    `scale`: noise features per metre."""
     m = principled(name, color, rough)
     n, l, b = nodes(m)
     noise = n.new("ShaderNodeTexNoise")
+    l.new(world_position(m), noise.inputs["Vector"])
     noise.inputs["Scale"].default_value = scale
     noise.inputs["Detail"].default_value = 6.0
     ramp = n.new("ShaderNodeValToRGB")
@@ -74,7 +82,8 @@ def painting(seed, colors):
     n, l, b = nodes(m)
     noise = n.new("ShaderNodeTexNoise")
     noise.noise_dimensions = "4D"
-    noise.inputs["Scale"].default_value = 1.6
+    l.new(world_position(m), noise.inputs["Vector"])
+    noise.inputs["Scale"].default_value = 2.5
     noise.inputs["Detail"].default_value = 3.0
     noise.inputs["W"].default_value = seed
     ramp = n.new("ShaderNodeValToRGB")
@@ -121,6 +130,21 @@ def plane(name, centre, size, material, rotation=(0, 0, 0)):
     bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)  # pivot stays put
     o.data.materials.append(material)
     return o
+
+
+_FACING = {  # rotation of a +z plane to face each way, and which extents it spans
+    "+z": ((0, 0, 0), (0, 1)), "-z": ((math.pi, 0, 0), (0, 1)),
+    "+x": ((0, math.pi / 2, 0), (2, 1)), "-x": ((0, -math.pi / 2, 0), (2, 1)),
+    "+y": ((-math.pi / 2, 0, 0), (0, 2)), "-y": ((math.pi / 2, 0, 0), (0, 2)),
+}
+
+
+def panel(name, centre, extent, facing, material):
+    """A one-sided rectangle (room walls, floors, ceilings: only the side
+    that faces into the room becomes splats). `extent` is (x, y, z); the
+    extent along `facing` is ignored."""
+    rotation, (a, b) = _FACING[facing]
+    return plane(name, centre, (extent[a], extent[b]), material, rotation)
 
 
 def rod(name, a, b, radius, material, vertices=12):
@@ -205,93 +229,124 @@ def densify(o, spacing):
     bm.free()
 
 
+def _arrays(o):
+    """World positions and normals of `o`'s vertices, its edges, and the mean
+    length of the edges at each vertex."""
+    m = o.data
+    n = len(m.vertices)
+    co = np.zeros(n * 3, dtype=np.float32)
+    m.vertices.foreach_get("co", co)
+    nv = np.zeros(n * 3, dtype=np.float32)
+    m.vertex_normals.foreach_get("vector", nv)
+    edges = np.zeros(len(m.edges) * 2, dtype=np.int64)
+    m.edges.foreach_get("vertices", edges)
+    edges = edges.reshape(-1, 2)
+    mw = np.array(o.matrix_world)
+    world = co.reshape(-1, 3) @ mw[:3, :3].T + mw[:3, 3]
+    normals = nv.reshape(-1, 3) @ np.linalg.inv(mw[:3, :3])
+    normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-9)
+    length = np.linalg.norm(world[edges[:, 0]] - world[edges[:, 1]], axis=1)
+    lengths = np.bincount(edges[:, 0], length, n) + np.bincount(edges[:, 1], length, n)
+    counts = np.bincount(edges[:, 0], minlength=n) + np.bincount(edges[:, 1], minlength=n)
+    return world, normals, edges, lengths / np.maximum(counts, 1), counts
+
+
 def bake_and_export(path, samples, spacing_for, median_grey=0.32, smooth_light=4, expose=None):
     """Bakes every mesh's light into splats and writes them to `path` (PLY).
     `spacing_for(object)` gives the splat spacing for an object (metres);
-    `median_grey` is the display value the median surface is exposed to (of
-    the objects `expose(object)` picks, if given);
+    `median_grey` is the scene value (before tone mapping) the median surface
+    is exposed to, of the objects `expose(object)` picks if given;
     `smooth_light` how many rings of neighbours the baked light is averaged
     over (it is path traced, so noisy)."""
     s = bpy.context.scene
     render_settings(samples)
-    meshes = []
-    for o in list(bpy.data.objects):
-        if o.type != "MESH":
-            continue
+    lit_meshes, glowing = [], []
+    exposed_names = []
+    for o in [o for o in bpy.data.objects if o.type == "MESH"]:
         bpy.context.view_layer.objects.active = o
         o.select_set(True)
         for md in list(o.modifiers):
             bpy.ops.object.modifier_apply(modifier=md.name)
         o.select_set(False)
         densify(o, spacing_for(o))
-        if "bake" not in o.data.color_attributes:
-            o.data.color_attributes.new("bake", "FLOAT_COLOR", "POINT")
-        o.data.color_attributes.active_color = o.data.color_attributes["bake"]
-        meshes.append(o)
-    print("vertices", sum(len(o.data.vertices) for o in meshes), flush=True)
+        glow = [slot.material.get("glow") for slot in o.material_slots if slot.material]
+        glow = [list(g) for g in glow if g is not None]
+        if glow:
+            glowing.append((o, glow[0]))  # shows its emission; nothing to bake
+            continue
+        k = len(lit_meshes)
+        lit_meshes.append(o)
+        exposed_names.append(bool(expose(o)) if expose else True)
+        src = o.data.attributes.new("src", "INT", "POINT")
+        src.data.foreach_set("value", np.full(len(o.data.vertices), k, dtype=np.int32))
     heavy = {}
-    for o in meshes:
+    for o in lit_meshes + [g[0] for g in glowing]:
         key = o.name.split(".")[0]
         heavy[key] = heavy.get(key, 0) + len(o.data.vertices)
+    print("objects", len(lit_meshes), "+", len(glowing), "glowing; vertices", sum(heavy.values()), flush=True)
     print("heaviest", sorted(heavy.items(), key=lambda kv: -kv[1])[:12], flush=True)
-    for o in bpy.data.objects:
+    # One object: Cycles sets up a bake per object, which costs far more than
+    # the sampling when there are hundreds of small ones. (Glowing objects stay
+    # apart: some are hidden from rays, which a joined object would inherit.)
+    for o in bpy.context.selected_objects:
         o.select_set(False)
-    for o in meshes:
+    for o in lit_meshes:
         o.select_set(True)
-    bpy.context.view_layer.objects.active = meshes[0]
+    bpy.context.view_layer.objects.active = lit_meshes[0]
+    names = [x.name.split(".")[0] for x in lit_meshes]
+    bpy.ops.object.join()
+    o = bpy.context.view_layer.objects.active
+    m = o.data
+    m.color_attributes.new("bake", "FLOAT_COLOR", "POINT")
+    m.color_attributes.active_color = m.color_attributes["bake"]
     s.render.bake.target = "VERTEX_COLORS"
+    n = len(m.vertices)
+
+    def baked():
+        buf = np.zeros(n * 4, dtype=np.float32)
+        m.color_attributes["bake"].data.foreach_get("color", buf)
+        return buf.reshape(-1, 4)[:, :3].astype(np.float64)
+
     # The light (noisy: path traced) and the surface colour (exact) apart, so
     # the light alone can be smoothed.
     t = time.time()
     bpy.ops.object.bake(type="DIFFUSE", pass_filter={"DIRECT", "INDIRECT"})
     print("bake light", round(time.time() - t, 1), "s", flush=True)
-    light = {o.name: np.array([d.color[:3] for d in o.data.color_attributes["bake"].data]).reshape(-1, 3)
-             for o in meshes}
+    light = baked()
     s.cycles.samples = 4
+    t = time.time()
     bpy.ops.object.bake(type="DIFFUSE", pass_filter={"COLOR"})
-    s.cycles.samples = samples
+    print("bake colour", round(time.time() - t, 1), "s", flush=True)
+    albedo = baked()
 
-    pos, nrm, col, spc, lit = [], [], [], [], []
-    for o in meshes:
-        m = o.data
-        mw = o.matrix_world
-        nw = mw.to_3x3().inverted().transposed()
-        lengths = np.zeros(len(m.vertices))
-        counts = np.zeros(len(m.vertices))
-        edges = np.array([e.vertices[:] for e in m.edges], dtype=np.int64).reshape(-1, 2)
-        world = np.array([(mw @ v.co)[:] for v in m.vertices]).reshape(-1, 3)
-        normals = np.array([(nw @ v.normal).normalized()[:] for v in m.vertices]).reshape(-1, 3)
-        if len(edges):
-            length = np.linalg.norm(world[edges[:, 0]] - world[edges[:, 1]], axis=1)
-            np.add.at(lengths, edges[:, 0], length)
-            np.add.at(lengths, edges[:, 1], length)
-            np.add.at(counts, edges[:, 0], 1)
-            np.add.at(counts, edges[:, 1], 1)
-        albedo = np.array([d.color[:3] for d in m.color_attributes["bake"].data]).reshape(-1, 3)
-        # Glowing surfaces show their emission, where the bake has none.
-        glow = [slot.material.get("glow") for slot in o.material_slots if slot.material]
-        glow = [g for g in glow if g is not None]
-        if glow:
-            colours = np.tile(np.array(glow[0], dtype=float), (len(world), 1))
-        else:
-            # Smooth the light over a few rings of neighbours (a few cm): the
-            # noise goes, shadow edges stay about as soft as the sun makes them.
-            e = light[o.name]
-            for _ in range(smooth_light):
-                if not len(edges):
-                    break
-                neighbour = np.zeros_like(e)
-                np.add.at(neighbour, edges[:, 0], e[edges[:, 1]])
-                np.add.at(neighbour, edges[:, 1], e[edges[:, 0]])
-                e = 0.4 * e + 0.6 * np.where(counts[:, None] > 0, neighbour / np.maximum(counts, 1)[:, None], e)
-            colours = albedo * e
-        pos.append(world)
-        nrm.append(normals)
-        col.append(colours)
-        spc.append(lengths / np.maximum(counts, 1))
-        lit.append(np.full(len(world), (expose(o) if expose else True) and not glow))
-    write_splats(path, np.concatenate(pos), np.concatenate(nrm), np.concatenate(col), np.concatenate(spc),
-                 np.concatenate(lit), median_grey)
+    world, normals, edges, spacing, counts = _arrays(o)
+    src = np.zeros(n, dtype=np.int32)
+    m.attributes["src"].data.foreach_get("value", src)
+    # Smooth the light over a few rings of neighbours (a few cm): the noise
+    # goes, shadow edges stay about as soft as the sun makes them. Edges never
+    # join two objects, so nothing bleeds between them.
+    e = light
+    for _ in range(smooth_light):
+        neighbour = np.zeros_like(e)
+        for c in range(3):
+            neighbour[:, c] = (np.bincount(edges[:, 0], e[edges[:, 1], c], n) +
+                               np.bincount(edges[:, 1], e[edges[:, 0], c], n))
+        e = np.where(counts[:, None] > 0, 0.4 * e + 0.6 * neighbour / np.maximum(counts, 1)[:, None], e)
+    colours = albedo * e
+    # Surfaces no light reaches are hidden (inside or under things). Judged
+    # on the smoothed light: a dim corner gets some from its neighbours, a
+    # hidden face has none around it either.
+    lum = np.array([0.2126, 0.7152, 0.0722])
+    keep = (e @ lum) > 0.001 * np.median(e @ lum)
+    lost = {}
+    for k in src[~keep]:
+        lost[names[k]] = lost.get(names[k], 0) + 1
+    print("dropped unlit", int(n - keep.sum()), sorted(lost.items(), key=lambda kv: -kv[1])[:8], flush=True)
+    parts = [(world[keep], normals[keep], colours[keep], spacing[keep], np.array(exposed_names)[src][keep])]
+    for g, glow in glowing:
+        gw, gn, _, gs, _ = _arrays(g)
+        parts.append((gw, gn, np.tile(np.array(glow, dtype=np.float64), (len(gw), 1)), gs, np.zeros(len(gw), bool)))
+    write_splats(path, *[np.concatenate([p[i] for p in parts]) for i in range(5)], median_grey)
 
 
 def tone(linear, exposure):
@@ -321,7 +376,7 @@ def write_splats(path, pos, nrm, lin, spacing, lit, median_grey):
     q = np.stack([w, (m[:, 2, 1] - m[:, 1, 2]) / (4 * w), (m[:, 0, 2] - m[:, 2, 0]) / (4 * w),
                   (m[:, 1, 0] - m[:, 0, 1]) / (4 * w)], 1)
     q /= np.linalg.norm(q, axis=1, keepdims=True)
-    sigma = np.clip(spacing, 0.004, 0.2) * 0.62
+    sigma = np.clip(spacing, 0.004, 0.2) * 0.7  # neighbours overlap: no gaps to see through
     scales = np.log(np.stack([sigma, sigma, sigma * 0.15], 1))
     dc = (rgb - 0.5) / 0.28209479177387814
     opacity = np.full((len(p), 1), math.log(0.97 / 0.03))

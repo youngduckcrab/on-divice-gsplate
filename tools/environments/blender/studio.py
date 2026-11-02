@@ -23,7 +23,7 @@ import bpy  # first: it makes mathutils importable
 import mathutils
 
 import place_kit as kit
-from place_kit import box, cylinder, emissive, mottled, painting, principled, rod
+from place_kit import box, cylinder, emissive, mottled, painting, panel, principled, rod
 
 ASSETS = sys.argv[1]
 OUT = sys.argv[2]
@@ -86,9 +86,9 @@ def area_light(name, location, target, shape, size, size_y, energy, color=(1.0, 
 
 
 def build():
-    paper = mottled("paper", (0.50, 0.49, 0.47), scale=3.0, low=0.97, high=1.02, rough=0.95)
-    concrete = mottled("concrete", (0.30, 0.30, 0.29), scale=1.2, low=0.8, high=1.12, rough=0.45)
-    charcoal = mottled("charcoal paint", (0.09, 0.09, 0.10), scale=2.0, low=0.9, high=1.08)
+    paper = mottled("paper", (0.50, 0.49, 0.47), scale=0.8, low=0.97, high=1.02, rough=0.95)
+    concrete = mottled("concrete", (0.30, 0.30, 0.29), scale=1.5, low=0.8, high=1.12, rough=0.45)
+    charcoal = mottled("charcoal paint", (0.09, 0.09, 0.10), scale=1.0, low=0.9, high=1.08)
     ceiling = principled("ceiling", (0.04, 0.04, 0.045), 0.9)
     metal = principled("black metal", (0.03, 0.03, 0.03), 0.35)
     chrome = principled("chrome", (0.55, 0.56, 0.58), 0.25)
@@ -98,12 +98,13 @@ def build():
     softlight = emissive("diffuser", (1.0, 0.98, 0.95), 12.0)
 
     # The room.
-    box("floor", ((X0 + X1) / 2, (Y0 + Y1) / 2, -0.05), (X1 - X0, Y1 - Y0, 0.1), concrete)
-    box("ceiling", ((X0 + X1) / 2, (Y0 + Y1) / 2, H + 0.05), (X1 - X0, Y1 - Y0, 0.1), ceiling)
-    box("wall -x", (X0 - 0.05, (Y0 + Y1) / 2, H / 2), (0.1, Y1 - Y0, H), charcoal)
-    box("wall +x", (X1 + 0.05, (Y0 + Y1) / 2, H / 2), (0.1, Y1 - Y0, H), charcoal)
-    box("wall -y", ((X0 + X1) / 2, Y0 - 0.05, H / 2), (X1 - X0, 0.1, H), charcoal)
-    box("wall +y", ((X0 + X1) / 2, Y1 + 0.05, H / 2), (X1 - X0, 0.1, H), charcoal)
+    cx, cy, w, d = (X0 + X1) / 2, (Y0 + Y1) / 2, X1 - X0, Y1 - Y0
+    panel("floor", (cx, cy, 0), (w, d, 0), "+z", concrete)
+    panel("ceiling", (cx, cy, H), (w, d, 0), "-z", ceiling)
+    panel("wall -x", (X0, cy, H / 2), (0, d, H), "+x", charcoal)
+    panel("wall +x", (X1, cy, H / 2), (0, d, H), "-x", charcoal)
+    panel("wall -y", (cx, Y0, H / 2), (w, 0, H), "+y", charcoal)
+    panel("wall +y", (cx, Y1, H / 2), (w, 0, H), "-y", charcoal)
     # A door in the -y wall, pipes under the ceiling.
     box("door", (3.2, Y0 + 0.02, 1.05), (1.0, 0.04, 2.1), principled("door", (0.18, 0.18, 0.19), 0.5))
     box("door handle", (2.8, Y0 + 0.06, 1.0), (0.14, 0.03, 0.025), chrome)
@@ -181,13 +182,13 @@ def build():
     hinge = mathutils.Vector((2.25, -0.25, 1.2))
     for a in (math.radians(100), math.radians(190)):
         d = mathutils.Vector((math.cos(a), math.sin(a), 0)) * 0.6
-        panel = box("vflat white", hinge + d, (1.2, 0.02, 2.4), white_board)
-        panel.rotation_euler[2] = a
+        board = box("vflat white", hinge + d, (1.2, 0.02, 2.4), white_board)
+        board.rotation_euler[2] = a
         normal = mathutils.Vector((-math.sin(a), math.cos(a), 0))
         if normal.dot(SUBJECT - hinge) > 0:
             normal = -normal  # the black side faces away from the set
-        back_panel = box("vflat black", hinge + d + normal * 0.03, (1.2, 0.04, 2.4), fabric)
-        back_panel.rotation_euler[2] = a
+        backing = box("vflat black", hinge + d + normal * 0.03, (1.2, 0.04, 2.4), fabric)
+        backing.rotation_euler[2] = a
 
     # Camera on a tripod, facing the set.
     cam = mathutils.Vector((0.0, -2.6, 1.45))
@@ -298,9 +299,9 @@ def light():
 def spacing_for(o):
     name = o.name
     if name.startswith(("ceiling", "wall")):
-        return 0.07
+        return SPACING * 3  # dark and plain; sparser than the floor
     if name.startswith("floor"):
-        return 0.034
+        return SPACING * 1.4
     return SPACING
 
 
@@ -313,6 +314,6 @@ build()
 light()
 if MODE == "bake":
     kit.bake_and_export(os.path.join(OUT, "studio.ply"), int(os.environ.get("BAKE_SAMPLES", "64")), spacing_for,
-                        median_grey=0.62, expose=lambda o: o.name.startswith("paper"))
+                        median_grey=0.3, expose=lambda o: o.name.startswith("paper"))
 else:
     kit.preview(OUT, VIEWS, exposure=-1.0, samples=32)
