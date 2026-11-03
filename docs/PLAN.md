@@ -231,6 +231,7 @@ on-divice-gsplate/
 2. **정렬** (`train_emit` → radix sort → `train_ranges`) — 키 = (타일 ID << 16) | 16-bit log 깊이. 32-bit 키만 쓰므로 `shaderInt64` 불필요. 정렬 값은 정렬 전 쌍 인덱스.
    - 기기마다 subgroup 크기가 16~128로 다르므로 이에 의존하지 않는 radix sort를 쓴다. GPU 간 forward-progress 보장이 필요한 onesweep 방식은 쓰지 않는다.
    - 쌍 개수는 매 단계 CPU로 읽어 온다(제출 2회/단계). 간접 dispatch로 없애는 것은 M5.
+   - **v0.16.0**: 가우시안을 먼저 16-bit log 깊이로 정렬(4패스, 가우시안 수만큼) → 그 순서로 쌍을 만들고 타일 ID로만 정렬(3패스, 이전 7패스). 정렬 결과는 (타일, 깊이, 가우시안 번호) 정렬과 같음(테스트).
 3. **Forward 래스터** (`train_forward`) — 16×16 타일, 픽셀별 front-to-back alpha blending. 최종 투과율과 마지막 기여 인덱스, 픽셀별 dL/dC, 타일별 loss 합을 저장한다.
 4. **Loss** — L1. 마스크가 있으면 정답을 무작위 배경색 위에 합성하고 렌더도 같은 배경색 위에 그려, 대상 밖은 투명해지도록 학습한다. (M4: (1−λ)·L1 + λ·D-SSIM)
 5. **Backward 래스터** (`train_backward`) — back-to-front로 다시 순회. **(c) atomic-free 방식 채택**: 가우시안 B개씩 묶어 픽셀별 그래디언트를 subgroupAdd → 공유 메모리에서 subgroup끼리 합산 → (타일, 가우시안) 쌍별 그래디언트를 정렬 전 인덱스 위치에 기록. 가장 작은 subgroup 크기에 맞춰 공유 메모리 크기를 specialization constant로 정한다 (Adreno 64 → B=32, lavapipe 8 → B=8).
@@ -247,6 +248,7 @@ on-divice-gsplate/
    - **v0.3.1 Fold6 결과**: 학습은 돌았으나 lizard 결과가 "색이 사라지고 흰색만 조금". 원인: 점 구름(3만 개, 조각상 반경 3 m)이 거의 조각상 위에만 있어 공원 배경을 학습할 수 없었음 → 주변까지 6만 개로 다시 뽑아 90×160·600회 hold-out PSNR 15.5 → 24.1 dB. opacity 리셋은 짧은 학습에서 이득이 없고(head 36.1 → 36.5 dB, lizard 15.5 → 15.1 dB) 중간에 모델이 사라지는 것처럼 보여 기본값에서 뺌.
    - **v0.3.0 Fold6 결과**: 학습 파이프라인 생성이 `VK_ERROR_UNKNOWN`으로 실패. 공유 메모리 배열 크기에 specialization constant 식(`OpSpecConstantOp`)을 쓴 셰이더가 원인으로 추정 → v0.3.1에서 고정 크기 + push constant로 바꾸고, subgroup 없이 공유 메모리 트리로 합산하는 대체 셰이더를 두어 subgroup 버전이 거부되면 자동 전환. 실패 시 셰이더 이름을 모두 보고.
 6. **Backward 전처리 + Adam** (`train_step`, 가우시안당 1스레드) — 정렬 전 순서에서 연속인 자기 쌍들을 합산 → 투영 · SH(시점 방향 포함) · 공분산 · quaternion 정규화를 거쳐 3D 파라미터 그래디언트 → fused Adam. 위치 학습률은 카메라 범위 기준 지수 감쇠. densify 통계(NDC 위치 그래디언트 크기, 보인 횟수, 최대 반경)도 여기서 누적.
+   - **v0.16.0**: sparse Adam(그 사진에서 그려지지 않은 가우시안은 값·모멘트를 그대로; 2000회 이상에서만, PC 2000회 비교에서 화질 동일). 움직임 보정 기울기는 묶음(128개)이 따르는 노드만 목록으로 만들어 스레드를 나눠 합산(초기 가우시안은 모턴 순서). D-SSIM은 창 전체가 배경인 타일을 건너뜀. 버킷 상태 fp16은 기울기 오차가 커서(가우시안 5%가 10% 이상 틀림) 쓰지 않음.
 7. **Densify / Prune** (`train_densify_mark`, `train_densify_spawn`) — 3DGS 기본 방식: 평균 위치 그래디언트가 임계값 이상이면 작은 것은 복제, 큰 것은 분할(1.6배 축소, 가우시안 분포에서 표본), opacity < 0.005나 너무 큰 것은 제거. 제거된 슬롯은 free list로 재사용하고 슬롯 상한(가우시안 예산)을 넘지 않는다. 정수 atomic만 쓴다. opacity 리셋도 GPU에서.
    - 3DGS-MCMC 재배치, Taming식 점수 기반 방식은 M4에서 비교.
 
