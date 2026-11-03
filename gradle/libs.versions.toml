@@ -8,6 +8,7 @@ lifecycle = "2.8.7"
 arcore = "1.47.0"
 mlkitSegmentation = "16.0.0-beta6"
 mlkitFace = "16.1.7"
+mlkitPose = "18.0.0-beta5"
 junit = "4.13.2"
 
 [libraries]
@@ -21,6 +22,7 @@ androidx-lifecycle-viewmodel-compose = { module = "androidx.lifecycle:lifecycle-
 arcore = { module = "com.google.ar:core", version.ref = "arcore" }
 mlkit-segmentation-selfie = { module = "com.google.mlkit:segmentation-selfie", version.ref = "mlkitSegmentation" }
 mlkit-face-detection = { module = "com.google.mlkit:face-detection", version.ref = "mlkitFace" }
+mlkit-pose-detection-accurate = { module = "com.google.mlkit:pose-detection-accurate", version.ref = "mlkitPose" }
 junit = { module = "junit:junit", version.ref = "junit" }
 
 [plugins]

@@ -26,6 +26,7 @@
 #include "gs/face_cover.h"
 #include "gs/json.h"
 #include "gs/json_parse.h"
+#include "gs/pose.h"
 #include "gs/splat_renderer.h"
 #include "gs/splat_scene.h"
 #include "gs/train_selftest.h"
@@ -62,6 +63,19 @@ struct PlaceSession {
   bool active = false;
 };
 PlaceSession g_place;
+
+// Re-posing the model: its skeleton (from a body pose detector on pictures of
+// it), every shown splat's bones, and the pose chosen. Guarded by g_face_mutex.
+struct PoseSession {
+  std::optional<gs::BodyViews> views;
+  gs::Skeleton skeleton;
+  std::shared_ptr<const gs::SplatScene> skinned;  // the scene `packed` is for
+  gs::Skin skin;
+  std::vector<uint32_t> packed;
+  std::string name = "rest";
+  std::shared_ptr<PoseAnimation> animation;  // shown; null at rest
+};
+PoseSession g_pose;
 constexpr uint32_t kFaceKeepLimit = 2000000;  // splats kept on the CPU at most
 
 std::string error_json(const std::string& message) {
@@ -159,6 +173,16 @@ std::string present_locked() {
   uint32_t count = g_face.shown->count;
   float floor = 0.0f;
   std::unique_ptr<gs::GpuScene> gpu;
+  // With a skeleton, the shown model's splats carry their bones (it comes first in a place too).
+  const std::vector<uint32_t>* skin = nullptr;
+  if (g_pose.skeleton.found) {
+    if (g_pose.skinned != g_face.shown) {
+      g_pose.skin = gs::skin_splats(*g_face.shown, g_pose.skeleton);
+      g_pose.packed = g_pose.skin.packed();
+      g_pose.skinned = g_face.shown;
+    }
+    skin = &g_pose.packed;
+  }
   if (g_place.active && g_place.scene) {
     gs::Staging staged = gs::stage(at_most_degree1(*g_face.shown), *g_place.scene, g_place.spot);
     view.kind = gs::Backdrop::Sky;
@@ -170,13 +194,20 @@ std::string present_locked() {
     view.relight_count = staged.model_count;
     count = staged.scene.count;
     floor = staged.floor;
-    gpu = gs::upload_scene(*ctx, staged.scene);
+    gpu = gs::upload_scene(*ctx, staged.scene, skin);
   } else {
-    gpu = gs::upload_scene(*ctx, *g_face.shown);
+    gpu = gs::upload_scene(*ctx, *g_face.shown, skin);
   }
   Viewer& v = viewer();
   v.set_backdrop(view);
   v.swap_scene(std::move(gpu));
+  if (g_pose.animation && g_pose.animation->count != g_face.shown->count) {
+    // A new one (the render thread may be reading the old), keeping its clock.
+    auto a = std::make_shared<PoseAnimation>(*g_pose.animation);
+    a->count = g_face.shown->count;
+    g_pose.animation = a;
+  }
+  v.set_pose(g_pose.animation);
   gs::JsonWriter w;
   w.begin_object();
   w.field("ok", true);
@@ -227,6 +258,8 @@ std::string load_scene(F&& make_scene, bool keep) {
     {
       std::lock_guard<std::mutex> lock(g_face_mutex);
       g_face = FaceSession{};
+      g_pose = PoseSession{};
+      v.set_pose(nullptr);
       if (kept) g_face.original = std::make_shared<const gs::SplatScene>(std::move(scene));
       g_face.shown = g_face.original;
       // A place chosen before takes the new model in; a model that cannot be kept shows on its own.
@@ -556,10 +589,110 @@ Java_com_ondevice_gsplat_NativeViewer_coverFace(JNIEnv* env, jobject /*this*/, j
   }));
 }
 
+// Re-posing: the app renders the body from around it (poseViews), runs a body
+// pose detector on the pictures, hands the landmarks back (fitPose) and picks
+// a pose (setPose); the shown model then follows its skeleton on the GPU.
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ondevice_gsplat_NativeViewer_poseViews(JNIEnv* env, jobject /*this*/, jint size) {
+  return to_jstring(env, face_call([&] {
+    float forward[3], up[3];
+    viewer().view_axes(forward, up);
+    const uint32_t side = static_cast<uint32_t>(std::clamp(static_cast<int>(size), 256, 1024));
+    g_pose.views = gs::render_body_views(*g_face.original, up, 8, side);
+    gs::JsonWriter w;
+    w.begin_object();
+    w.field("ok", true);
+    w.field("body", g_pose.views->found);
+    w.field("views", static_cast<uint32_t>(g_pose.views->views.size()));
+    w.field("size", side);
+    w.field("height", g_pose.views->height);
+    w.end_object();
+    return w.str();
+  }));
+}
+
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_ondevice_gsplat_NativeViewer_poseViewPixels(JNIEnv* env, jobject /*this*/, jint index) {
+  std::lock_guard<std::mutex> lock(g_face_mutex);
+  if (!g_pose.views || index < 0 || static_cast<size_t>(index) >= g_pose.views->views.size()) return nullptr;
+  const gs::OrthoView& v = g_pose.views->views[static_cast<size_t>(index)];
+  const std::vector<uint8_t> rgb = v.rgb8();
+  const size_t n = size_t(v.width) * v.height;
+  std::vector<jint> argb(n);
+  for (size_t p = 0; p < n; ++p) {
+    argb[p] = static_cast<jint>(0xff000000u | uint32_t(rgb[p * 3]) << 16 | uint32_t(rgb[p * 3 + 1]) << 8 | rgb[p * 3 + 2]);
+  }
+  jintArray out = env->NewIntArray(static_cast<jsize>(n));
+  if (out != nullptr) env->SetIntArrayRegion(out, 0, static_cast<jsize>(n), argb.data());
+  return out;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ondevice_gsplat_NativeViewer_fitPose(JNIEnv* env, jobject /*this*/, jstring jlandmarks) {
+  const std::string landmarks = from_jstring(env, jlandmarks);
+  return to_jstring(env, face_call([&] {
+    if (!g_pose.views || !g_pose.views->found) return error_json("몸을 찾지 못했어요");
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::vector<gs::PoseLandmarks> marks = gs::parse_pose_landmarks(landmarks);
+    const gs::Skeleton sk = gs::fit_skeleton(*g_pose.views, marks);
+    gs::JsonWriter w;
+    w.begin_object();
+    w.field("ok", true);
+    w.field("found", sk.found);
+    w.field("detections", static_cast<uint32_t>(marks.size()));
+    w.field("views", sk.views_used);
+    w.field("mirrored", sk.views_flipped);
+    w.field("error_cm", sk.error * 100.0f);
+    if (sk.found) {
+      g_pose.skeleton = sk;
+      g_pose.skinned = nullptr;
+      g_pose.animation.reset();
+      g_pose.name = "rest";
+      present_locked();  // again, with the splats' bones
+    }
+    w.field("ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    w.end_object();
+    return w.str();
+  }));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ondevice_gsplat_NativeViewer_setPose(JNIEnv* env, jobject /*this*/, jstring jname) {
+  const std::string name = from_jstring(env, jname);
+  return to_jstring(env, face_call([&] {
+    if (!gs::known_pose(name)) return error_json("알 수 없는 자세: " + name);
+    if (name != "rest" && !g_pose.skeleton.found) return error_json("뼈대를 먼저 찾아 주세요");
+    g_pose.name = name;
+    if (name == "rest") {
+      g_pose.animation.reset();
+    } else {
+      auto a = std::make_shared<PoseAnimation>();
+      a->skeleton = g_pose.skeleton;
+      a->name = name;
+      a->moves = gs::pose_moves(name);
+      a->count = g_face.shown->count;
+      g_pose.animation = a;
+    }
+    viewer().set_pose(g_pose.animation);
+    gs::JsonWriter w;
+    w.begin_object();
+    w.field("ok", true);
+    w.field("moves", gs::pose_moves(name));
+    w.end_object();
+    return w.str();
+  }));
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_ondevice_gsplat_NativeViewer_saveShown(JNIEnv* env, jobject /*this*/, jint fd) {
   return to_jstring(env, face_call([&] {
-    gs::SplatScene scene = *g_face.shown;
+    // In the pose shown (a moving one as it is right now).
+    gs::SplatScene scene = g_pose.animation && g_pose.skinned == g_face.shown
+                               ? gs::apply_pose(*g_face.shown, g_pose.skin,
+                                                gs::pose_skeleton(g_pose.skeleton, g_pose.name,
+                                                                  g_pose.animation->seconds()))
+                               : *g_face.shown;
     gs::convert_convention(scene, gs::AxisConvention::RDF);  // the .ply layout
     const std::vector<uint8_t> ply = gs::save_ply(scene);
     size_t written = 0;

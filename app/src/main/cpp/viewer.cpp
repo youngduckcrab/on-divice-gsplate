@@ -158,6 +158,12 @@ void Viewer::set_relight(float strength) {
   request_redraw();
 }
 
+void Viewer::set_pose(std::shared_ptr<const PoseAnimation> pose) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  pose_ = std::move(pose);
+  request_redraw();
+}
+
 void Viewer::request_redraw() {
   redraw_ = true;
   cv_.notify_all();
@@ -212,12 +218,15 @@ void Viewer::render_loop() {
       gs::OrbitCamera orbit;
       gs::BackdropView backdrop;
       float relight = 1.0f;
+      std::shared_ptr<const PoseAnimation> pose;
       std::unique_ptr<gs::GpuScene> incoming;
       bool resized = false;
       bool continuous = false;
       {
         std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [&] { return stop_ || redraw_ || resized_ || continuous_ || pending_scene_ != nullptr; });
+        cv_.wait(lock, [&] {
+          return stop_ || redraw_ || resized_ || continuous_ || pending_scene_ != nullptr || (pose_ && pose_->moves);
+        });
         if (stop_) break;
         incoming = std::move(pending_scene_);
         resized = resized_;
@@ -228,6 +237,7 @@ void Viewer::render_loop() {
         backdrop = backdrop_;
         backdrop.ground = ground_;
         relight = relight_;
+        pose = pose_;
       }
 
       if (incoming) {
@@ -247,7 +257,7 @@ void Viewer::render_loop() {
         continue;
       }
 
-      if (!draw_frame(orbit, backdrop, relight)) {
+      if (!draw_frame(orbit, backdrop, relight, pose.get())) {
         std::lock_guard<std::mutex> lock(mutex_);
         resized_ = true;
         redraw_ = true;
@@ -521,7 +531,8 @@ void Viewer::read_timestamps(uint32_t frame) {
   stats_.draw_ms = stats_.draw_ms == 0.0 ? draw : 0.8 * stats_.draw_ms + 0.2 * draw;
 }
 
-bool Viewer::draw_frame(const gs::OrbitCamera& orbit, const gs::BackdropView& backdrop, float relight) {
+bool Viewer::draw_frame(const gs::OrbitCamera& orbit, const gs::BackdropView& backdrop, float relight,
+                        const PoseAnimation* pose) {
   VkDevice device = ctx_->device();
   Frame& f = frames_[frame_index_];
   GS_VK_CHECK(vkWaitForFences(device, 1, &f.fence, VK_TRUE, UINT64_MAX));
@@ -549,6 +560,12 @@ bool Viewer::draw_frame(const gs::OrbitCamera& orbit, const gs::BackdropView& ba
   }
   renderer_->set_lighting(
       gs::splat_lighting(backdrop.light, backdrop.ground, orbit.flip_y(), relight, backdrop.relight_count));
+  if (pose != nullptr && pose->skeleton.found && pose->name != "rest") {
+    renderer_->set_skinning(
+        gs::skinning_for(gs::pose_skeleton(pose->skeleton, pose->name, pose->seconds()), pose->count));
+  } else {
+    renderer_->set_skinning(gs::SplatSkinning{});
+  }
   renderer_->record_prepare(f.cmd, camera);
   if (query_pool_ != VK_NULL_HANDLE) {
     vkCmdWriteTimestamp(f.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, query_pool_, q + 1);

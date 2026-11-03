@@ -90,5 +90,6 @@ dependencies {
     implementation(libs.arcore)
     implementation(libs.mlkit.segmentation.selfie)
     implementation(libs.mlkit.face.detection)
+    implementation(libs.mlkit.pose.detection.accurate)
     testImplementation(libs.junit)
 }

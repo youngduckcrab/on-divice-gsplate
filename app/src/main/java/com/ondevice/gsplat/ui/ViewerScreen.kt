@@ -51,6 +51,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ondevice.gsplat.NativeViewer
+import com.ondevice.gsplat.viewer.BodyPose
 import com.ondevice.gsplat.viewer.FaceCover
 import com.ondevice.gsplat.viewer.ViewerViewModel
 import java.io.File
@@ -159,6 +160,7 @@ fun ViewerScreen(
             }
             if (vm.faceOpen) FacePanel(vm, onSave = { saveFile.launch(vm.coveredName()) })
             if (vm.placeOpen) PlacePanel(vm, onPickModel = { pickPlace = true })
+            if (vm.poseOpen) PosePanel(vm, onSave = { saveFile.launch(vm.coveredName()) })
             ControlRow {
                 FilledTonalButton(enabled = !vm.loading, onClick = { vm.loadSynthetic(100_000) }) { Text("샘플 10만") }
                 FilledTonalButton(enabled = !vm.loading, onClick = { vm.loadSynthetic(500_000) }) { Text("샘플 50만") }
@@ -174,6 +176,9 @@ fun ViewerScreen(
                 }
                 if (vm.canCoverFace && !vm.faceOpen) {
                     FilledTonalButton(enabled = !vm.loading, onClick = vm::openFacePanel) { Text("얼굴 가리기") }
+                }
+                if (vm.canCoverFace && !vm.poseOpen) {
+                    FilledTonalButton(enabled = !vm.loading, onClick = vm::openPosePanel) { Text("포즈") }
                 }
                 OutlinedButton(onClick = vm::toggleFlip) { Text(if (vm.flipY) "상하 반전 켬" else "상하 반전 끔") }
                 OutlinedButton(onClick = vm::resetView) { Text("시점 초기화") }
@@ -232,6 +237,42 @@ private fun PlacePanel(vm: ViewerViewModel, onPickModel: () -> Unit) {
                 },
                 style = MaterialTheme.typography.bodySmall,
             )
+        }
+    }
+}
+
+/**
+ * The pose the model is shown in: its skeleton is found the first time (a body pose detector on
+ * pictures of it), then every splat follows the bones; the moving poses play on.
+ */
+@Composable
+private fun PosePanel(vm: ViewerViewModel, onSave: () -> Unit) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(horizontal = 10.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("포즈", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+                TextButton(onClick = vm::closePosePanel) { Text("닫기") }
+            }
+            for ((moving, title) in listOf(false to "자세", true to "움직임")) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(title, style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(44.dp))
+                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        for (pose in BodyPose.entries.filter { it.moves == moving }) {
+                            FilterChip(
+                                selected = vm.pose == pose,
+                                enabled = !vm.poseBusy,
+                                onClick = { vm.choosePose(pose) },
+                                label = { Text(pose.label) },
+                            )
+                        }
+                    }
+                }
+            }
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(enabled = !vm.poseBusy, onClick = vm::saveToModels) { Text("이 자세로 내 모델에 저장") }
+                OutlinedButton(enabled = !vm.poseBusy, onClick = onSave) { Text("파일로 내보내기") }
+            }
+            if (vm.poseStatus.isNotEmpty()) Text(vm.poseStatus, style = MaterialTheme.typography.bodySmall)
         }
     }
 }

@@ -37,6 +37,17 @@ enum class FaceCover(val id: String, val label: String) {
  * A 3D place the model can be put into: a spot in one of the captured places shipped with the
  * app (assets/environments/manifest.json), or none.
  */
+/** Poses the model can be shown in (NativeViewer.setPose names); some move. */
+enum class BodyPose(val id: String, val label: String, val moves: Boolean = false) {
+    REST("rest", "처음 자세"),
+    ATTENTION("attention", "차렷"),
+    HANDS_ON_HIPS("hands_on_hips", "허리에 손"),
+    ARMS_UP("arms_up", "만세"),
+    BOW("bow", "인사"),
+    WAVE("wave", "손 흔들기", moves = true),
+    WALK("walk", "걷기", moves = true),
+}
+
 data class PlaceChoice(
     val id: String,
     val label: String,
@@ -57,6 +68,8 @@ private object ViewerSession {
     var faceCover = FaceCover.NONE
     var faceSize = 1.0f
     var faceRaise = 0.0f
+    var skeletonFound = false
+    var pose = BodyPose.REST
 }
 
 class ViewerViewModel(application: Application) : AndroidViewModel(application) {
@@ -100,6 +113,17 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
     var faceSize by mutableFloatStateOf(1.0f)
     var faceRaise by mutableFloatStateOf(0.0f)
     private var coverAgain = false
+
+    // Re-posing: also only for models opened from a file.
+    var poseOpen by mutableStateOf(false)
+        private set
+    var poseBusy by mutableStateOf(false)
+        private set
+    var poseStatus by mutableStateOf("")
+        private set
+    var pose by mutableStateOf(BodyPose.REST)
+        private set
+    private var skeletonFound = false
 
     /** Spots in the places from assets/environments, then none. */
     val places: List<PlaceChoice> = loadPlaces()
@@ -206,6 +230,8 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
         faceSize = ViewerSession.faceSize
         faceRaise = ViewerSession.faceRaise
         if (faceCover != FaceCover.NONE) faceStatus = "${faceCover.label} 적용 중인 모델이에요"
+        skeletonFound = ViewerSession.skeletonFound
+        pose = ViewerSession.pose
     }
 
     private fun rememberFace() {
@@ -238,6 +264,90 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
     fun openPlacePanel() {
         placeOpen = true
         faceOpen = false
+        poseOpen = false
+    }
+
+    fun openPosePanel() {
+        poseOpen = true
+        placeOpen = false
+        faceOpen = false
+        if (!skeletonFound && poseStatus.isEmpty()) {
+            poseStatus = "자세를 고르면 먼저 몸의 뼈대를 찾아요 (몇 초). 팔을 벌리고 찍은 모델일수록 잘 돼요."
+        }
+    }
+
+    fun closePosePanel() {
+        poseOpen = false
+    }
+
+    /**
+     * Shows the model in [choice]. The first time, finds the skeleton: pictures of the body
+     * from around it, pose detection on them, and the engine puts the points together in 3D.
+     */
+    fun choosePose(choice: BodyPose) {
+        if (poseBusy) return
+        if (!canCoverFace) {
+            poseStatus = "파일에서 연 모델(학습한 모델, PLY)에서만 쓸 수 있어요"
+            return
+        }
+        viewModelScope.launch {
+            poseBusy = true
+            var found = ""
+            if (!skeletonFound && choice != BodyPose.REST) {
+                poseStatus = "몸의 뼈대를 찾는 중…"
+                val fit = withContext(Dispatchers.Default) {
+                    runCatching { findSkeleton() }
+                        .getOrElse { JSONObject().put("ok", false).put("error", it.message ?: it.toString()) }
+                }
+                if (!fit.optBoolean("ok")) {
+                    poseBusy = false
+                    poseStatus = "뼈대 찾기 실패: ${fit.optString("error")}"
+                    return@launch
+                }
+                if (!fit.optBoolean("found")) {
+                    poseBusy = false
+                    poseStatus = "몸을 알아보지 못했어요 (사람을 찾은 그림 ${fit.optInt("detections")}장). " +
+                        "온몸이 나온 모델에서 써 주세요."
+                    return@launch
+                }
+                skeletonFound = true
+                ViewerSession.skeletonFound = true
+                found = "뼈대를 찾았어요 (그림 ${fit.optInt("views")}장, 어긋남 " +
+                    "${"%.1f".format(java.util.Locale.US, fit.optDouble("error_cm"))} cm) · "
+            }
+            val result = withContext(Dispatchers.Default) {
+                runCatching { JSONObject(NativeViewer.setPose(choice.id)) }
+                    .getOrElse { JSONObject().put("ok", false).put("error", it.message ?: it.toString()) }
+            }
+            poseBusy = false
+            if (!result.optBoolean("ok")) {
+                poseStatus = "자세 바꾸기 실패: ${result.optString("error")}"
+                return@launch
+            }
+            pose = choice
+            ViewerSession.pose = choice
+            poseStatus = found + when {
+                choice == BodyPose.REST -> "찍은 그대로의 자세예요"
+                choice.moves -> "${choice.label} 중이에요"
+                else -> "${choice.label} 자세예요"
+            }
+        }
+    }
+
+    private fun findSkeleton(): JSONObject {
+        val views = JSONObject(NativeViewer.poseViews(512))
+        if (!views.optBoolean("ok")) return views
+        if (!views.optBoolean("body")) return JSONObject().put("ok", false).put("error", "몸을 찾지 못했어요")
+        val size = views.optInt("size")
+        val pictures = (0 until views.optInt("views")).mapNotNull { i ->
+            NativeViewer.poseViewPixels(i)?.let { i to Bitmap.createBitmap(it, size, size, Bitmap.Config.ARGB_8888) }
+        }
+        val landmarks = try {
+            PoseFinder().use { it.landmarks(pictures) }
+        } finally {
+            pictures.forEach { it.second.recycle() }
+        }
+        return JSONObject(NativeViewer.fitPose(landmarks.toString()))
     }
 
     fun closePlacePanel() {
@@ -379,6 +489,7 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
 
     fun openFacePanel() {
         placeOpen = false
+        poseOpen = false
         faceOpen = true
         if (!facePlaced && !faceBusy) findFace(aroundCamera = false)
     }
@@ -460,10 +571,20 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    /** File name for saving what is shown: the model's name plus the cover. */
+    /** File name for saving what is shown: the model's name plus the cover and the pose. */
     fun coveredName(): String {
         val base = scene?.optString("label").orEmpty().substringBeforeLast('.').ifEmpty { "model" }
-        return if (faceCover == FaceCover.NONE) "$base.ply" else "$base-${faceCover.label}.ply"
+        val parts = listOfNotNull(
+            base,
+            faceCover.label.takeIf { faceCover != FaceCover.NONE },
+            pose.label.takeIf { pose != BodyPose.REST },
+        )
+        return parts.joinToString("-") + ".ply"
+    }
+
+    /** Shows a save's progress in the panel it was started from. */
+    private fun report(message: String) {
+        if (poseOpen) poseStatus = message else faceStatus = message
     }
 
     /** Saves what is shown into app storage, where [modelFiles] lists it. */
@@ -473,7 +594,7 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
         var n = 2
         while (file.exists()) file = File(modelsDir, "$name-${n++}.ply")
         viewModelScope.launch {
-            faceStatus = "저장 중…"
+            report("저장 중…")
             val result = withContext(Dispatchers.IO) {
                 runCatching {
                     val mode = ParcelFileDescriptor.MODE_WRITE_ONLY or ParcelFileDescriptor.MODE_CREATE or
@@ -481,30 +602,34 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
                     JSONObject(NativeViewer.saveShown(ParcelFileDescriptor.open(file, mode).detachFd()))
                 }.getOrElse { JSONObject().put("ok", false).put("error", it.message ?: it.toString()) }
             }
-            faceStatus = if (result.optBoolean("ok")) {
-                "내 모델에 저장했어요: ${file.name}"
-            } else {
-                file.delete()
-                "저장 실패: ${result.optString("error")}"
-            }
+            report(
+                if (result.optBoolean("ok")) {
+                    "내 모델에 저장했어요: ${file.name}"
+                } else {
+                    file.delete()
+                    "저장 실패: ${result.optString("error")}"
+                },
+            )
         }
     }
 
     fun saveShown(uri: Uri) {
         val resolver = getApplication<Application>().contentResolver
         viewModelScope.launch {
-            faceStatus = "저장 중…"
+            report("저장 중…")
             val result = withContext(Dispatchers.IO) {
                 runCatching {
                     val pfd = resolver.openFileDescriptor(uri, "wt") ?: error("파일을 열 수 없음")
                     JSONObject(NativeViewer.saveShown(pfd.detachFd()))
                 }.getOrElse { JSONObject().put("ok", false).put("error", it.message ?: it.toString()) }
             }
-            faceStatus = if (result.optBoolean("ok")) {
-                "저장했어요 (${"%.1f".format(java.util.Locale.US, result.optLong("bytes") / 1e6)} MB)"
-            } else {
-                "저장 실패: ${result.optString("error")}"
-            }
+            report(
+                if (result.optBoolean("ok")) {
+                    "저장했어요 (${"%.1f".format(java.util.Locale.US, result.optLong("bytes") / 1e6)} MB)"
+                } else {
+                    "저장 실패: ${result.optString("error")}"
+                },
+            )
         }
     }
 
@@ -555,6 +680,12 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
                 faceSize = 1.0f
                 faceRaise = 0.0f
                 faceStatus = ""
+                poseOpen = false
+                poseStatus = ""
+                pose = BodyPose.REST
+                skeletonFound = false
+                ViewerSession.skeletonFound = false
+                ViewerSession.pose = BodyPose.REST
                 ViewerSession.scene = scene
                 rememberFace()
                 if (remember != null) prefs.edit().putString("last_model", remember).apply()

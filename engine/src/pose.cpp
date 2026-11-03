@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -409,16 +407,6 @@ Skeleton fit_skeleton(const BodyViews& views, const std::vector<PoseLandmarks>& 
   sk.error = float(std::sqrt(err / std::max(err_w, 1e-9)));
   int flipped = 0;
   for (uint8_t s : best) flipped += s;
-  if (std::getenv("GS_POSE_DEBUG") != nullptr) {
-    std::fprintf(stderr, "swaps:");
-    for (size_t k = 0; k < n; ++k) std::fprintf(stderr, " %d(v%d)", best[k], obs[k].marks->view);
-    std::fprintf(stderr, "\n");
-    for (int j : {0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28}) {
-      std::fprintf(stderr, "  p%d (%.3f %.3f %.3f)", j, pts[size_t(j)].x, pts[size_t(j)].y, pts[size_t(j)].z);
-      for (size_t k = 0; k < n; ++k) std::fprintf(stderr, " %.3f", std::sqrt(residual2(obs[k], best[k] != 0, j, pts[size_t(j)])));
-      std::fprintf(stderr, "\n");
-    }
-  }
   for (int j = 0; j < kPosePoints; ++j) {
     pts[size_t(j)].store(sk.points[j]);
     sk.confidence[j] = weights[size_t(j)] / float(n);

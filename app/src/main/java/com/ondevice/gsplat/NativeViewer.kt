@@ -83,6 +83,30 @@ object NativeViewer {
      */
     external fun coverFace(style: String, size: Float, raise: Float): String
 
-    /** Writes the model as shown as a .ply to [fd] (taken over). Returns JSON {ok, count, bytes}. */
+    /**
+     * Writes the model as shown (cover, and pose: a moving one as it is right now) as a .ply to
+     * [fd] (taken over). Returns JSON {ok, count, bytes}.
+     */
     external fun saveShown(fd: Int): String
+
+    // Re-posing, for a model opened from a file.
+
+    /** Eight pictures of the whole body from around it for a body pose detector. Returns JSON {ok, body, views, size}. */
+    external fun poseViews(size: Int): String
+
+    /** Picture [index] of [poseViews] as ARGB_8888 pixels (size x size), or null. */
+    external fun poseViewPixels(index: Int): IntArray?
+
+    /**
+     * Fits the skeleton to a detector's landmarks in those pictures, a JSON array of
+     * {"view": i, "points": [[x, y, likelihood] x 33]} (BlazePose order). Returns JSON
+     * {ok, found, views, mirrored, error_cm}.
+     */
+    external fun fitPose(landmarks: String): String
+
+    /**
+     * Shows the model in pose [name]: rest, attention, hands_on_hips, arms_up, bow, or the moving
+     * wave and walk. Returns JSON {ok, moves}.
+     */
+    external fun setPose(name: String): String
 }

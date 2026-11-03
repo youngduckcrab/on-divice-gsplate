@@ -2,6 +2,7 @@
 
 #include <android/native_window.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -11,8 +12,23 @@
 
 #include "gs/background.h"
 #include "gs/camera.h"
+#include "gs/pose.h"
 #include "gs/splat_renderer.h"
 #include "gs/vk_context.h"
+
+// A pose shown on the model: its first `count` splats (uploaded with skin
+// data) follow the skeleton turned into pose `name`, moving with time for
+// the moving poses.
+struct PoseAnimation {
+  gs::Skeleton skeleton;
+  std::string name = "rest";
+  uint32_t count = 0;
+  bool moves = false;
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+  float seconds() const {
+    return std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count();
+  }
+};
 
 // On-screen splat viewer. The scene and camera live for the whole process; the
 // window (and with it the swapchain and render thread) comes and goes with the
@@ -48,6 +64,8 @@ class Viewer {
   void set_backdrop(const gs::BackdropView& view);
   // How much the model takes the backdrop's light: 0 as captured, 1 fully.
   void set_relight(float strength);
+  // The pose the model is shown in (null: as captured); a moving one keeps frames coming.
+  void set_pose(std::shared_ptr<const PoseAnimation> pose);
 
   std::string stats_json();
 
@@ -76,7 +94,8 @@ class Viewer {
   void create_swapchain();
   void destroy_swapchain();
   // Returns false when the swapchain is out of date.
-  bool draw_frame(const gs::OrbitCamera& orbit, const gs::BackdropView& backdrop, float relight);
+  bool draw_frame(const gs::OrbitCamera& orbit, const gs::BackdropView& backdrop, float relight,
+                  const PoseAnimation* pose);
   void read_timestamps(uint32_t frame);
 
   std::shared_ptr<gs::VkContext> ctx_;
@@ -98,6 +117,7 @@ class Viewer {
   gs::Ground ground_;
   gs::BackdropView backdrop_;
   float relight_ = 1.0f;
+  std::shared_ptr<const PoseAnimation> pose_;
   Stats stats_;
 
   // Owned by the render thread while it runs.
