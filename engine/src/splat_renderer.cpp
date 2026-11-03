@@ -64,7 +64,7 @@ uint64_t sh_uints_per_splat(int degree) { return (uint64_t(sh_rest_coeffs(degree
 
 }  // namespace
 
-std::unique_ptr<GpuScene> upload_scene(VkContext& ctx, const SplatScene& scene) {
+std::unique_ptr<GpuScene> upload_scene(VkContext& ctx, const SplatScene& scene, const std::vector<uint32_t>* skin) {
   if (scene.count == 0) throw std::runtime_error("장면이 비어 있음");
   const uint64_t max_range = ctx.info().properties.limits.maxStorageBufferRange;
   const uint64_t n = scene.count;
@@ -123,6 +123,13 @@ std::unique_ptr<GpuScene> upload_scene(VkContext& ctx, const SplatScene& scene) 
   gpu->projected = ctx.create_buffer(n * 32, MemoryKind::Device);
   gpu->keys = ctx.create_buffer(n * 4, MemoryKind::Device);
   gpu->order = ctx.create_buffer(n * 4, MemoryKind::Device);
+  if (skin != nullptr && skin->size() >= 2) {
+    gpu->skin_count = uint32_t(std::min<uint64_t>(skin->size() / 2, n));
+    gpu->skin = ctx.create_buffer(uint64_t(gpu->skin_count) * 8, MemoryKind::Device);
+    ctx.upload(gpu->skin, skin->data(), uint64_t(gpu->skin_count) * 8);
+  } else {
+    gpu->skin = ctx.create_buffer(8, MemoryKind::Device);
+  }
   gpu->draw_args = ctx.create_buffer(16, MemoryKind::Upload, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
   const uint32_t args[4] = {4, 0, 0, 0};  // vertexCount, instanceCount, firstVertex, firstInstance
   std::memcpy(gpu->draw_args.mapped(), args, sizeof(args));
@@ -131,7 +138,7 @@ std::unique_ptr<GpuScene> upload_scene(VkContext& ctx, const SplatScene& scene) 
 
 SplatRenderer::SplatRenderer(VkContext& ctx, VkRenderPass render_pass)
     : ctx_(ctx),
-      preprocess_(ctx.create_compute_pipeline(shaders::splat_preprocess, 7, sizeof(PreprocessParams))),
+      preprocess_(ctx.create_compute_pipeline(shaders::splat_preprocess, 9, sizeof(PreprocessParams))),
       sort_(ctx) {
   VkDevice device = ctx_.device();
   pool_ = ctx_.create_descriptor_pool(16, 96);
@@ -259,9 +266,13 @@ void SplatRenderer::attach(GpuScene* scene) {
   if (lighting_buffer_.handle() == VK_NULL_HANDLE) {
     lighting_buffer_ = ctx_.create_buffer(sizeof(SplatLighting), MemoryKind::Device);
   }
+  if (skinning_buffer_.handle() == VK_NULL_HANDLE) {
+    skinning_buffer_ = ctx_.create_buffer(sizeof(SplatSkinning), MemoryKind::Device);
+  }
   preprocess_set_ = ctx_.allocate_set(pool_, preprocess_.set_layout(),
                                       {&scene->splats, &scene->sh_rest, &scene->projected, &scene->keys,
-                                       &scene->order, &scene->draw_args, &lighting_buffer_});
+                                       &scene->order, &scene->draw_args, &lighting_buffer_, &scene->skin,
+                                       &skinning_buffer_});
   draw_set_ = ctx_.allocate_set(pool_, draw_set_layout_, {&scene->projected, &scene->order});
   sort_binding_ = sort_.bind(pool_, scene->keys, scene->order);
 }
@@ -276,6 +287,10 @@ void SplatRenderer::record_prepare(VkCommandBuffer cmd, const Camera& camera) {
   vkCmdFillBuffer(cmd, scene_->draw_args.handle(), 4, 4, 0);  // instanceCount = 0
   // In the command stream, so frames in flight each read their own lighting.
   vkCmdUpdateBuffer(cmd, lighting_buffer_.handle(), 0, sizeof(SplatLighting), &lighting_);
+  SplatSkinning skinning = skinning_;
+  skinning.count = std::min(skinning.count, scene_->skin_count);
+  skinning.bones = std::min(skinning.bones, kMaxBones);
+  vkCmdUpdateBuffer(cmd, skinning_buffer_.handle(), 0, sizeof(SplatSkinning), &skinning);
   VkContext::barrier(cmd);
 
   PreprocessParams p{};

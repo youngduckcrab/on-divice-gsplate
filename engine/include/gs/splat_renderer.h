@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <vector>
 
 #include "gs/camera.h"
 #include "gs/radix_sort.h"
@@ -20,6 +21,19 @@ struct GpuScene {
   Buffer keys;       // per frame: 16-bit back-to-front depth keys
   Buffer order;      // per frame: sorted splat indices
   Buffer draw_args;  // VkDrawIndirectCommand; instanceCount = visible splats (host visible)
+  Buffer skin;       // 8 B per posable splat: 4 bone indices, 4 weights (a byte each); see SplatSkinning
+  uint32_t skin_count = 0;  // splats with skin data (the first ones)
+};
+
+// Posing of the splats that have skin data (see gs::pose_skeleton): each
+// follows the blend of up to 4 bones' rigid motions (position, the axes of
+// its covariance, and the direction its view-dependent colour is seen from).
+constexpr uint32_t kMaxBones = 32;
+struct SplatSkinning {
+  uint32_t count = 0;  // splats posed (the first ones; 0: off); no more than the scene's skin_count
+  uint32_t bones = 0;
+  uint32_t pad[2] = {0, 0};
+  float rows[kMaxBones * 3][4] = {};  // per bone, 3 rows of [rotation | translation]
 };
 
 // Relighting of the splats to match a backdrop (see gs::splat_lighting): each
@@ -44,7 +58,9 @@ struct SplatLighting {
 
 // Throws std::runtime_error if the scene exceeds the device's buffer limits.
 // Lowers the SH degree if the coefficients would not fit a single binding.
-std::unique_ptr<GpuScene> upload_scene(VkContext& ctx, const SplatScene& scene);
+// `skin` (2 uint32 per splat, gs::Skin::packed) makes the first splats posable.
+std::unique_ptr<GpuScene> upload_scene(VkContext& ctx, const SplatScene& scene,
+                                       const std::vector<uint32_t>* skin = nullptr);
 
 // Rasterises splats as depth-sorted, alpha-blended screen-space ellipses:
 // a compute pass projects every splat (EWA 2D covariance, SH colour), a radix
@@ -65,6 +81,7 @@ class SplatRenderer {
 
   // Takes effect from the next record_prepare.
   void set_lighting(const SplatLighting& lighting) { lighting_ = lighting; }
+  void set_skinning(const SplatSkinning& skinning) { skinning_ = skinning; }
 
   // Projection + depth sort. Record outside a render pass.
   void record_prepare(VkCommandBuffer cmd, const Camera& camera);
@@ -91,6 +108,8 @@ class SplatRenderer {
   RadixSort::Binding sort_binding_;
   SplatLighting lighting_;
   Buffer lighting_buffer_;
+  SplatSkinning skinning_;
+  Buffer skinning_buffer_;
 };
 
 }  // namespace gs
