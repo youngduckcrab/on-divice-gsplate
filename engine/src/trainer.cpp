@@ -75,6 +75,7 @@ constexpr uint32_t kFlagPoseGrad = 8;
 constexpr uint32_t kFlagPoseOnly = 16;
 constexpr uint32_t kFlagMotion = 32;
 constexpr uint32_t kFlagMotionGrad = 64;
+constexpr uint32_t kFlagSparseAdam = 128;
 constexpr uint32_t kMaxMotionNodes = 128;  // train_step: one thread per node
 constexpr uint32_t kMotionNodeBytes = 80;  // train_motion.glsl: 5 vec4 per node
 constexpr size_t kNone = ~size_t(0);
@@ -487,7 +488,7 @@ void Trainer::write_frame(uint32_t slot, const Camera& camera, const float backg
   f.model[1] = sh_degree_at(step);
   f.model[2] = sh_stride_;
   f.model[3] = (masked_target ? kFlagMaskedTarget : 0) | (bucket_state ? kFlagBucketState : 0) |
-               (ssim ? kFlagSsim : 0) | flags;
+               (ssim ? kFlagSsim : 0) | (options_.sparse_adam ? kFlagSparseAdam : 0) | flags;
   for (int c = 0; c < 3; ++c) f.background[c] = background[c];
   f.background[3] = 1.0f / (3.0f * float(width_) * float(height_));
 

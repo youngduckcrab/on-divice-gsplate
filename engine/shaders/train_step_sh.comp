@@ -27,7 +27,8 @@ void main() {
   if (k >= uint(sh_rest_coeffs(degree))) return;  // degrees not active yet
   if (params[i * 4u + 1u].w < 0.5) return;       // free slot
   vec3 colour = sh_input[i * 2u].xyz;
-  if (colour == vec3(0.0)) return;  // drew nothing in this view: kept as it is (sparse Adam, see train_step)
+  // Drew nothing in this view: kept as it is (sparse Adam, see train_step).
+  if (colour == vec3(0.0) && (frame.model.w & kFlagSparseAdam) != 0u) return;
   float basis[16];
   sh_basis(sh_input[i * 2u + 1u].xyz, degree, basis);
   vec3 g = basis[k + 1u] * colour;

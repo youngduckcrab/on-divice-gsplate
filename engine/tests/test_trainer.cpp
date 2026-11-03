@@ -546,23 +546,24 @@ void test_pose_recovery(gs::VkContext& ctx) {
   EXPECT(shift1 < 0.25 * shift0 && turn1 < 0.25 * turn0, "pose not recovered: %.3f m %.2f deg left", shift1, turn1);
 }
 
-void test_motion_gradient(gs::VkContext& ctx) {
+void test_motion_gradient(gs::VkContext& ctx, uint32_t wanted) {
   // With every node at rest the gaussians are where they are, so a shift s of
   // node k moves its gaussians by w s: dL/ds = sum_i w_i dL/dp_i. A turn u
   // about the node moves them by w u x (p_i - n_k) and turns their
   // orientation by w u: dL/du = sum_i w_i ((p_i - n_k) x dL/dp_i + tau_i),
   // tau_i the orientation's share (as in test_pose_gradient), all from the
   // per-gaussian gradients checked against the CPU reference. SH degree 0.
+  // Up to 64 nodes two threads share each node's sum; more, one thread each.
   gs::Dataset ds = gs::make_test_dataset(kWidth, kHeight, 2, true, 3);
-  gs::SplatScene scene = gs::make_test_scene(120, 0, 9);
+  gs::SplatScene scene = gs::make_test_scene(wanted > 64 ? 400 : 120, 0, 9);
   const float bg[3] = {0.2f, 0.3f, 0.4f};
   gs::TrainOptions o = gs::frozen_train_options(0, true);
   o.refine_motion = true;
   o.motion_from = 0;
-  o.motion_nodes = 6;
+  o.motion_nodes = wanted;
   o.lr_motion_shift = o.lr_motion_turn = 0.0f;  // measure only
   gs::Trainer t(ctx, ds, scene, o);
-  EXPECT(t.motion_nodes().size() == 6, "%zu motion nodes", t.motion_nodes().size());
+  EXPECT(t.motion_nodes().size() == wanted, "%zu motion nodes", t.motion_nodes().size());
   t.step_on(1, bg);
   const std::vector<double>& g = t.last_motion_gradient();
   const gs::Trainer::Gradients grads = t.first_step_gradients();
@@ -1092,7 +1093,8 @@ int main() {
     test_pose_gradient(ctx, 0.0f);
     test_pose_gradient(ctx, 0.5f);
     test_pose_recovery(ctx);
-    test_motion_gradient(ctx);
+    test_motion_gradient(ctx, 6);
+    test_motion_gradient(ctx, 100);
     test_motion_recovery(ctx);
     test_motion_batched(ctx);
     test_exposure_recovery(ctx);

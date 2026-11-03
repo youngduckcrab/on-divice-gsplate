@@ -10,6 +10,7 @@
 //            [--refine-poses] [--pose-lr shift,turn] [--pose-from N] [--eval-pose-steps N] [--pose-out poses.json]
 //            [--refine-motion] [--motion-nodes 64] [--motion-lr shift,turn] [--motion-lr-final F] [--motion-from N]
 //            [--refine-exposure] (a brightness gain per view and colour channel)
+//            [--sparse-adam] (gaussians that drew nothing in a step's view keep their values and moments)
 //            [--diagnose] (after training: per-view brightness, where the error is, blurry photos)
 //            [--bucket-state-limit MB (each of the two bucket state buffers; phones: 128)]
 //            [--motion-reg decay,rigidity,smoothness,center] [--eval-rest <dataset_dir>] (held-out views of a twin
@@ -117,6 +118,8 @@ int main(int argc, char** argv) {
         options.eval_pose_steps = std::atoi(next());
       } else if (arg == "--pose-out") {
         pose_out = next();
+      } else if (arg == "--sparse-adam") {
+        options.sparse_adam = true;
       } else if (arg == "--refine-exposure") {
         options.refine_exposure = true;
       } else if (arg == "--diagnose") {

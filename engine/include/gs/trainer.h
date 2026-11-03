@@ -130,6 +130,11 @@ struct TrainOptions {
   uint32_t exposure_from = 300;
   float exposure_rate = 0.3f;
 
+  // Sparse Adam: a gaussian that drew nothing in a step's view keeps its
+  // values and moments (otherwise it keeps moving on its momentum). Saves
+  // optimizer work; with short schedules each gaussian gets fewer moves.
+  bool sparse_adam = false;
+
   // Adaptive density control.
   uint32_t densify_from = 300;
   uint32_t densify_until = 2000;

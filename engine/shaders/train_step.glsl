@@ -50,6 +50,7 @@ shared vec3 s_dturn[128];
 shared uvec4 s_nodes[128];
 shared vec4 s_weights[128];
 shared uint s_node_mask[4];  // nodes some gaussian of this workgroup follows (up to 128)
+shared uint s_list[128];     // those nodes, in order
 #endif
 
 struct MotionShare {
@@ -219,11 +220,11 @@ void step_gaussian(uint i, bool pose_only, inout vec3 grad_d, inout vec3 grad_w,
   }
 
   if (pose_only) return;
-  // Sparse Adam: a gaussian that drew nothing in this view (outside it, or
-  // behind others past where every pixel it covers had stopped) keeps its
-  // values and moments instead of drifting on its momentum, and costs no
-  // reads and writes of them.
-  if (!drew) {
+  // Sparse Adam (kFlagSparseAdam): a gaussian that drew nothing in this view
+  // (outside it, or behind others past where every pixel it covers had
+  // stopped) keeps its values and moments instead of drifting on its
+  // momentum, and costs no reads and writes of them.
+  if (!drew && (frame.model.w & kFlagSparseAdam) != 0u) {
     sh_input[i * 2u] = vec4(0.0);
     return;
   }
@@ -268,9 +269,11 @@ void main() {
   }
 #ifdef GS_MOTION_GRAD
   if ((flags & kFlagMotionGrad) != 0u) {
-    // Each node's sum over this workgroup's gaussians, without float atomics:
-    // only for the nodes some gaussian here follows (marked below), and with
-    // at most 64 nodes, two threads per node, each over half the gaussians.
+    // Each node's sum over this workgroup's gaussians, without float atomics.
+    // Gaussians are in space-filling-curve order, so a workgroup's follow a
+    // few of the nodes: those are listed, and the threads split between them,
+    // each over a slice of the gaussians (whole waves of threads past the
+    // list do nothing), then each node adds up its slices.
     s_rest[l] = share.any ? params[i * 4u].xyz : vec3(0.0);
     s_dpos[l] = share.dpos;
     s_dturn[l] = share.dturn;
@@ -286,14 +289,24 @@ void main() {
     }
     barrier();
     uint nodes = frame.limits.y;
-    bool halves = nodes <= 64u;  // the same for the whole dispatch
-    uint node = halves ? (l & 63u) : l;
-    uint first = halves ? (l >> 6u) * 64u : 0u;
-    uint last = halves ? first + 64u : 128u;
+    uint word = l >> 5u, bit = 1u << (l & 31u);
+    bool mine = l < nodes && (s_node_mask[word] & bit) != 0u;
+    uint place = uint(bitCount(s_node_mask[word] & (bit - 1u))), count = 0u;
+    for (uint w = 0u; w < 4u; ++w) {
+      uint c = uint(bitCount(s_node_mask[w]));
+      count += c;
+      if (w < word) place += c;
+    }
+    if (mine) s_list[place] = l;
+    // Threads per listed node: a power of two, up to 16, all within the 128.
+    uint parts = count <= 1u ? 16u : min(16u, 128u >> uint(findMSB(count - 1u) + 1));
+    uint per = 128u / parts;
+    barrier();
     vec3 shift = vec3(0.0), turn = vec3(0.0);
-    if (node < nodes && (s_node_mask[node >> 5u] & (1u << (node & 31u))) != 0u) {
+    if (l < count * parts) {
+      uint node = s_list[l / parts], first = (l % parts) * per;
       vec4 c = motion[node * kMotionNodeVec4 + 4u];
-      for (uint j = first; j < last; ++j) {
+      for (uint j = first; j < first + per; ++j) {
         uvec4 n = s_nodes[j];
         vec4 w = s_weights[j];
         float wl = n.x == node ? w.x : n.y == node ? w.y : n.z == node ? w.z : n.w == node ? w.w : 0.0;
@@ -303,17 +316,19 @@ void main() {
         turn += wl * (s_dturn[j] + cross(arm, s_dpos[j]));
       }
     }
-    if (halves) {
-      // The second half's sums to the first (the pose sums above are done with these).
-      s_grad_d[l] = shift;
-      s_grad_w[l] = turn;
-      barrier();
-      if (l < 64u) {
-        shift += s_grad_d[l + 64u];
-        turn += s_grad_w[l + 64u];
+    // The slices to their nodes (the pose sums above are done with these).
+    s_grad_d[l] = shift;
+    s_grad_w[l] = turn;
+    barrier();
+    if (l < nodes) {
+      shift = vec3(0.0);
+      turn = vec3(0.0);
+      if (mine) {
+        for (uint k = place * parts; k < (place + 1u) * parts; ++k) {
+          shift += s_grad_d[k];
+          turn += s_grad_w[k];
+        }
       }
-    }
-    if (l < nodes && (!halves || l < 64u)) {
       uint o = (gl_WorkGroupID.x * nodes + l) * 2u;
       motion_grad[o] = vec4(shift, 0.0);
       motion_grad[o + 1u] = vec4(turn, 0.0);

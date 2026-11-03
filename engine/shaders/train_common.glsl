@@ -54,6 +54,7 @@ const uint kFlagPoseGrad = 8u;      // train_step sums the gradient of the camer
 const uint kFlagPoseOnly = 16u;     // only that gradient: no parameter, moment or statistics updates
 const uint kFlagMotion = 32u;       // gaussians follow the subject's motion in this view (train_motion.glsl)
 const uint kFlagMotionGrad = 64u;   // train_step sums the gradient of that motion per node, per workgroup
+const uint kFlagSparseAdam = 128u;  // gaussians that drew nothing keep their values and moments (TrainOptions::sparse_adam)
 
 // SSIM window: 11x11 Gaussian, sigma 1.5, separable (as in 3D Gaussian Splatting).
 const int kSsimRadius = 5;
