@@ -3,6 +3,7 @@
 // (mirrored in the views from behind, as detectors tend to, one view
 // garbage), the splats' bones, the named poses, the CPU posing and the GPU
 // skinning against it.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -273,6 +274,52 @@ void test_poses(const Person& p, const gs::Skeleton& sk, const gs::Skin& skin) {
     for (int j : {27, 28, 29, 30, 31, 32}) rest_low = std::min(rest_low, sk.points[j][1]);
     EXPECT(std::fabs(low - rest_low) < 1e-3f, "walk t=%.2f: feet on the floor (%.4f vs %.4f)", t, low, rest_low);
   }
+  // Palms: the rest palm faces down (a T-pose); each pose turns it the way it should face.
+  auto palm = [&](const gs::BonePose& pose, int hand) {
+    const float* r = pose.rotation[hand];
+    return V{-r[1], -r[4], -r[7]};  // the turned (0, -1, 0)
+  };
+  const V inward_l = mul(p.left, -1.0f);
+  EXPECT(dot(palm(down, gs::kLeftHand), inward_l) > 0.8f, "arms down: palm towards the thigh (%.2f)",
+         dot(palm(down, gs::kLeftHand), inward_l));
+  const V facing_in = norm(add(mul(p.left, -0.45f), mul(p.facing, 0.9f)));
+  EXPECT(dot(palm(up, gs::kLeftHand), facing_in) > 0.8f, "arms up: palms to the front (%.2f)",
+         dot(palm(up, gs::kLeftHand), facing_in));
+  EXPECT(dot(palm(hips, gs::kLeftHand), inward_l) > 0.7f, "hands on hips: palm on the waist (%.2f)",
+         dot(palm(hips, gs::kLeftHand), inward_l));
+  const gs::BonePose wave_pose = gs::pose_skeleton(sk, "wave", 0.1f);
+  EXPECT(dot(palm(wave_pose, gs::kRightHand), p.facing) > 0.8f, "waving palm to the front (%.2f)",
+         dot(palm(wave_pose, gs::kRightHand), p.facing));
+  // Bowing: the back straight, the hands together in front.
+  const gs::BonePose bow = gs::pose_skeleton(sk, "bow");
+  const V wl = moved(bow, gs::kLeftForearm, from(sk.points[15]));
+  const V wr = moved(bow, gs::kRightForearm, from(sk.points[16]));
+  EXPECT(len(sub(wl, wr)) < 0.12f && dot(sub(wl, from(sk.points[23])), p.facing) > 0.1f,
+         "bow: hands together (%.3f m apart) in front", len(sub(wl, wr)));
+
+  // The shoulders bend without tearing: splats near the shoulder keep their
+  // neighbours about as near as they were.
+  const gs::SplatScene posed_down = gs::apply_pose(p.scene, skin, down);
+  const V sh = from(sk.points[11]);
+  std::vector<uint32_t> near;
+  for (uint32_t i = 0; i < p.scene.count; ++i) {
+    if (len(sub(from(&p.scene.positions[i * 3]), sh)) < 0.12f) near.push_back(i);
+  }
+  std::vector<float> stretch;
+  for (size_t a = 0; a < near.size(); a += 3) {
+    const V pa = from(&p.scene.positions[near[a] * 3]), qa = from(&posed_down.positions[near[a] * 3]);
+    for (size_t b = 0; b < near.size(); ++b) {
+      const V pb = from(&p.scene.positions[near[b] * 3]);
+      const float d0 = len(sub(pa, pb));
+      if (d0 < 1e-4f || d0 > 0.025f) continue;
+      stretch.push_back(len(sub(qa, from(&posed_down.positions[near[b] * 3]))) / d0);
+    }
+  }
+  std::sort(stretch.begin(), stretch.end());
+  const float worst = stretch.empty() ? 0.0f : stretch[stretch.size() * 99 / 100];
+  EXPECT(!stretch.empty() && worst < 2.0f, "arms down: shoulder splats stay near their neighbours (99%%: %.2fx)", worst);
+  std::printf("shoulder stretch (99th percentile) %.2fx over %zu pairs\n", worst, stretch.size());
+
   const V k0 = moved(gs::pose_skeleton(sk, "walk", 0.0f), gs::kLeftShin, from(sk.points[27]));
   const V k1 = moved(gs::pose_skeleton(sk, "walk", 0.27f), gs::kLeftShin, from(sk.points[27]));
   EXPECT(len(sub(k0, k1)) > 0.1f, "walking moves the feet: %.3f m", len(sub(k0, k1)));
@@ -350,6 +397,20 @@ void test_gpu(const Person& p, const gs::Skin& skin, const gs::Skeleton& sk) {
     diff /= double(w * h * 3);
     EXPECT(diff < 1.5 && big < int(w * h * 3 / 200), "%s: GPU skinning matches the CPU posing (mean %.2f, %d off)", name,
            diff, big);
+  }
+  // Split at the joints: more splats, looking the same at rest.
+  uint32_t added = 0;
+  const gs::SplatScene split = gs::split_at_joints(p.scene, skin, sk, &added);
+  EXPECT(added > 0 && split.count == p.scene.count + added, "split at the joints: %u added", added);
+  {
+    const auto a = draw(p.scene, nullptr, nullptr);
+    const auto b = draw(split, nullptr, nullptr);
+    double diff = 0;
+    for (size_t i = 0; i < a.size(); i += 4) {
+      for (int c = 0; c < 3; ++c) diff += std::abs(int(a[i + c]) - int(b[i + c]));
+    }
+    diff /= double(w * h * 3);
+    EXPECT(diff < 2.0, "split looks the same at rest (mean %.2f)", diff);
   }
   // Skin uploaded but posing off: the rest pose.
   gs::SplatSkinning off;

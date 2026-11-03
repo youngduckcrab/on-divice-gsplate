@@ -69,8 +69,9 @@ PlaceSession g_place;
 struct PoseSession {
   std::optional<gs::BodyViews> views;
   gs::Skeleton skeleton;
-  std::shared_ptr<const gs::SplatScene> skinned;  // the scene `packed` is for
-  gs::Skin skin;
+  std::shared_ptr<const gs::SplatScene> skinned;  // the shown scene `posable` was made from
+  std::shared_ptr<const gs::SplatScene> posable;  // it, split at the joints: what is drawn
+  gs::Skin skin;                                  // posable's bones
   std::vector<uint32_t> packed;
   std::string name = "rest";
   std::shared_ptr<PoseAnimation> animation;  // shown; null at rest
@@ -170,21 +171,27 @@ std::string present_locked() {
     ctx = context_locked();
   }
   gs::BackdropView view;
-  uint32_t count = g_face.shown->count;
-  float floor = 0.0f;
-  std::unique_ptr<gs::GpuScene> gpu;
-  // With a skeleton, the shown model's splats carry their bones (it comes first in a place too).
+  std::shared_ptr<const gs::SplatScene> model = g_face.shown;
+  // With a skeleton, the model is split at its joints and its splats carry
+  // their bones (it comes first in a place too).
   const std::vector<uint32_t>* skin = nullptr;
   if (g_pose.skeleton.found) {
     if (g_pose.skinned != g_face.shown) {
-      g_pose.skin = gs::skin_splats(*g_face.shown, g_pose.skeleton);
+      const gs::Skin first = gs::skin_splats(*g_face.shown, g_pose.skeleton);
+      g_pose.posable = std::make_shared<const gs::SplatScene>(
+          gs::split_at_joints(*g_face.shown, first, g_pose.skeleton));
+      g_pose.skin = gs::skin_splats(*g_pose.posable, g_pose.skeleton);
       g_pose.packed = g_pose.skin.packed();
       g_pose.skinned = g_face.shown;
     }
+    model = g_pose.posable;
     skin = &g_pose.packed;
   }
+  uint32_t count = model->count;
+  float floor = 0.0f;
+  std::unique_ptr<gs::GpuScene> gpu;
   if (g_place.active && g_place.scene) {
-    gs::Staging staged = gs::stage(at_most_degree1(*g_face.shown), *g_place.scene, g_place.spot);
+    gs::Staging staged = gs::stage(at_most_degree1(*model), *g_place.scene, g_place.spot);
     view.kind = gs::Backdrop::Sky;
     for (int c = 0; c < 3; ++c) {
       view.zenith[c] = g_place.spot.sky[0][c];
@@ -196,15 +203,15 @@ std::string present_locked() {
     floor = staged.floor;
     gpu = gs::upload_scene(*ctx, staged.scene, skin);
   } else {
-    gpu = gs::upload_scene(*ctx, *g_face.shown, skin);
+    gpu = gs::upload_scene(*ctx, *model, skin);
   }
   Viewer& v = viewer();
   v.set_backdrop(view);
   v.swap_scene(std::move(gpu));
-  if (g_pose.animation && g_pose.animation->count != g_face.shown->count) {
+  if (g_pose.animation && g_pose.animation->count != model->count) {
     // A new one (the render thread may be reading the old), keeping its clock.
     auto a = std::make_shared<PoseAnimation>(*g_pose.animation);
-    a->count = g_face.shown->count;
+    a->count = model->count;
     g_pose.animation = a;
   }
   v.set_pose(g_pose.animation);
@@ -671,7 +678,7 @@ Java_com_ondevice_gsplat_NativeViewer_setPose(JNIEnv* env, jobject /*this*/, jst
       a->skeleton = g_pose.skeleton;
       a->name = name;
       a->moves = gs::pose_moves(name);
-      a->count = g_face.shown->count;
+      a->count = g_pose.posable ? g_pose.posable->count : g_face.shown->count;
       g_pose.animation = a;
     }
     viewer().set_pose(g_pose.animation);
@@ -688,8 +695,8 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_com_ondevice_gsplat_NativeViewer_saveShown(JNIEnv* env, jobject /*this*/, jint fd) {
   return to_jstring(env, face_call([&] {
     // In the pose shown (a moving one as it is right now).
-    gs::SplatScene scene = g_pose.animation && g_pose.skinned == g_face.shown
-                               ? gs::apply_pose(*g_face.shown, g_pose.skin,
+    gs::SplatScene scene = g_pose.animation && g_pose.skinned == g_face.shown && g_pose.posable
+                               ? gs::apply_pose(*g_pose.posable, g_pose.skin,
                                                 gs::pose_skeleton(g_pose.skeleton, g_pose.name,
                                                                   g_pose.animation->seconds()))
                                : *g_face.shown;

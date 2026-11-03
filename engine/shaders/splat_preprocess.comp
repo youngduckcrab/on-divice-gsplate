@@ -35,11 +35,12 @@ layout(std430, binding = 6) readonly buffer Lighting {
   vec4 cut;       // feet height (scene y), radius, on (> 0): see-through cut for a place
 } light;
 
-// Posing (gs::SplatSkinning): the first `count` splats follow up to 4 bones each.
+// Posing (gs::SplatSkinning): the first `count` splats follow up to 4 bones
+// each, their motions blended as dual quaternions (rigid: no shrinking).
 layout(std430, binding = 7) readonly buffer Skin { uvec2 skin[]; };  // bone indices, weights: a byte each
 layout(std430, binding = 8) readonly buffer Skinning {
-  uvec4 info;       // x: splats posed, y: bones
-  vec4 rows[96];    // per bone: 3 rows of [rotation | translation]
+  uvec4 info;    // x: splats posed, y: bones
+  vec4 dq[64];   // per bone: rotation quaternion (w, x, y, z), then its dual part
 } skinning;
 
 layout(push_constant) uniform Params {
@@ -166,24 +167,34 @@ void main() {
   // Posed: the blend of the bones' motions moves the centre and turns the
   // splat's axes; view directions are taken back to the rest pose for the SH.
   bool posed = i < skinning.info.x;
-  vec4 b0 = vec4(1.0, 0.0, 0.0, 0.0), b1 = vec4(0.0, 1.0, 0.0, 0.0), b2 = vec4(0.0, 0.0, 1.0, 0.0);
+  mat3 B = mat3(1.0);  // the blend's rotation
   if (posed) {
     const uvec2 sk = skin[i];
-    b0 = vec4(0.0);
-    b1 = vec4(0.0);
-    b2 = vec4(0.0);
+    vec4 r = vec4(0.0), d = vec4(0.0), first = vec4(0.0);
     for (uint k = 0u; k < 4u; ++k) {
       const float w = float((sk.y >> (8u * k)) & 0xffu) / 255.0;
       if (w > 0.0) {
-        const uint b = min((sk.x >> (8u * k)) & 0xffu, 31u) * 3u;
-        b0 += w * skinning.rows[b];
-        b1 += w * skinning.rows[b + 1u];
-        b2 += w * skinning.rows[b + 2u];
+        const uint b = min((sk.x >> (8u * k)) & 0xffu, 31u) * 2u;
+        const vec4 br = skinning.dq[b], bd = skinning.dq[b + 1u];
+        if (k == 0u) first = br;
+        const float sgn = dot(br, first) < 0.0 ? -w : w;
+        r += sgn * br;
+        d += sgn * bd;
       }
     }
-    p = vec3(dot(b0.xyz, p) + b0.w, dot(b1.xyz, p) + b1.w, dot(b2.xyz, p) + b2.w);
-    const mat3 A = transpose(mat3(b0.xyz, b1.xyz, b2.xyz));  // rows b0..b2
-    R = A * R;
+    const float len = length(r);
+    if (len > 1e-6) {
+      r /= len;
+      d /= len;
+      B = quat_to_matrix(r);
+      // Translation 2 (d r*), with r = (w, v): 2 (r.w d.v - d.w r.v + r.v x d.v).
+      const vec3 rv = r.yzw, dv = d.yzw;
+      const vec3 shift = 2.0 * (r.x * dv - d.x * rv + cross(rv, dv));
+      p = B * p + shift;
+      R = B * R;
+    } else {
+      posed = false;
+    }
   }
   vec3 t = vec3(dot(pc.rot0.xyz, p) + pc.rot0.w,
                 dot(pc.rot1.xyz, p) + pc.rot1.w,
@@ -258,7 +269,7 @@ void main() {
         uint coeffs = degree == 0u ? 0u : (degree + 1u) * (degree + 1u) - 1u;
         uint stride = (coeffs * 3u + 1u) / 2u;
         vec3 view_dir = normalize(p - pc.cam_pos.xyz);
-        if (posed) view_dir = normalize(b0.xyz * view_dir.x + b1.xyz * view_dir.y + b2.xyz * view_dir.z);
+        if (posed) view_dir = transpose(B) * view_dir;
         vec3 color = eval_sh(s.sh_dc.xyz, degree, i * stride, view_dir);
         if (light.centre.w > 0.0 && (light.limit.x == 0u || i < light.limit.x)) {
           color = relight(color, p, R, s.scale.xyz, normalize(pc.cam_pos.xyz - p),

@@ -42,10 +42,10 @@ double ms_since(std::chrono::steady_clock::time_point t0) {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-const char* const kBoneNames[gs::kBoneCount] = {"pelvis",     "chest",       "head",       "left upper arm",
-                                                "left forearm", "left hand", "right upper arm", "right forearm",
-                                                "right hand", "left thigh",  "left shin",  "left foot",
-                                                "right thigh", "right shin", "right foot"};
+const char* const kBoneNames[gs::kBoneCount] = {
+    "pelvis",         "chest",          "head",          "left collarbone", "left upper arm",  "left forearm",
+    "left hand",      "right collarbone", "right upper arm", "right forearm", "right hand",     "left thigh",
+    "left shin",      "left foot",      "right thigh",   "right shin",      "right foot"};
 
 }  // namespace
 
@@ -107,23 +107,26 @@ int main(int argc, char** argv) {
       gs::write_file(path, std::vector<uint8_t>(json.begin(), json.end()));
     }
     t0 = std::chrono::steady_clock::now();
-    const gs::Skin skin = gs::skin_splats(scene, sk);
-    std::printf("skin: %.0f ms\n", ms_since(t0));
+    uint32_t split = 0;
+    const gs::SplatScene scene_in = scene;
+    const gs::SplatScene posable = gs::split_at_joints(scene_in, gs::skin_splats(scene_in, sk), sk, &split);
+    const gs::Skin skin = gs::skin_splats(posable, sk);
+    std::printf("skin: %.0f ms (%u splats added at joints)\n", ms_since(t0), split);
     if (const char* probe = option(argc, argv, "--probe", nullptr)) {
       float q[3] = {0, 0, 0};
       std::sscanf(probe, "%f,%f,%f", &q[0], &q[1], &q[2]);
       uint32_t best = 0;
       float best_d = 1e30f;
-      for (uint32_t i = 0; i < scene.count; ++i) {
+      for (uint32_t i = 0; i < posable.count; ++i) {
         float d = 0;
-        for (int k = 0; k < 3; ++k) d += (scene.positions[i * 3 + k] - q[k]) * (scene.positions[i * 3 + k] - q[k]);
+        for (int k = 0; k < 3; ++k) d += (posable.positions[i * 3 + k] - q[k]) * (posable.positions[i * 3 + k] - q[k]);
         if (d < best_d) {
           best_d = d;
           best = i;
         }
       }
-      std::printf("probe: splat %u at (%.3f %.3f %.3f):", best, scene.positions[best * 3], scene.positions[best * 3 + 1],
-                  scene.positions[best * 3 + 2]);
+      std::printf("probe: splat %u at (%.3f %.3f %.3f):", best, posable.positions[best * 3], posable.positions[best * 3 + 1],
+                  posable.positions[best * 3 + 2]);
       for (int k = 0; k < 4; ++k) {
         if (skin.weights[best * 4 + k]) std::printf(" %s %d", kBoneNames[skin.bones[best * 4 + k]], skin.weights[best * 4 + k]);
       }
@@ -143,7 +146,7 @@ int main(int argc, char** argv) {
     std::string out = argv[4];
     if (names.size() > 1 && out.size() > 4 && out.substr(out.size() - 4) == ".ply") out.resize(out.size() - 4);
     for (const std::string& name : names) {
-      const gs::SplatScene posed = gs::apply_pose(scene, skin, gs::pose_skeleton(sk, name, time));
+      const gs::SplatScene posed = gs::apply_pose(posable, skin, gs::pose_skeleton(sk, name, time));
       const std::string path = names.size() > 1 ? out + "-" + name + ".ply" : out;
       gs::write_file(path, gs::save_ply(posed));
       std::printf("wrote %s\n", path.c_str());

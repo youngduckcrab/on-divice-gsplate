@@ -26,14 +26,15 @@ struct GpuScene {
 };
 
 // Posing of the splats that have skin data (see gs::pose_skeleton): each
-// follows the blend of up to 4 bones' rigid motions (position, the axes of
-// its covariance, and the direction its view-dependent colour is seen from).
+// follows the blend of up to 4 bones' rigid motions, blended as dual
+// quaternions (position, the axes of its covariance, and the direction its
+// view-dependent colour is seen from).
 constexpr uint32_t kMaxBones = 32;
 struct SplatSkinning {
   uint32_t count = 0;  // splats posed (the first ones; 0: off); no more than the scene's skin_count
   uint32_t bones = 0;
   uint32_t pad[2] = {0, 0};
-  float rows[kMaxBones * 3][4] = {};  // per bone, 3 rows of [rotation | translation]
+  float dq[kMaxBones * 2][4] = {};  // per bone: rotation quaternion (w, x, y, z), then its dual part
 };
 
 // Relighting of the splats to match a backdrop (see gs::splat_lighting): each

@@ -9,7 +9,8 @@
 //   Either form takes --place <manifest.json>:<spot id> to put the model into
 //   one of the app's 3D places (tools/environments) as the viewer does, with
 //   --yaw <degrees> to turn the place and --relight <0..1> for how much the
-//   model takes its light (default 1).
+//   model takes its light (default 1). The orbit view takes --look x,y,z
+//   (scene coordinates) and --distance d for close-ups.
 //
 //       one image per line of cameras.txt, written as out_dir/view_00000.ppm, ...
 //       Each line: width height fx fy cx cy, then the 3x4 world-to-camera matrix
@@ -232,6 +233,19 @@ int main(int argc, char** argv) {
     orbit.reset(model_bounds, scene.convention == gs::AxisConvention::RDF);
     orbit.yaw = positional(5) ? std::atof(argv[5]) * 3.14159265f / 180.0f : 0.0f;
     orbit.pitch = positional(6) ? std::atof(argv[6]) * 3.14159265f / 180.0f : 0.25f;
+    // Close-ups: --look x,y,z (scene coordinates) and --distance d.
+    for (int i = 3; i + 1 < argc; ++i) {
+      const std::string arg = argv[i];
+      if (arg == "--look") {
+        float q[3] = {0, 0, 0};
+        std::sscanf(argv[i + 1], "%f,%f,%f", &q[0], &q[1], &q[2]);
+        const float s = orbit.flip_y() ? -1.0f : 1.0f;
+        orbit.target[0] = q[0];
+        orbit.target[1] = s * q[1];
+        orbit.target[2] = s * q[2];
+      }
+      if (arg == "--distance") orbit.distance = float(std::atof(argv[i + 1]));
+    }
     const gs::Camera camera = orbit.camera(width, height);
     auto start = std::chrono::steady_clock::now();
     auto pixels = render(ctx, *gpu, camera, target, renderer, background, backdrop, &visible);

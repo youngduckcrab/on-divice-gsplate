@@ -44,9 +44,11 @@ enum Bone : int {
   kPelvis,
   kChest,
   kHead,
+  kLeftClavicle,  // the shoulder girdle: takes a little of the arm's lift
   kLeftUpperArm,
   kLeftForearm,
   kLeftHand,
+  kRightClavicle,
   kRightUpperArm,
   kRightForearm,
   kRightHand,
@@ -88,7 +90,9 @@ struct Skeleton {
 Skeleton fit_skeleton(const BodyViews& views, const std::vector<PoseLandmarks>& landmarks);
 
 // Up to 4 bones per splat (the nearest, measured against each bone's
-// thickness, blended with its neighbours in the hierarchy near joints).
+// thickness, blended with its neighbours in the hierarchy near joints; across
+// the shoulders and hips over a wide band along the limb, so they bend
+// smoothly instead of creasing).
 struct Skin {
   uint32_t count = 0;
   std::vector<uint8_t> bones;    // 4 per splat
@@ -97,6 +101,15 @@ struct Skin {
   std::vector<uint32_t> packed() const;
 };
 Skin skin_splats(const SplatScene& scene, const Skeleton& skeleton);
+
+// Long splats where a limb bends would stay straight across the joint and
+// poke out of it when it bends (a trained model has many along the limbs).
+// Those shared between bones (`skin`) and longer than a few millimetres are
+// split along their long axis into shorter ones, which look the same at
+// rest; bind the result again with skin_splats so each piece gets its own
+// bones.
+SplatScene split_at_joints(const SplatScene& scene, const Skin& skin, const Skeleton& skeleton,
+                           uint32_t* added = nullptr);
 
 // Each bone's rigid motion: p -> rotation p + translation (rotation row-major).
 struct BonePose {
@@ -107,7 +120,9 @@ struct BonePose {
 
 // Named poses: "rest", "attention" (arms down), "hands_on_hips", "arms_up",
 // "bow", and moving ones, "wave" and "walk", which follow `time` (seconds).
-// The feet are kept on the floor.
+// Each arm is set by where its bones point, which way the elbow bends and
+// which way the palm faces (the forearm turns to bring it round); the
+// shoulder girdle follows the arm a little. The feet are kept on the floor.
 bool known_pose(std::string_view name);
 bool pose_moves(std::string_view name);
 BonePose pose_skeleton(const Skeleton& skeleton, std::string_view name, float time = 0.0f);
@@ -115,9 +130,10 @@ BonePose pose_skeleton(const Skeleton& skeleton, std::string_view name, float ti
 // For SplatRenderer::set_skinning: the first `count` splats posed.
 SplatSkinning skinning_for(const BonePose& pose, uint32_t count);
 
-// The posed scene on the CPU (for saving it): positions blended over the
-// splat's bones, rotations turned by the blend of theirs, view-dependent
-// colour turned with them (to degree 1).
+// The posed scene on the CPU (for saving it), as the GPU does it: the splat's
+// bones' motions blended as dual quaternions (a rigid motion, so splats
+// between two bones neither shrink nor collapse), turning its position, its
+// axes and its view-dependent colour (to degree 1).
 SplatScene apply_pose(const SplatScene& scene, const Skin& skin, const BonePose& pose);
 
 }  // namespace gs
