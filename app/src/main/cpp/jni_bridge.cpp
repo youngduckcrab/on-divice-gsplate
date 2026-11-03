@@ -856,6 +856,9 @@ Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, js
     // The subject's motion needs nodes on the subject: only with its mask.
     options.refine_motion = refine_motion == JNI_TRUE && options.masked && ds.has_masks;
     options.refine_exposure = refine_exposure == JNI_TRUE;
+    // Same quality as dense Adam at the presets' lengths (PC, 2000 steps:
+    // held-out 37.78 / 37.79 dB); a 300-step run came out lower with it.
+    options.sparse_adam = iterations >= 2000;
     const auto t1 = Clock::now();
     gs::InitOptions init;
     init.max_gaussians = std::min<uint32_t>(options.max_gaussians / 2, 150000);
@@ -906,6 +909,7 @@ Java_com_ondevice_gsplat_NativeTrainer_prepare(JNIEnv* env, jobject /*this*/, js
     w.field("setup_ms", setup_ms);
     w.field("lambda_start", session->trainer->options().lambda_dssim);
     w.field("lambda_end", session->trainer->options().lambda_dssim_end);
+    w.field("sparse_adam", session->trainer->options().sparse_adam);
     w.field("reduction_note", session->trainer->reduction_note());
     w.field("reduction_check", g_reduction->log);
     w.field("reduction_check_ms", g_reduction_ms);

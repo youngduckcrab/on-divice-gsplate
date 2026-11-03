@@ -584,6 +584,7 @@ class TrainViewModel(application: Application) : AndroidViewModel(application) {
                         "움직임 보정 ${ox(prep.optBoolean("refine_motion"))} · " +
                         "밝기·색 보정 ${ox(prep.optBoolean("refine_exposure"))} · " +
                         "손실 L1+D-SSIM (λ ${f1(prep.optDouble("lambda_start"))} → ${f1(prep.optDouble("lambda_end"))}) · " +
+                        "sparse Adam ${ox(prep.optBoolean("sparse_adam"))} · " +
                         if (prep.optBoolean("head_found")) {
                             "머리 가중치 ${f1(prep.optDouble("head_weight"))}배 (반지름 " +
                                 "${"%.0f".format(Locale.US, prep.optDouble("head_radius") * 100)} cm, " +
