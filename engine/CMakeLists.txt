@@ -55,6 +55,7 @@ set(GS_SHADERS
   scan_add.comp
   train_project.comp
   train_emit.comp
+  train_gather.comp
   train_ranges.comp
   train_forward.comp
   train_backward.comp

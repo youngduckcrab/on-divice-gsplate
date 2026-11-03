@@ -1,7 +1,8 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
-// Training pass 1: project every gaussian (EWA 2D covariance, SH colour) and
-// count the 16x16 tiles its opacity-aware footprint (an ellipse) reaches.
+// Training pass 1: project every gaussian (EWA 2D covariance, SH colour),
+// count the 16x16 tiles its opacity-aware footprint (an ellipse) reaches, and
+// write its depth key for the depth sort.
 // With kFlagMotion, each gaussian first follows the subject's motion in this
 // view (train_motion.glsl).
 layout(local_size_x = 128) in;
@@ -15,6 +16,10 @@ layout(std430, binding = 3) writeonly buffer Projected { vec4 projected[]; };
 layout(std430, binding = 4) writeonly buffer Tiles { uint tiles_touched[]; };
 layout(std430, binding = 5) readonly buffer Motion { vec4 motion[]; };
 layout(std430, binding = 6) readonly buffer Bind { uvec4 bind[]; };
+// For the depth sort before the pairs are made (train_gather, train_emit):
+// 16-bit log depth, front to back, and the gaussian's own index.
+layout(std430, binding = 7) writeonly buffer DepthKeys { uint depth_keys[]; };
+layout(std430, binding = 8) writeonly buffer DepthOrder { uint depth_order[]; };
 
 #include "train_motion.glsl"
 
@@ -102,4 +107,6 @@ void main() {
   projected[i * 4u + 2u] = out2;
   projected[i * 4u + 3u] = out3;
   tiles_touched[i] = tiles;
+  depth_keys[i] = tiles > 0u ? uint(clamp(log2(out0.z / kNear) / log2(kFar / kNear), 0.0, 1.0) * 65535.0) : 0xffffu;
+  depth_order[i] = i;
 }

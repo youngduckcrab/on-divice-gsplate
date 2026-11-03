@@ -15,11 +15,11 @@ void main() {
   uint s = gl_GlobalInvocationID.x;
   uint count = min(pc.capacity, totals[0]);
   if (s >= count) return;
-  uint tile = keys[s] >> 16u;
+  uint tile = keys[s];
   if (s == 0u) {
     ranges[tile].x = 0u;
   } else {
-    uint prev = keys[s - 1u] >> 16u;
+    uint prev = keys[s - 1u];
     if (prev != tile) {
       ranges[prev].y = s;
       ranges[tile].x = s;

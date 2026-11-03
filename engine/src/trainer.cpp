@@ -27,6 +27,7 @@
 #include "shaders/train_densify_spawn.h"
 #include "shaders/train_dispatch_args.h"
 #include "shaders/train_emit.h"
+#include "shaders/train_gather.h"
 #include "shaders/train_forward.h"
 #include "shaders/train_motion_bind.h"
 #include "shaders/train_motion_sum.h"
@@ -109,6 +110,17 @@ void rotation_from(const double w[3], double out[9]) {
   for (int i = 0; i < 9; ++i) out[i] = (i % 4 == 0 ? 1.0 : 0.0) + a * K[i] + b * K2[i];
 }
 
+// The turn vector of a rotation (the inverse of rotation_from).
+void rotation_log(const float R[9], double w[3]) {
+  const double c = std::clamp((double(R[0]) + R[4] + R[8] - 1.0) * 0.5, -1.0, 1.0);
+  const double theta = std::acos(c);
+  const double s = std::sin(theta);
+  const double f = s > 1e-9 ? theta / (2.0 * s) : 0.5;
+  w[0] = f * (double(R[7]) - R[5]);
+  w[1] = f * (double(R[2]) - R[6]);
+  w[2] = f * (double(R[3]) - R[1]);
+}
+
 // Dispatch of a kernel without push constants.
 void dispatch_kernel(VkContext& ctx, VkCommandBuffer cmd, const ComputePipeline& pipeline,
                      std::initializer_list<const Buffer*> buffers, uint32_t groups_x, uint32_t groups_y = 1) {
@@ -170,16 +182,17 @@ Trainer::Trainer(VkContext& ctx, Dataset dataset, const SplatScene& initial, con
       return ComputePipeline{};
     }
   };
-  project_ = make("train_project", shaders::train_project, 7, 0);
+  project_ = make("train_project", shaders::train_project, 9, 0);
+  gather_ = make("train_gather", shaders::train_gather, 3, sizeof(uint32_t));
   scan_local_ = make("scan_local", shaders::scan_local, 4, sizeof(ScanPush));
   scan_blocks_ = make("scan_blocks", shaders::scan_blocks, 1, sizeof(uint32_t));
   scan_add_ = make("scan_add", shaders::scan_add, 4, sizeof(ScanPush));
-  emit_ = make("train_emit", shaders::train_emit, 9, 0);
+  emit_ = make("train_emit", shaders::train_emit, 11, 0);
   dispatch_args_ = make("train_dispatch_args", shaders::train_dispatch_args, 2, sizeof(uint32_t));
   ranges_ = make("train_ranges", shaders::train_ranges, 3, sizeof(uint32_t));
   forward_ = make("train_forward", shaders::train_forward, 16, 0);
-  ssim_ = make("train_ssim", shaders::train_ssim, 4, 0);
-  ssim_grad_ = make("train_ssim_grad", shaders::train_ssim_grad, 5, 0);
+  ssim_ = make("train_ssim", shaders::train_ssim, 5, 0);
+  ssim_grad_ = make("train_ssim_grad", shaders::train_ssim_grad, 6, 0);
   pair_sum_ = make("train_pair_sum", shaders::train_pair_sum, 6, 0);
   step_ = make("train_step", shaders::train_step, 15, 0);
   step_sh_ = make("train_step_sh", shaders::train_step_sh, 7, 0);
@@ -350,6 +363,10 @@ Trainer::Trainer(VkContext& ctx, Dataset dataset, const SplatScene& initial, con
   projected_ = ctx.create_buffer(cap * 64, MemoryKind::Device);
   tiles_ = ctx.create_buffer(cap * 4, MemoryKind::Device);
   offsets_ = ctx.create_buffer(cap * 4, MemoryKind::Device);
+  depth_keys_ = ctx.create_buffer(cap * 4, MemoryKind::Device);
+  depth_order_ = ctx.create_buffer(cap * 4, MemoryKind::Device);
+  sorted_tiles_ = ctx.create_buffer(cap * 4, MemoryKind::Device);
+  sorted_offsets_ = ctx.create_buffer(cap * 4, MemoryKind::Device);
   spawn_ = ctx.create_buffer(cap * 4, MemoryKind::Device);
   free_list_ = ctx.create_buffer(cap * 4, MemoryKind::Device);
   counters_ = ctx.create_buffer(16, MemoryKind::Device);
@@ -552,6 +569,7 @@ void Trainer::reset_sets() {
   GS_VK_CHECK(vkResetDescriptorPool(ctx_.device(), set_pool_, 0));
   sets_.clear();
   sort_bound_ = false;
+  depth_sort_bound_ = false;
 }
 
 void Trainer::record_scan(VkCommandBuffer cmd, const Buffer& values, const Buffer& prefix, uint32_t count,
@@ -580,7 +598,7 @@ void Trainer::reserve_pairs(uint64_t expected) {
     values_ = ctx_.create_buffer(n * 4, MemoryKind::Device);
     pair_gaussian_ = ctx_.create_buffer(n * 4, MemoryKind::Device);
     pair_grads_ = ctx_.create_buffer(n * kPairGradBytes, MemoryKind::Device);
-    sort_->reserve(static_cast<uint32_t>(n));
+    sort_->reserve(static_cast<uint32_t>(std::max<uint64_t>(n, capacity_)));  // the pairs, and the depth sort
     pair_capacity_ = n;
     // Bucket state: with p pairs, every tile's buckets after the first fit
     // below p / 32 + tiles + 1. It goes in two buffers of up to the binding
@@ -646,10 +664,21 @@ bool Trainer::needs_bucket_state(bool train, bool retune) const {
 void Trainer::record_project(VkCommandBuffer cmd, uint32_t slot) {
   if (slots_ > 0) {
     kernel(cmd, project_,
-           {&frames_[slot], &params_, &sh_, &projected_, &tiles_, &motion_slots_[slot], &motion_bind_buf_},
+           {&frames_[slot], &params_, &sh_, &projected_, &tiles_, &motion_slots_[slot], &motion_bind_buf_,
+            &depth_keys_, &depth_order_},
            div_up(slots_, 128));
     VkContext::barrier(cmd);
-    record_scan(cmd, tiles_, offsets_, slots_, 0);
+    // The gaussians front to back (16-bit keys: 4 passes over the gaussians),
+    // then their pairs' places in that order; record_sort then sorts the pairs
+    // by tile alone (3 passes) instead of by (tile, depth) (7 passes).
+    if (!depth_sort_bound_) {
+      depth_sort_binding_ = sort_->bind(set_pool_, depth_keys_, depth_order_);
+      depth_sort_bound_ = true;
+    }
+    sort_->record(cmd, depth_sort_binding_, depth_keys_, depth_order_, slots_, 16);
+    kernel(cmd, gather_, {&depth_order_, &tiles_, &sorted_tiles_}, div_up(slots_, 256), 1, &slots_, sizeof(slots_));
+    VkContext::barrier(cmd);
+    record_scan(cmd, sorted_tiles_, sorted_offsets_, slots_, 0);
   } else {
     vkCmdFillBuffer(cmd, totals_.handle(), 0, 16, 0);
     VkContext::barrier(cmd);
@@ -660,13 +689,13 @@ void Trainer::record_sort(VkCommandBuffer cmd, uint32_t slot) {
   // The pair count is on the GPU (totals_): the passes over pairs are
   // dispatched indirectly for it, bounded by the capacity.
   const uint32_t capacity = uint32_t(pair_capacity_);
-  const uint32_t key_bits = 16 + bits_for(tiles_x_ * tiles_y_ + 1);  // + the padding tile
+  const uint32_t key_bits = bits_for(tiles_x_ * tiles_y_ + 1);  // the tile (+ the padding tile)
   vkCmdFillBuffer(cmd, ranges_buf_.handle(), 0, VK_WHOLE_SIZE, 0);
   if (slots_ > 0) {
     kernel(cmd, dispatch_args_, {&totals_, &dispatch_args_buf_}, 1, 1, &capacity, sizeof(capacity));
     kernel(cmd, emit_,
-           {&frames_[slot], &projected_, &tiles_, &offsets_, &keys_, &values_, &pair_gaussian_, &pair_grads_,
-            &mismatch_},
+           {&frames_[slot], &projected_, &tiles_, &sorted_offsets_, &keys_, &values_, &pair_gaussian_, &pair_grads_,
+            &mismatch_, &depth_order_, &offsets_},
            div_up(slots_, 128));
     VkContext::barrier(cmd);
     if (!sort_bound_) {
@@ -693,11 +722,11 @@ void Trainer::record_rasterize(VkCommandBuffer cmd, uint32_t slot) {
 
 void Trainer::record_loss(VkCommandBuffer cmd, uint32_t slot, bool ssim, bool grad) {
   if (ssim) {
-    kernel(cmd, ssim_, {&frames_[slot], &ssim_input_, &ssim_maps_, &tile_loss_}, tiles_x_, tiles_y_);
+    kernel(cmd, ssim_, {&frames_[slot], &ssim_input_, &ssim_maps_, &tile_loss_, &ranges_buf_}, tiles_x_, tiles_y_);
     VkContext::barrier(cmd);
     if (grad) {
-      kernel(cmd, ssim_grad_, {&frames_[slot], &ssim_input_, &ssim_maps_, &pixel_grad_, &pixel_dot_}, tiles_x_,
-             tiles_y_);
+      kernel(cmd, ssim_grad_, {&frames_[slot], &ssim_input_, &ssim_maps_, &pixel_grad_, &pixel_dot_, &ranges_buf_},
+             tiles_x_, tiles_y_);
       VkContext::barrier(cmd);
     }
   }
@@ -1132,31 +1161,41 @@ EvalResult Trainer::evaluate_at_rest(const Dataset& other) {
 }
 
 Trainer::PoseFix Trainer::align_camera(const Camera& camera, const DatasetFrame& frame, const ViewMotion* motion,
-                                       const float* gain) {
+                                       const float* gain, const PoseFix* start) {
   // The model was fitted to corrected poses: give each held-out view the
-  // same chance, moving only its camera. Gradient descent whose step grows
-  // after a step that lowered the loss and halves (from the best pose) after
-  // one that did not; turns count as the shift they cause at the cameras'
-  // distance. The view keeps the best pose seen, so it is never worse than
-  // given. (Adam moved poses that were already right.)
+  // same chance, moving only its camera. It starts from the better of the
+  // given pose and `start` (where the training views next to it ended up:
+  // the tracking's error drifts slowly), then gradient descent whose step
+  // grows after a step that lowered the loss and halves (from the best pose)
+  // after one that did not; turns count as the shift they cause at the
+  // cameras' distance. The view keeps the best pose seen, so it is never
+  // worse than given. The loss is L1 alone: the SSIM passes would double
+  // each step's cost for the same alignment. (Adam moved poses that were
+  // already right.)
   const float black[3] = {0.0f, 0.0f, 0.0f};
   const double reach = dataset_.camera_extent;
-  PoseFix best{}, current{};
+  PoseFix best{};
   double best_loss = std::numeric_limits<double>::infinity(), best_grad[6] = {0, 0, 0, 0, 0, 0};
-  double length = options_.eval_pose_step * reach;
-  for (uint32_t k = 0; k < options_.eval_pose_steps; ++k) {
-    run_view(with_fix(camera, current), frame.rgba.data(), black, options_.masked, true, false, false, uses_ssim(),
+  auto try_fix = [&](const PoseFix& fix) {
+    run_view(with_fix(camera, fix), frame.rgba.data(), black, options_.masked, true, false, false, false,
              kFlagPoseGrad | kFlagPoseOnly, motion, gain);
-    const double lambda = lambda_at(stats_.step);
-    const double loss = (1.0 - lambda) * last_losses_[3] + lambda * (last_losses_[5] - last_losses_[4]);
-    if (loss < best_loss) {
-      best = current;
-      best_loss = loss;
-      pose_gradient(0, best_grad);
-      if (k > 0) length *= 1.5;
-    } else {
-      length *= 0.5;
-    }
+    const double loss = last_losses_[3];
+    if (!(loss < best_loss)) return false;
+    best = fix;
+    best_loss = loss;
+    pose_gradient(0, best_grad);
+    return true;
+  };
+  uint32_t renders = 0;
+  if (options_.eval_pose_steps == 0) return best;
+  try_fix(PoseFix{});
+  ++renders;
+  if (start && start->updates > 0 && renders < options_.eval_pose_steps) {
+    try_fix(*start);
+    ++renders;
+  }
+  double length = options_.eval_pose_step * reach;
+  for (; renders < options_.eval_pose_steps; ++renders) {
     double g[6], norm = 0.0;
     for (int c = 0; c < 6; ++c) {
       g[c] = c < 3 ? best_grad[c] : best_grad[c] / reach;
@@ -1166,11 +1205,39 @@ Trainer::PoseFix Trainer::align_camera(const Camera& camera, const DatasetFrame&
     norm = std::sqrt(norm);
     double step[6];
     for (int c = 0; c < 6; ++c) step[c] = -length * g[c] / norm / (c < 3 ? 1.0 : reach);
-    current = best;
-    current.updates = 1;
+    PoseFix current = best;
+    current.updates = std::max(current.updates, 1u);
     apply_pose_step(current, step);
+    length *= try_fix(current) ? 1.5 : 0.5;
   }
   return best;
+}
+
+Trainer::PoseFix Trainer::neighbour_fix(size_t frame) const {
+  // Between the corrections of the training views before and after it in
+  // the capture.
+  size_t a = train_before_.at(frame), b = train_after_.at(frame);
+  if (a != kNone && pose_fix_[a].updates == 0) a = kNone;
+  if (b != kNone && pose_fix_[b].updates == 0) b = kNone;
+  PoseFix out{};
+  if (a == kNone && b == kNone) return out;
+  const double t = a == kNone ? 1.0 : b == kNone ? 0.0 : double(frame - a) / double(b - a);
+  double wa[3] = {0, 0, 0}, wb[3] = {0, 0, 0}, step[6];
+  if (a != kNone) rotation_log(pose_fix_[a].rotation, wa);
+  if (b != kNone) rotation_log(pose_fix_[b].rotation, wb);
+  for (int c = 0; c < 3; ++c) {
+    const double sa = a == kNone ? 0.0 : pose_fix_[a].shift[c], sb = b == kNone ? 0.0 : pose_fix_[b].shift[c];
+    const double ra = a == kNone ? wb[c] : wa[c], rb = b == kNone ? wa[c] : wb[c];
+    step[c] = a == kNone ? sb : b == kNone ? sa : sa + (sb - sa) * t;
+    step[3 + c] = ra + (rb - ra) * t;
+  }
+  // [E | d] from the identity: rotation E, shift d.
+  out.updates = 1;
+  double E[9];
+  rotation_from(step + 3, E);
+  for (int i = 0; i < 9; ++i) out.rotation[i] = float(E[i]);
+  for (int c = 0; c < 3; ++c) out.shift[c] = float(step[c]);
+  return out;
 }
 
 EvalResult Trainer::evaluate_views(const Dataset& ds, bool own) {
@@ -1203,7 +1270,9 @@ EvalResult Trainer::evaluate_views(const Dataset& ds, bool own) {
     PoseFix fix{};
     if (align) {
       measure(given, frame, m, gain, unaligned);
-      fix = align_camera(given, frame, m, gain);
+      // A view aligned before starts where it got to; otherwise between its neighbours.
+      const PoseFix start = !own ? PoseFix{} : pose_fix_[i].updates > 0 ? pose_fix_[i] : neighbour_fix(i);
+      fix = align_camera(given, frame, m, gain, &start);
       if (own) pose_fix_[i] = fix;
     }
     measure(with_fix(given, fix), frame, m, gain, sums);
@@ -1764,7 +1833,18 @@ Trainer::DebugSnapshot Trainer::debug_snapshot() {
     ctx_.download(values_, values.data(), values.size() * 4);
     d.pair_tile.assign(stats_.pairs, ~0u);
     for (size_t k = 0; k < keys.size(); ++k) {
-      if (values[k] < d.pair_tile.size()) d.pair_tile[values[k]] = keys[k] >> 16;
+      if (values[k] < d.pair_tile.size()) d.pair_tile[values[k]] = keys[k];
+    }
+    d.render_order = std::move(values);
+  }
+  if (slots_ > 0) {
+    // Sorted in place: the k-th key is that of slot order[k].
+    std::vector<uint32_t> keys(slots_), order(slots_);
+    ctx_.download(depth_keys_, keys.data(), keys.size() * 4);
+    ctx_.download(depth_order_, order.data(), order.size() * 4);
+    d.depth_key.assign(slots_, ~0u);
+    for (size_t k = 0; k < keys.size(); ++k) {
+      if (order[k] < slots_) d.depth_key[order[k]] = keys[k];
     }
   }
   return d;

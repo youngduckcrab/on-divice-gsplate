@@ -147,6 +147,7 @@ void main() {
       fit_rr = vec4(C * C, 1.0);
       fit_rp = vec4(C * t.rgb, 0.0);
     }
+    fit_rp.w = t.a > 0.0 ? 1.0 : 0.0;  // the tile's subject pixels (train_ssim skips tiles without)
   }
   s_g0[lid] = fit_rr;
   s_g1[lid] = fit_rp;

@@ -215,9 +215,11 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
       }
       if (eval_every > 0 && (s.step % eval_every == 0 || trainer.finished())) {
+        const auto te = clock::now();
         const gs::EvalResult e = trainer.evaluate();
-        std::printf("  eval: held-out PSNR %.2f dB, SSIM %.4f over %u views; head PSNR %.2f dB over %u", e.psnr,
-                    e.ssim, e.views, e.head_psnr, e.head_views);
+        std::printf("  eval (%.1f s): held-out PSNR %.2f dB, SSIM %.4f over %u views; head PSNR %.2f dB over %u",
+                    std::chrono::duration<double>(clock::now() - te).count(), e.psnr, e.ssim, e.views, e.head_psnr,
+                    e.head_views);
         if (e.aligned) std::printf(" (poses aligned; %.2f dB at the given poses)", e.psnr_unaligned);
         std::printf("\n");
         if (options.refine_poses) {

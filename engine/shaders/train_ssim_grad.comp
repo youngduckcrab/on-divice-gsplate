@@ -14,6 +14,7 @@ layout(std430, binding = 1) readonly buffer SsimInput { vec4 ssim_input[]; };  /
 layout(std430, binding = 2) readonly buffer SsimMaps { vec4 ssim_maps[]; };    // A, B, C (rgb)
 layout(std430, binding = 3) buffer PixelGrad { vec4 pixel_grad[]; };          // dL/dC rgb, final T
 layout(std430, binding = 4) writeonly buffer PixelDot { float pixel_dot[]; };
+layout(std430, binding = 5) readonly buffer Ranges { uvec2 ranges[]; };  // each tile's pairs
 
 const uint W = kTile + 2u * uint(kSsimRadius);
 shared float s_m[3u * W * W];      // A, B, C of one channel around the tile
@@ -22,6 +23,9 @@ shared float s_h[3u * W * kTile];  // blurred along rows
 void main() {
   uint lid = gl_LocalInvocationIndex;
   uvec2 tile = gl_WorkGroupID.xy;
+  // Without splats in the tile nothing reads its pixels' gradients.
+  uvec2 own = ranges[tile.y * frame.image.z + tile.x];
+  if ((frame.model.w & kFlagMaskedTarget) != 0u && own.y <= own.x) return;
   ivec2 origin = ivec2(tile * kTile) - kSsimRadius;
   uvec2 pix = tile * kTile + gl_LocalInvocationID.xy;
   bool inside = pix.x < frame.image.x && pix.y < frame.image.y;

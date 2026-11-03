@@ -26,9 +26,11 @@ void main() {
   if ((frame.model.w & kFlagPoseOnly) != 0u) return;  // only the camera moves
   if (k >= uint(sh_rest_coeffs(degree))) return;  // degrees not active yet
   if (params[i * 4u + 1u].w < 0.5) return;       // free slot
+  vec3 colour = sh_input[i * 2u].xyz;
+  if (colour == vec3(0.0)) return;  // drew nothing in this view: kept as it is (sparse Adam, see train_step)
   float basis[16];
   sh_basis(sh_input[i * 2u + 1u].xyz, degree, basis);
-  vec3 g = basis[k + 1u] * sh_input[i * 2u].xyz;
+  vec3 g = basis[k + 1u] * colour;
   uint base = gl_GlobalInvocationID.x * 3u;  // = i * stride + k * 3
   for (uint c = 0u; c < 3u; ++c) {
     uint o = base + c;

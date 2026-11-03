@@ -77,7 +77,7 @@ struct TrainOptions {
   float lr_pose_shift = 1e-3f;   // per update, times the camera extent
   float lr_pose_turn = 1e-3f;    // radians per update
   float lr_pose_final = 1.0f;    // the rates decay exponentially to this fraction by the last step
-  uint32_t eval_pose_steps = 20;
+  uint32_t eval_pose_steps = 8;
   float eval_pose_step = 0.005f;  // the alignment's first step, times the camera extent
 
   // Subject motion. A person cannot stand still for a whole lap: the head
@@ -302,6 +302,8 @@ class Trainer {
     std::vector<uint32_t> offsets;      // first pair per slot
     std::vector<float> pair_grads;      // 12 per pair, pre-sort order
     std::vector<uint32_t> pair_tile;    // per pair, pre-sort order
+    std::vector<uint32_t> render_order; // pre-sort index of each pair in render order (by tile, front to back)
+    std::vector<uint32_t> depth_key;    // per slot: the quantized depth pairs are ordered by
   };
   DebugSnapshot debug_snapshot();
   uint32_t sh_stride() const { return sh_stride_; }
@@ -388,7 +390,9 @@ class Trainer {
   void update_pose_stats();
   static Camera with_fix(Camera camera, const PoseFix& fix);  // [R | t] -> [E R | E t + d]
   // The best correction of `camera` for held-out `frame` (moving only the camera).
-  PoseFix align_camera(const Camera& camera, const DatasetFrame& frame, const ViewMotion* motion, const float* gain);
+  PoseFix align_camera(const Camera& camera, const DatasetFrame& frame, const ViewMotion* motion, const float* gain,
+                       const PoseFix* start);
+  PoseFix neighbour_fix(size_t frame) const;  // between the training views' corrections around it
   // Held-out views of `ds`: this trainer's own (poses and motions as trained) or another's (at rest).
   EvalResult evaluate_views(const Dataset& ds, bool own);
   // Subject motion.
@@ -464,6 +468,8 @@ class Trainer {
   std::map<std::vector<uint64_t>, VkDescriptorSet> sets_;
   RadixSort::Binding sort_binding_;
   bool sort_bound_ = false;
+  RadixSort::Binding depth_sort_binding_;
+  bool depth_sort_bound_ = false;
   std::string reduction_note_;
   uint32_t sh_stride_ = 0;  // floats per slot
   uint32_t slots_ = 0;
@@ -475,6 +481,7 @@ class Trainer {
   std::vector<size_t> order_;
   size_t order_pos_ = 0;
 
+  ComputePipeline gather_;
   ComputePipeline project_, scan_local_, scan_blocks_, scan_add_, emit_, dispatch_args_, ranges_, forward_, ssim_,
       ssim_grad_, pair_sum_, step_, step_sh_;
   ComputePipeline densify_mark_, densify_spawn_, reset_opacity_;
@@ -483,6 +490,7 @@ class Trainer {
   std::vector<Buffer> frames_;  // FrameData per batch slot, host-visible
   Buffer params_, sh_, m_params_, v_params_, m_sh_, v_sh_, stats_buf_;
   Buffer projected_, tiles_, offsets_, spawn_, free_list_, counters_, mismatch_, block_sums_, totals_;
+  Buffer depth_keys_, depth_order_, sorted_tiles_, sorted_offsets_;  // the depth sort before the pairs
   Buffer keys_, values_, pair_gaussian_, pair_grads_;
   std::vector<Buffer> targets_;  // per batch slot
   Buffer pixel_grad_, pixel_count_, image_, ranges_buf_, tile_loss_, tile_count_;

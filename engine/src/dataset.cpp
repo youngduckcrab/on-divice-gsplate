@@ -423,6 +423,38 @@ SplatScene initialize_gaussians(const Dataset& ds, const InitOptions& options, I
     }
   }
   const size_t n = merged.size() / 3;
+  // In space-filling-curve order (Morton, 10 bits per axis): gaussians next
+  // to each other in memory are next to each other in space, so a GPU
+  // workgroup's gaussians share motion nodes and the passes that gather a
+  // tile's gaussians read nearby memory. (The voxel map above has no order.)
+  {
+    auto spread = [](uint32_t v) {  // 10 bits to every third bit
+      v &= 0x3ffu;
+      v = (v | (v << 16)) & 0x030000ffu;
+      v = (v | (v << 8)) & 0x0300f00fu;
+      v = (v | (v << 4)) & 0x030c30c3u;
+      v = (v | (v << 2)) & 0x09249249u;
+      return v;
+    };
+    std::vector<std::pair<uint32_t, uint32_t>> order(n);
+    for (size_t i = 0; i < n; ++i) {
+      uint32_t code = 0;
+      for (int k = 0; k < 3; ++k) {
+        const float extent = std::max(hi[k] - lo[k], 1e-6f);
+        const uint32_t q = uint32_t(std::clamp((merged[i * 3 + k] - lo[k]) / extent, 0.0f, 1.0f) * 1023.0f);
+        code |= spread(q) << k;
+      }
+      order[i] = {code, uint32_t(i)};
+    }
+    std::sort(order.begin(), order.end());
+    std::vector<float> p2(merged.size()), c2(merged_colors.size());
+    for (size_t j = 0; j < n; ++j) {
+      std::copy_n(&merged[size_t(order[j].second) * 3], 3, &p2[j * 3]);
+      std::copy_n(&merged_colors[size_t(order[j].second) * 3], 3, &c2[j * 3]);
+    }
+    merged = std::move(p2);
+    merged_colors = std::move(c2);
+  }
 
   // Scale from the mean distance to the 3 nearest neighbours, searched in a
   // grid of about two points' spacing (a few points per cell).

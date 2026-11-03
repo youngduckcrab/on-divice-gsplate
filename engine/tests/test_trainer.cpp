@@ -9,6 +9,7 @@
 #include <fstream>
 #include <numeric>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -121,6 +122,114 @@ void test_bucket_long_lists(gs::VkContext& ctx) {
               max_diff);
   EXPECT(max_count > 96, "test scene too thin: longest pixel list %u", max_count);
   EXPECT(max_diff <= 1e-4 * max_abs, "bucket gradients differ from serial by %.3g", max_diff);
+}
+
+void test_ssim_background_tiles(gs::VkContext& ctx) {
+  // Masked targets with the subject in the middle: tiles far from it (no
+  // subject pixel and no splat in the window) skip the SSIM passes. The loss
+  // must still be the CPU reference's, with a patch of subject pixels away
+  // from every splat (a window that reaches it is not background only).
+  constexpr uint32_t W = 256, H = 192;
+  gs::Dataset ds = gs::make_test_dataset(W, H, 1, true, 41);
+  std::vector<uint8_t>& rgba = ds.frames[0].rgba;
+  for (uint32_t y = 0; y < H; ++y) {
+    for (uint32_t x = 0; x < W; ++x) {
+      const bool subject = std::abs(int(x) - int(W / 2)) < 56 && std::abs(int(y) - int(H / 2)) < 56;
+      const bool patch = x >= 20 && x < 28 && y >= 150 && y < 160;
+      if (!subject && !patch) rgba[(size_t(y) * W + x) * 4 + 3] = 0;
+    }
+  }
+  constexpr uint32_t kCount = 60;
+  gs::SplatScene scene = gs::make_test_scene(kCount, 1, 43);
+  for (float& v : scene.positions) v *= 0.4f;
+  for (float& v : scene.log_scales) v += std::log(0.5f);
+  gs::TrainOptions o = gs::frozen_train_options(1, true);
+  o.lambda_dssim = o.lambda_dssim_end = 0.5f;
+  gs::Trainer trainer(ctx, ds, scene, o);
+  const float bg[3] = {0.2f, 0.5f, 0.7f};
+  const int stride = int(trainer.sh_stride());
+  std::vector<double> params(kCount * 16, 0.0), sh(size_t(kCount) * stride, 0.0);
+  for (uint32_t i = 0; i < kCount; ++i) {
+    for (int k = 0; k < 3; ++k) {
+      params[i * 16 + k] = scene.positions[i * 3 + k];
+      params[i * 16 + 4 + k] = scene.log_scales[i * 3 + k];
+      params[i * 16 + 12 + k] = scene.sh_dc[i * 3 + k];
+    }
+    params[i * 16 + 3] = scene.opacity_logits[i];
+    params[i * 16 + 7] = 1.0;
+    for (int k = 0; k < 4; ++k) params[i * 16 + 8 + k] = scene.rotations[i * 4 + k];
+    for (int k = 0; k < stride; ++k) sh[i * stride + k] = scene.sh_rest[i * stride + k];
+  }
+  const gs::Camera cam = gs::dataset_camera(ds, ds.frames[0]);
+  const double ref = gs::reference_loss(cam, params, sh, stride, 1, rgba, bg, true, 0.5);
+  trainer.step_on(0, bg);
+  const double gpu = trainer.stats().loss;
+  // Tiles that skip: none of the 3 x 3 around them hold a pair or a subject pixel.
+  const gs::Trainer::DebugSnapshot snap = trainer.debug_snapshot();
+  constexpr uint32_t T = gs::Trainer::kTileSize;
+  const int tx = int((W + T - 1) / T), ty = int((H + T - 1) / T);
+  std::vector<int> busy(size_t(tx) * ty, 0);
+  for (uint32_t tile : snap.pair_tile) busy.at(tile) = 1;
+  for (uint32_t y = 0; y < H; ++y) {
+    for (uint32_t x = 0; x < W; ++x) {
+      if (rgba[(size_t(y) * W + x) * 4 + 3] > 0) busy[(y / T) * tx + x / T] = 1;
+    }
+  }
+  int skipped = 0, near_patch = 0;
+  for (int y = 0; y < ty; ++y) {
+    for (int x = 0; x < tx; ++x) {
+      bool any = false;
+      for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+          const int nx = x + dx, ny = y + dy;
+          if (nx >= 0 && ny >= 0 && nx < tx && ny < ty && busy[ny * tx + nx]) any = true;
+        }
+      }
+      skipped += !any;
+      near_patch += any && std::abs(x - 1) <= 1 && std::abs(y - 9) <= 1;
+    }
+  }
+  std::printf("  ssim background tiles: %d of %d skip; loss gpu %.6f, reference %.6f\n", skipped, tx * ty, gpu, ref);
+  EXPECT(skipped > tx * ty / 4 && near_patch > 0, "test scene: %d tiles skip, %d near the patch", skipped, near_patch);
+  EXPECT(std::fabs(gpu - ref) < 1e-4, "loss %.6f, reference %.6f", gpu, ref);
+}
+
+void test_pair_order(gs::VkContext& ctx) {
+  // Gaussians are sorted by depth first and their pairs then by tile alone
+  // (stable): each tile's list must come out as a sort by (tile, depth) would
+  // give it, equal depths in gaussian order.
+  gs::Dataset ds = gs::make_test_dataset(kWidth, kHeight, 1, false, 31);
+  gs::SplatScene scene = gs::make_test_scene(400, 1, 37);
+  gs::Trainer trainer(ctx, ds, scene, gs::frozen_train_options(1, false));
+  const float bg[3] = {0, 0, 0};
+  trainer.step_on(0, bg);
+  const gs::Trainer::DebugSnapshot snap = trainer.debug_snapshot();
+  std::vector<uint32_t> gaussian(snap.pair_tile.size(), ~0u);
+  for (size_t i = 0; i < snap.tiles.size(); ++i) {
+    for (uint32_t k = snap.offsets[i]; k < snap.offsets[i] + snap.tiles[i]; ++k) gaussian.at(k) = uint32_t(i);
+  }
+  struct Pair {
+    uint32_t tile, depth, gaussian;
+  };
+  std::vector<Pair> want, got;
+  for (size_t p = 0; p < gaussian.size(); ++p) {
+    want.push_back({snap.pair_tile[p], snap.depth_key.at(gaussian[p]), gaussian[p]});
+  }
+  for (uint32_t p : snap.render_order) got.push_back({snap.pair_tile.at(p), snap.depth_key.at(gaussian.at(p)), gaussian[p]});
+  std::sort(want.begin(), want.end(), [](const Pair& a, const Pair& b) {
+    return a.tile != b.tile ? a.tile < b.tile : a.depth != b.depth ? a.depth < b.depth : a.gaussian < b.gaussian;
+  });
+  size_t wrong = 0, ties = 0;
+  std::set<uint32_t> depths;
+  for (size_t k = 0; k < want.size(); ++k) {
+    if (k >= got.size() || got[k].tile != want[k].tile || got[k].gaussian != want[k].gaussian) ++wrong;
+    if (k > 0 && want[k].tile == want[k - 1].tile && want[k].depth == want[k - 1].depth) ++ties;
+    depths.insert(want[k].depth);
+  }
+  std::printf("  pair order: %zu pairs, %zu depths, %zu ties, %zu out of order\n", want.size(), depths.size(), ties, wrong);
+  EXPECT(want.size() > 500 && depths.size() > 100, "test scene too small: %zu pairs, %zu depths", want.size(),
+         depths.size());
+  EXPECT(got.size() == want.size() && wrong == 0, "%zu of %zu pairs out of order", wrong, want.size());
 }
 
 void test_footprint(gs::VkContext& ctx) {
@@ -974,6 +1083,8 @@ int main() {
     test_gradients(ctx, false, gs::TrainOptions::Reduction::Serial);
     test_gradients(ctx, true, gs::TrainOptions::Reduction::Serial);
     test_cutoff_matches_serial(ctx);
+    test_pair_order(ctx);
+    test_ssim_background_tiles(ctx);
     test_bucket_long_lists(ctx);
     test_footprint(ctx);
     test_retune(ctx);

@@ -19,6 +19,7 @@ layout(std430, binding = 0) readonly buffer FrameBuf { FrameData frame; };
 layout(std430, binding = 1) readonly buffer SsimInput { vec4 ssim_input[]; };  // render, target
 layout(std430, binding = 2) writeonly buffer SsimMaps { vec4 ssim_maps[]; };  // A, B, C (rgb)
 layout(std430, binding = 3) buffer TileLoss { vec4 tile_loss[]; };
+layout(std430, binding = 4) readonly buffer Ranges { uvec2 ranges[]; };  // each tile's pairs
 
 const uint W = kTile + 2u * uint(kSsimRadius);  // tile plus halo
 shared float s_x[W * W];
@@ -26,9 +27,37 @@ shared float s_y[W * W];
 shared float s_h[5u * W * kTile];  // x, y, xx, yy, xy blurred along rows
 shared vec2 s_sum[kTile * kTile];  // SSIM, weighted SSIM
 
+// Background only (masked targets): no subject pixel and no splat in the
+// tile or the tiles around it, which the window reaches. Render and target
+// are then the same background colour all over the window: SSIM is 1 and its
+// gradient 0, and train_ssim_grad (which skips tiles without splats) never
+// reads this tile's maps.
+bool background_only(uvec2 tile) {
+  if ((frame.model.w & kFlagMaskedTarget) == 0u) return false;
+  for (int dy = -1; dy <= 1; ++dy) {
+    for (int dx = -1; dx <= 1; ++dx) {
+      ivec2 n = ivec2(tile) + ivec2(dx, dy);
+      if (n.x < 0 || n.y < 0 || n.x >= int(frame.image.z) || n.y >= int(frame.image.w)) continue;
+      uint t = uint(n.y) * frame.image.z + uint(n.x);
+      uvec2 r = ranges[t];
+      if (r.y > r.x || tile_loss[t * 4u + 3u].w > 0.0) return false;
+    }
+  }
+  return true;
+}
+
 void main() {
   uint lid = gl_LocalInvocationIndex;
   uvec2 tile = gl_WorkGroupID.xy;
+  if (background_only(tile)) {
+    if (lid == 0u) {
+      uint t = tile.y * frame.image.z + tile.x;
+      uvec2 size = min(uvec2(kTile), frame.image.xy - tile * kTile);
+      tile_loss[t * 4u].z = 3.0 * float(size.x * size.y);  // SSIM 1 per pixel and channel
+      tile_loss[t * 4u + 1u].x = tile_loss[t * 4u + 1u].y;  // the same, weighted: sum 3 w (train_forward)
+    }
+    return;
+  }
   ivec2 origin = ivec2(tile * kTile) - kSsimRadius;
   uvec2 pix = tile * kTile + gl_LocalInvocationID.xy;
   bool inside = pix.x < frame.image.x && pix.y < frame.image.y;

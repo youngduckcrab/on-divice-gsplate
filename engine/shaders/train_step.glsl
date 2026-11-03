@@ -49,6 +49,7 @@ shared vec3 s_dpos[128];
 shared vec3 s_dturn[128];
 shared uvec4 s_nodes[128];
 shared vec4 s_weights[128];
+shared uint s_node_mask[4];  // nodes some gaussian of this workgroup follows (up to 128)
 #endif
 
 struct MotionShare {
@@ -74,10 +75,12 @@ void step_gaussian(uint i, bool pose_only, inout vec3 grad_d, inout vec3 grad_w,
   vec4 dp0 = vec4(0.0), dp1 = vec4(0.0), dq = vec4(0.0), dp3 = vec4(0.0);
   uint degree = frame.model.y;
   int coeffs = sh_rest_coeffs(degree);
-  vec4 sh_colour = vec4(0.0), sh_dir = vec4(0.0);  // zero colour gradient: the SH step only decays the moments
+  vec4 sh_colour = vec4(0.0), sh_dir = vec4(0.0);  // zero colour gradient: the SH step skips the gaussian
+  bool drew = false;
 
   if (tiles_touched[i] > 0u) {
     vec4 a0 = grad_sum[i * 3u], a1 = grad_sum[i * 3u + 1u], a2 = grad_sum[i * 3u + 2u];
+    drew = any(notEqual(a0, vec4(0.0))) || any(notEqual(a1, vec4(0.0))) || any(notEqual(a2, vec4(0.0)));
     vec2 dL_dmean = a0.xy;
     vec3 dL_dconic = vec3(a0.zw, a1.x);
     float dL_dopacity = a1.y;
@@ -216,6 +219,14 @@ void step_gaussian(uint i, bool pose_only, inout vec3 grad_d, inout vec3 grad_w,
   }
 
   if (pose_only) return;
+  // Sparse Adam: a gaussian that drew nothing in this view (outside it, or
+  // behind others past where every pixel it covers had stopped) keeps its
+  // values and moments instead of drifting on its momentum, and costs no
+  // reads and writes of them.
+  if (!drew) {
+    sh_input[i * 2u] = vec4(0.0);
+    return;
+  }
   vec4 lr0 = vec4(vec3(frame.lr0.x), frame.lr0.w);
   vec4 lr1 = vec4(vec3(frame.lr0.y), 0.0);
   params[i * 4u] = adam(p0, dp0, i * 4u, lr0);
@@ -257,27 +268,52 @@ void main() {
   }
 #ifdef GS_MOTION_GRAD
   if ((flags & kFlagMotionGrad) != 0u) {
-    // Each node's sum over this workgroup's gaussians, one thread per node
-    // (at most 128): no float atomics.
+    // Each node's sum over this workgroup's gaussians, without float atomics:
+    // only for the nodes some gaussian here follows (marked below), and with
+    // at most 64 nodes, two threads per node, each over half the gaussians.
     s_rest[l] = share.any ? params[i * 4u].xyz : vec3(0.0);
     s_dpos[l] = share.dpos;
     s_dturn[l] = share.dturn;
     s_nodes[l] = share.any ? bind[i * 2u] : uvec4(0u);
     s_weights[l] = share.any ? uintBitsToFloat(bind[i * 2u + 1u]) : vec4(0.0);
+    if (l < 4u) s_node_mask[l] = 0u;
+    barrier();
+    if (share.any) {
+      for (uint k = 0u; k < 4u; ++k) {
+        uint n = s_nodes[l][k];
+        if (s_weights[l][k] != 0.0) atomicOr(s_node_mask[n >> 5u], 1u << (n & 31u));
+      }
+    }
     barrier();
     uint nodes = frame.limits.y;
-    if (l < nodes) {
-      vec4 c = motion[l * kMotionNodeVec4 + 4u];
-      vec3 shift = vec3(0.0), turn = vec3(0.0);
-      for (uint j = 0u; j < 128u; ++j) {
+    bool halves = nodes <= 64u;  // the same for the whole dispatch
+    uint node = halves ? (l & 63u) : l;
+    uint first = halves ? (l >> 6u) * 64u : 0u;
+    uint last = halves ? first + 64u : 128u;
+    vec3 shift = vec3(0.0), turn = vec3(0.0);
+    if (node < nodes && (s_node_mask[node >> 5u] & (1u << (node & 31u))) != 0u) {
+      vec4 c = motion[node * kMotionNodeVec4 + 4u];
+      for (uint j = first; j < last; ++j) {
         uvec4 n = s_nodes[j];
         vec4 w = s_weights[j];
-        float wl = n.x == l ? w.x : n.y == l ? w.y : n.z == l ? w.z : n.w == l ? w.w : 0.0;
+        float wl = n.x == node ? w.x : n.y == node ? w.y : n.z == node ? w.z : n.w == node ? w.w : 0.0;
         if (wl == 0.0) continue;
-        vec3 arm = node_apply(l, s_rest[j]) - c.xyz;  // R_l (p - n_l)
+        vec3 arm = node_apply(node, s_rest[j]) - c.xyz;  // R_l (p - n_l)
         shift += wl * s_dpos[j];
         turn += wl * (s_dturn[j] + cross(arm, s_dpos[j]));
       }
+    }
+    if (halves) {
+      // The second half's sums to the first (the pose sums above are done with these).
+      s_grad_d[l] = shift;
+      s_grad_w[l] = turn;
+      barrier();
+      if (l < 64u) {
+        shift += s_grad_d[l + 64u];
+        turn += s_grad_w[l + 64u];
+      }
+    }
+    if (l < nodes && (!halves || l < 64u)) {
       uint o = (gl_WorkGroupID.x * nodes + l) * 2u;
       motion_grad[o] = vec4(shift, 0.0);
       motion_grad[o + 1u] = vec4(turn, 0.0);
